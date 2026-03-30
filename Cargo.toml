@@ -1,0 +1,34 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+readme = "Readme.md"
+description = "All-in-one LLM utilities."
+homepage = "https://github.com/wtdcode/llmy"
+repository = "https://github.com/wtdcode/llmy"
+
+[workspace.dependencies]
+derive_more = { version = "1" }
+serde = { version = "1.0" }
+clap = {version = "4"}
+log = "0.4"
+thiserror = "2.0"
+color-eyre = "0.6"
+async-openai = {version = "0.34"}
+futures-util = "0.3"
+itertools = "0.14"
+serde_json = "1"
+chrono = "0.4"
+tracing = "0.1"
+tokio = "1"
+tokio-stream = "0.1"
+
+llmy-clap = {version = "0.1", path = "./crates/llmy-clap"}
+llmy-client = {version = "0.1", path = "./crates/llmy-client"}
+llmy-models = {version = "0.1", path = "./crates/llmy-models"}
+llmy-types = {version = "0.1", path = "./crates/llmy-types"}
+llmy = {version = "0.1", path = "./crates/llmy"}

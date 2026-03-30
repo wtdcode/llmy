@@ -1,0 +1,14 @@
+[package]
+name = "llmy-clap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap = {workspace = true, features = ["derive", "env"]}
+llmy-client.workspace = true
+llmy-models.workspace = true
