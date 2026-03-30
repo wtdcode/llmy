@@ -905,6 +905,7 @@ dependencies = [
  "llmy-clap",
  "llmy-client",
  "llmy-models",
+ "llmy-types",
 ]
 
 [[package]]

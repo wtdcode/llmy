@@ -12,3 +12,4 @@ repository.workspace = true
 llmy-clap.workspace = true
 llmy-client.workspace = true
 llmy-models.workspace = true
+llmy-types.workspace = true

@@ -9,3 +9,5 @@ pub mod clap {
 pub mod client {
     pub use llmy_client::*;
 }
+
+pub use llmy_types::error::LLMYError;
