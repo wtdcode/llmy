@@ -11,26 +11,14 @@ use itertools::Itertools;
 use llmy_types::error::LLMYError;
 use serde::Serialize;
 
-use async_openai::{
-    Client,
-    config::{AzureConfig, OpenAIConfig},
-    error::OpenAIError,
-    types::chat::{
-        ChatChoice, ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-        ChatCompletionNamedToolChoiceCustom, ChatCompletionRequestAssistantMessageContent,
-        ChatCompletionRequestAssistantMessageContentPart,
-        ChatCompletionRequestDeveloperMessageContent,
-        ChatCompletionRequestDeveloperMessageContentPart, ChatCompletionRequestMessage,
-        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestSystemMessageContent,
-        ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestToolMessageContent,
-        ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessageArgs,
-        ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-        ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionStreamOptions,
-        ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionUsage,
-        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-        CreateChatCompletionStreamResponse, CustomName, FinishReason, FunctionCall,
-        ReasoningEffort, Role, ToolChoiceOptions,
-    },
+use async_openai::types::chat::{
+    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageContent,
+    ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestDeveloperMessageContent,
+    ChatCompletionRequestDeveloperMessageContentPart, ChatCompletionRequestMessage,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionResponseMessage, ChatCompletionTools, CreateChatCompletionResponse,
 };
 
 pub fn completion_to_role(msg: &ChatCompletionRequestMessage) -> &'static str {
@@ -69,7 +57,7 @@ pub fn response_to_string(resp: &ChatCompletionResponseMessage) -> String {
     }
 
     if let Some(tools) = resp.tool_calls.as_ref() {
-        s += &tools.iter().map(|t| toolcall_to_string(t)).join("\n");
+        s += &tools.iter().map(toolcall_to_string).join("\n");
     }
 
     if let Some(refusal) = &resp.refusal {
@@ -110,7 +98,7 @@ pub fn completion_to_string(msg: &ChatCompletionRequestMessage) -> String {
                 .tool_calls
                 .iter()
                 .flatten()
-                .map(|t| toolcall_to_string(t))
+                .map(toolcall_to_string)
                 .join("\n");
             format!("{}\n{}", msg, tool_calls)
         }

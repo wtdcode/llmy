@@ -119,7 +119,7 @@ impl LLM {
             let debug_path;
             loop {
                 let prefix = if let Some(debug_prefix) = &debug_prefix {
-                    if debug_prefix.len() == 0 {
+                    if debug_prefix.is_empty() {
                         "main".to_string()
                     } else {
                         debug_prefix.to_lowercase()
@@ -145,7 +145,7 @@ impl LLM {
         LLM {
             llm: Arc::new(LLMInner {
                 client: LLMClient::new(config),
-                model: model,
+                model,
                 billing,
                 llm_debug: debug_path,
                 llm_debug_index: AtomicU64::new(0),
@@ -290,10 +290,10 @@ impl LLMInner {
         };
         let debug_fp = self.on_llm_debug(&prefix);
 
-        if let Some(debug_fp) = debug_fp.as_ref() {
-            if let Err(e) = debug::save_llm_user(debug_fp, &req).await {
-                tracing::warn!("Fail to save user due to {}", e);
-            }
+        if let Some(debug_fp) = debug_fp.as_ref()
+            && let Err(e) = debug::save_llm_user(debug_fp, &req).await
+        {
+            tracing::warn!("Fail to save user due to {}", e);
         }
 
         tracing::trace!(
@@ -325,18 +325,17 @@ impl LLMInner {
                 return Err(e);
             }
         };
-        if let Some(debug_fp) = debug_fp.as_ref() {
-            if let Err(e) = debug::save_llm_resp(debug_fp, &resp).await {
-                tracing::warn!("Fail to save resp due to {}", e);
-            }
+        if let Some(debug_fp) = debug_fp.as_ref()
+            && let Err(e) = debug::save_llm_resp(debug_fp, &resp).await
+        {
+            tracing::warn!("Fail to save resp due to {}", e);
         }
 
         if let Some(usage) = &resp.usage {
             let cached = usage
                 .prompt_tokens_details
                 .as_ref()
-                .map(|v| v.cached_tokens)
-                .flatten()
+                .and_then(|v| v.cached_tokens)
                 .unwrap_or_default();
             let input = usage.prompt_tokens - cached;
             self.billing
@@ -346,8 +345,7 @@ impl LLMInner {
             let reasoning = usage
                 .completion_tokens_details
                 .as_ref()
-                .map(|v| v.reasoning_tokens)
-                .flatten()
+                .and_then(|v| v.reasoning_tokens)
                 .unwrap_or_default() as u64;
 
             self.billing.write().await.output_tokens(
