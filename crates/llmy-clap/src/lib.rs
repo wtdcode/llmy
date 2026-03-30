@@ -41,7 +41,7 @@ macro_rules! make_openai_args {
             #[arg(long, env = concat!($prefix, "LLM_PRESENCE_PENALTY"), default_value_t = 0.0)]
             pub llm_presence_penalty: f32,
 
-            #[arg(long, env = concat!($prefix, "LLM_PROMPT_TIMEOUT"), default_value_t = 120)]
+            #[arg(long, env = concat!($prefix, "LLM_PROMPT_TIMEOUT"), default_value_t = 20 * 60)]
             pub llm_prompt_timeout: u64,
 
             #[arg(long, env = concat!($prefix, "LLM_RETRY"), default_value_t = 5)]

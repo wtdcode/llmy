@@ -312,7 +312,7 @@ impl LLMInner {
             Err(e) => {
                 if let Some(debug_fp) = debug_fp.as_ref() {
                     let err = format!("{:?}", e);
-                    debug::rewrite_json(
+                    if let Err(e) = debug::rewrite_json(
                         debug_fp,
                         &serde_json::json!(
                             {
@@ -320,7 +320,10 @@ impl LLMInner {
                             }
                         ),
                     )
-                    .await?;
+                    .await
+                    {
+                        tracing::warn!("can not save error: {} due to json error {}", err, e);
+                    }
                 }
                 return Err(e);
             }
@@ -332,27 +335,38 @@ impl LLMInner {
         }
 
         if let Some(usage) = &resp.usage {
+            let mut billing = self.billing.write().await;
+
             let cached = usage
                 .prompt_tokens_details
                 .as_ref()
                 .and_then(|v| v.cached_tokens)
                 .unwrap_or_default();
             let input = usage.prompt_tokens - cached;
-            self.billing
-                .write()
-                .await
-                .input_tokens(&self.model, input as _, cached as _)?;
+            billing.input_tokens(&self.model, input as _, cached as _)?;
             let reasoning = usage
                 .completion_tokens_details
                 .as_ref()
                 .and_then(|v| v.reasoning_tokens)
                 .unwrap_or_default() as u64;
 
-            self.billing.write().await.output_tokens(
+            billing.output_tokens(
                 &self.model,
                 usage.completion_tokens as u64 - reasoning,
                 reasoning,
             )?;
+
+            if let Some(debug_fp) = debug_fp.as_ref() {
+                let billing_clone = billing.clone();
+                drop(billing);
+                if let Err(e) = debug::rewrite_json(debug_fp, &billing_clone).await {
+                    tracing::warn!(
+                        "can not write {} to debug file due to {}",
+                        &billing_clone,
+                        e
+                    );
+                }
+            }
         } else {
             tracing::warn!("No usage from {:?}?!", &resp);
         }
