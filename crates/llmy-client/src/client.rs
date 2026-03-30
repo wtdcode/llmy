@@ -193,6 +193,7 @@ impl LLMInner {
         settings: Option<LLMSettings>,
     ) -> Result<CreateChatCompletionResponse, LLMYError> {
         let settings = settings.unwrap_or_else(|| self.default_settings.clone());
+        let timeout = settings.timeout();
         let sys = ChatCompletionRequestSystemMessageArgs::default()
             .content(sys_msg)
             .build()?;
@@ -219,12 +220,6 @@ impl LLMInner {
 
         let req = req.build()?;
 
-        let timeout = if settings.llm_prompt_timeout == 0 {
-            Duration::MAX
-        } else {
-            Duration::from_secs(settings.llm_prompt_timeout)
-        };
-
         self.complete_once_with_retry(&req, prefix, Some(timeout), Some(settings.llm_retry))
             .await
     }
@@ -236,41 +231,16 @@ impl LLMInner {
         timeout: Option<Duration>,
         retry: Option<u64>,
     ) -> Result<CreateChatCompletionResponse, LLMYError> {
-        let timeout = if let Some(timeout) = timeout {
-            timeout
-        } else {
-            Duration::MAX
-        };
-
-        let retry = if let Some(retry) = retry {
-            retry
-        } else {
-            u64::MAX
-        };
+        let retry = retry.unwrap_or(u64::MAX);
 
         let mut last = None;
         for idx in 0..retry {
-            match tokio::time::timeout(timeout, self.complete(req.clone(), prefix)).await {
-                Ok(r) => {
-                    last = Some(r);
+            match self.complete(req.clone(), prefix, timeout).await {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    tracing::warn!("Having an error {} during {} retry", e, idx);
+                    last = Some(Err(e));
                 }
-                Err(_) => {
-                    tracing::warn!("Timeout with {} retry, timeout = {:?}", idx, timeout);
-                    continue;
-                }
-            };
-
-            match last {
-                Some(Ok(r)) => return Ok(r),
-                Some(Err(ref e)) => {
-                    tracing::warn!(
-                        "Having an error {} during {} retry (timeout is {:?})",
-                        e,
-                        idx,
-                        timeout
-                    );
-                }
-                _ => {}
             }
         }
 
@@ -281,6 +251,7 @@ impl LLMInner {
         &self,
         req: CreateChatCompletionRequest,
         prefix: Option<&str>,
+        timeout_overwrite: Option<Duration>,
     ) -> Result<CreateChatCompletionResponse, LLMYError> {
         let use_stream = self.default_settings.llm_stream;
         let prefix = if let Some(prefix) = prefix {
@@ -301,10 +272,26 @@ impl LLMInner {
             &serde_json::to_string(&req)
         );
 
-        let resp = if use_stream {
-            self.complete_streaming(req).await
+        let llm_fut = async {
+            if use_stream {
+                self.complete_streaming(req).await
+            } else {
+                self.client.create_chat(req).await.map_err(|e| e.into())
+            }
+        };
+
+        let timeout = timeout_overwrite.unwrap_or_else(|| self.default_settings.timeout());
+        let resp = if timeout == Duration::MAX {
+            llm_fut.await
         } else {
-            self.client.create_chat(req).await.map_err(|e| e.into())
+            tokio::time::timeout(timeout, llm_fut)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(LLMYError::Other(eyre!(
+                        "LLM request timed out after {:?}",
+                        timeout
+                    )))
+                })
         };
 
         let resp = match resp {
@@ -312,17 +299,10 @@ impl LLMInner {
             Err(e) => {
                 if let Some(debug_fp) = debug_fp.as_ref() {
                     let err = format!("{:?}", e);
-                    if let Err(e) = debug::rewrite_json(
-                        debug_fp,
-                        &serde_json::json!(
-                            {
-                                "error": err
-                            }
-                        ),
-                    )
-                    .await
+                    if let Err(je) =
+                        debug::rewrite_json(debug_fp, &serde_json::json!({ "error": err })).await
                     {
-                        tracing::warn!("can not save error: {} due to json error {}", err, e);
+                        tracing::warn!("can not save error: {} due to json error {}", err, je);
                     }
                 }
                 return Err(e);
@@ -559,6 +539,6 @@ impl LLMInner {
             .presence_penalty(settings.llm_presence_penalty)
             .max_completion_tokens(settings.llm_max_completion_tokens)
             .build()?;
-        self.complete(req, prefix).await
+        self.complete(req, prefix, None).await
     }
 }

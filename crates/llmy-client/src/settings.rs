@@ -91,3 +91,13 @@ pub struct LLMSettings {
     pub llm_stream: bool,
     pub reasoning_effort: Option<Reasoning>,
 }
+
+impl LLMSettings {
+    pub fn timeout(&self) -> std::time::Duration {
+        if self.llm_prompt_timeout == 0 {
+            std::time::Duration::MAX
+        } else {
+            std::time::Duration::from_secs(self.llm_prompt_timeout)
+        }
+    }
+}
