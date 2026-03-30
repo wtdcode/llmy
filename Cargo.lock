@@ -900,7 +900,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
 name = "llmy"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "llmy-clap",
  "llmy-client",
@@ -910,7 +910,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-clap"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "llmy-client",
@@ -919,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-openai",
  "color-eyre",
@@ -935,7 +935,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-models"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "derive_more",
@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-types"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-openai",
  "color-eyre",
