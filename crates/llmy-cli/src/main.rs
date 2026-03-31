@@ -26,6 +26,8 @@ enum Commands {
     Chat(ChatArgs),
     /// Count tokens in text using various encodings
     Tokenizer(TokenizerArgs),
+    /// List all supported models with pricing info
+    Models,
 }
 
 #[derive(Parser)]
@@ -186,11 +188,39 @@ async fn run_chat(args: ChatArgs) -> color_eyre::Result<()> {
     Ok(())
 }
 
+fn run_models() {
+    let models = llmy_tokenizer::models();
+    let mut entries: Vec<_> = models.iter().collect();
+    entries.sort_by_key(|(id, _)| *id);
+
+    println!(
+        "{}\t{}\t{}\t{}\t{}",
+        "Model", "Input (per 1M)", "Output (per 1M)", "Context Window", "Encoding"
+    );
+    for (id, config) in entries {
+        let (input, output) = match config.pricing {
+            Some(p) => (
+                format!("${:.2}", p.input * 1_000_000.0),
+                format!("${:.2}", p.output * 1_000_000.0),
+            ),
+            None => ("-".to_string(), "-".to_string()),
+        };
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            id, input, output, config.context_window, config.encoding
+        );
+    }
+}
+
 async fn main_entry() -> color_eyre::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Chat(args) => run_chat(args).await,
         Commands::Tokenizer(args) => run_tokenizer(args),
+        Commands::Models => {
+            run_models();
+            Ok(())
+        }
     }
 }
 

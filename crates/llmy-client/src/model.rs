@@ -106,7 +106,7 @@ impl FromStr for OpenAIModel {
         // Case-insensitive match against registry model short names
         for (id, config) in llmy_tokenizer::models() {
             let short = id.rsplit('/').next().unwrap_or(id);
-            if short.eq_ignore_ascii_case(s) || config.name.eq_ignore_ascii_case(s) {
+            if id == s || short.eq_ignore_ascii_case(s) || config.name.eq_ignore_ascii_case(s) {
                 return Ok(Self {
                     model_id: id.to_string(),
                     config: config.clone(),

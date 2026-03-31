@@ -2,7 +2,59 @@
 
 All-in-one LLM utilities for Rust — plug OpenAI / Azure settings straight into [clap](https://crates.io/crates/clap), track spend with built-in billing, and replay every request when things go wrong.
 
-## Quick start
+## CLI
+
+Install the command-line tool:
+
+```bash
+cargo install llmy-cli
+```
+
+### `llmy chat` — interactive chat
+
+```bash
+OPENAI_API_KEY=sk-... llmy chat --model gpt-4o
+```
+
+```
+You: Explain async Rust in one sentence.
+Assistant: Async Rust uses futures and an executor to let you write non-blocking,
+concurrent code with zero-cost abstractions at compile time.
+```
+
+Supports `--system` for a custom system prompt. Reads from stdin when not a TTY.
+
+### `llmy tokenizer` — count tokens offline
+
+```bash
+echo "Hello, world!" | llmy tokenizer --model openai/gpt-4o
+# 4
+
+llmy tokenizer --encoding cl100k_base --input my_prompt.txt --verbose
+# 0  9906   "Hello"
+# 1  11    ","
+# 2  1917  " world"
+# 3  0     "!"
+# 4
+```
+
+### `llmy models` — list supported models
+
+```
+Model                           Input (per 1M)  Output (per 1M) Context Window  Encoding
+anthropic/claude-sonnet-4       $3.00           $15.00          200000          claude
+google/gemini-2.5-flash         $0.30           $2.50           1000000         o200k_base
+google/gemini-2.5-pro           $1.25           $10.00          1048576         o200k_base
+openai/gpt-4.1                  $2.00           $8.00           1047576         o200k_base
+openai/gpt-4o                   $2.50           $10.00          128000          o200k_base
+openai/gpt-4o-mini              $0.15           $0.60           128000          o200k_base
+openai/o1                       $15.00          $60.00          200000          o200k_base
+openai/o3                       $2.00           $8.00           200000          o200k_base
+openai/o4-mini                  $1.10           $4.40           200000          o200k_base
+…                               (112 models total)
+```
+
+## Library
 
 Add the dependency (the root crate re-exports everything):
 
@@ -10,8 +62,6 @@ Add the dependency (the root crate re-exports everything):
 [dependencies]
 llmy = "0.3"
 ```
-
-## Features
 
 ### 1. Clap integration — up to 3 LLM slots
 
@@ -134,18 +184,20 @@ The `.json` companion contains the full serialised `CreateChatCompletionRequest`
 
 ### 3. Built-in billing with automatic budget enforcement
 
-`llmy` ships with up-to-date per-token pricing for 30+ models (GPT-4o, o1, o3, GPT-5 family, Gemini, …). Token usage is tracked in real-time including **cached-input** and **reasoning** token discounts. When spend exceeds the budget cap the client returns `LLMYError::Billing` immediately — no more surprise bills.
+`llmy` ships with up-to-date per-token pricing for 110+ models (GPT-4o, o1, o3, GPT-5 family, Claude, Gemini, …). Token usage is tracked in real-time including **cached-input** and **reasoning** token discounts. When spend exceeds the budget cap the client returns `LLMYError::Billing` immediately — no more surprise bills.
 
 ```rust
 use llmy::client::{LLM, SupportedConfig};
-use llmy::models::OpenAIModel;
 use llmy::client::settings::LLMSettings;
+
+let settings = LLMSettings::default();
+let model = "gpt-4o".parse().unwrap();
 
 let llm = LLM::new(
     SupportedConfig::new("https://api.openai.com/v1", "sk-..."),
-    OpenAIModel::GPT4O,
+    model,
     5.0, // budget cap in USD
-    LLMSettings::default(),
+    settings,
     None,
     None,
 );
@@ -162,21 +214,10 @@ match llm.prompt_once("system", "user", None, None).await {
 Via clap the cap defaults to **$10** and can be overridden:
 
 ```bash
-cargo run -- --biling-cap 2.5 --model gpt-4o-mini
+cargo run -- --billing-cap 2.5 --model gpt-4o-mini
 ```
 
-A sample of the built-in pricing table (USD per 1 M tokens):
-
-| Model | Input | Output | Cached input |
-|-------|-------|--------|-------------|
-| `gpt-4o` | 2.50 | 10.00 | 1.25 |
-| `gpt-4o-mini` | 0.15 | 0.60 | 0.075 |
-| `o1` | 15.00 | 60.00 | 7.50 |
-| `o3` | 2.00 | 8.00 | 0.50 |
-| `o4-mini` | 1.10 | 4.40 | 0.275 |
-| `gpt-4.1` | 2.00 | 8.00 | 0.50 |
-
-For models not in the list, pass pricing inline:
+For models not in the built-in list, pass pricing inline:
 
 ```bash
 cargo run -- --model "my-custom-model,1.0,4.0,0.5"
