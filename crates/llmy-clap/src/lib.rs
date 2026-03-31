@@ -1,6 +1,5 @@
 use clap::Args;
-use llmy_client::{client::*, settings::*};
-use llmy_models::OpenAIModel;
+use llmy_client::{client::*, model::OpenAIModel, settings::*};
 use std::path::PathBuf;
 
 macro_rules! make_openai_args {

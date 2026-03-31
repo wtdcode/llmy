@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use crate::model::OpenAIModel;
 use async_openai::{
     Client,
     config::{AzureConfig, OpenAIConfig},
@@ -22,7 +23,6 @@ use async_openai::{
     },
 };
 use color_eyre::eyre::eyre;
-use llmy_models::OpenAIModel;
 use llmy_types::error::LLMYError;
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
@@ -272,6 +272,7 @@ impl LLMInner {
             &serde_json::to_string(&req)
         );
 
+        let now = std::time::SystemTime::now();
         let llm_fut = async {
             if use_stream {
                 self.complete_streaming(req).await
@@ -314,7 +315,7 @@ impl LLMInner {
             tracing::warn!("Fail to save resp due to {}", e);
         }
 
-        if let Some(usage) = &resp.usage {
+        let output_tokens = if let Some(usage) = &resp.usage {
             let mut billing = self.billing.write().await;
 
             let cached = usage
@@ -347,11 +348,25 @@ impl LLMInner {
                     );
                 }
             }
+            usage.completion_tokens
         } else {
             tracing::warn!("No usage from {:?}?!", &resp);
-        }
+            0
+        };
 
-        tracing::info!("Model Billing: {}", &self.billing.read().await);
+        let delta = std::time::SystemTime::now()
+            .duration_since(now)
+            .map(|v| v.as_secs_f64())
+            .unwrap_or_default();
+        tracing::info!(
+            "Usage: {}, Speed: {:.2} tok/s",
+            &self.billing.read().await,
+            if delta.is_normal() && delta.is_sign_positive() {
+                output_tokens as f64 / delta
+            } else {
+                0.0f64
+            }
+        );
         Ok(resp)
     }
 

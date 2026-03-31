@@ -18,5 +18,5 @@ itertools.workspace = true
 tokio = {workspace = true, features = ["fs"]}
 tokio-stream.workspace = true
 
-llmy-models.workspace = true
+llmy-tokenizer.workspace = true
 llmy-types.workspace = true

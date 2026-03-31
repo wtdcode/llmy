@@ -11,5 +11,5 @@ repository.workspace = true
 [dependencies]
 llmy-clap.workspace = true
 llmy-client.workspace = true
-llmy-models.workspace = true
 llmy-types.workspace = true
+async-openai.workspace = true

@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use llmy_models::OpenAIModel;
+use crate::model::OpenAIModel;
 use llmy_types::error::LLMYError;
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,7 @@ impl Display for ModelBilling {
                 0.0f64
             } else {
                 self.reasoning_tokens as f64 / self.output_tokens as f64
-            }, self.output_tokens
+            }, self.reasoning_tokens
         ))
     }
 }
@@ -54,14 +54,10 @@ impl ModelBilling {
     ) -> Result<(), LLMYError> {
         let pricing = model.pricing();
 
-        let cached_price = if let Some(cached) = pricing.cached_input_tokens {
-            cached
-        } else {
-            pricing.input_tokens
-        };
+        let cached_price = pricing.input_cache_read.unwrap_or(pricing.input);
 
-        let cached_usd = (cached_price * (cached_count as f64)) / 1e6;
-        let raw_input_usd = (pricing.input_tokens * (input_wihout_cache_count as f64)) / 1e6;
+        let cached_usd = cached_price * (cached_count as f64);
+        let raw_input_usd = pricing.input * (input_wihout_cache_count as f64);
         self.input_tokens += input_wihout_cache_count + cached_count;
         self.cache_tokens += cached_count;
         tracing::debug!(
@@ -88,8 +84,8 @@ impl ModelBilling {
     ) -> Result<(), LLMYError> {
         let pricing = model.pricing();
 
-        let output_usd = pricing.output_tokens * (count_without_reasoning as f64) / 1e6;
-        let reason_usd = pricing.output_tokens * (reasoning as f64) / 1e6;
+        let output_usd = pricing.output * (count_without_reasoning as f64);
+        let reason_usd = pricing.output * (reasoning as f64);
         tracing::debug!(
             "Output token usage: {:.4} USD, {} tokens / reason: {:.4} USD, {} tokens",
             output_usd,

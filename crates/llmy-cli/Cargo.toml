@@ -1,0 +1,25 @@
+[package]
+name = "llmy-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "llmy"
+path = "src/main.rs"
+
+[dependencies]
+clap = {workspace = true, features = ["derive"]}
+async-openai = {workspace = true, features = ["chat-completion-types"]}
+llmy-clap.workspace = true
+llmy-client.workspace = true
+llmy-tokenizer.workspace = true
+tokio = {workspace = true, features = ["full"]}
+tracing.workspace = true
+color-eyre = "0"
+dotenvy = "0"
+tracing-subscriber = {version = "0", features = ["env-filter"]}
