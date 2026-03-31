@@ -8,7 +8,7 @@ Add the dependency (the root crate re-exports everything):
 
 ```toml
 [dependencies]
-llmy = "0.2"
+llmy = "0.3"
 ```
 
 ## Features
