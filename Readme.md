@@ -183,6 +183,30 @@ cargo run -- --model "my-custom-model,1.0,4.0,0.5"
 #                      name,         in, out, cached
 ```
 
+---
+
+### 4. Offline token estimation (`llmy-tokenizer`)
+
+`llmy-tokenizer` provides fast, offline BPE token estimation for 110+ models across OpenAI, Anthropic, Google, and more. Encodings and model metadata are baked into the binary at compile time — no network calls, no data files to ship.
+
+Four encodings are supported: **cl100k_base**, **o200k_base**, **p50k_base** (OpenAI / tiktoken) and **claude** (Anthropic).
+
+```rust
+use llmy_tokenizer::{encode, count_tokens, count_tokens_for_model, Encoding};
+
+// Encode text into token IDs
+let tokens: Vec<u32> = encode("Hello, world!", Encoding::O200kBase);
+
+// Count tokens directly
+let n = count_tokens("Hello, world!", Encoding::Cl100kBase);
+
+// Or let the library resolve the encoding from a model ID
+let n = count_tokens_for_model("Hello, world!", "openai/gpt-4o"); // Some(4)
+let n = count_tokens_for_model("Hello, world!", "anthropic/claude-sonnet-4"); // Some(4)
+```
+
+The model registry is generated from the same source-of-truth JSON used by the billing system, so model look-ups, pricing, and token counts always stay in sync.
+
 ## License
 
 MIT

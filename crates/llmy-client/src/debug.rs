@@ -268,3 +268,107 @@ pub(crate) async fn save_llm_resp(
 
     Ok(())
 }
+
+/// Extract raw text from a chat completion request for token estimation.
+/// Text content is extracted as-is; tool calls and tool definitions are
+/// serialized to JSON so their token cost is still approximated.
+pub fn extract_raw_text(req: &CreateChatCompletionRequest) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    for msg in &req.messages {
+        match msg {
+            ChatCompletionRequestMessage::System(sys) => match &sys.content {
+                ChatCompletionRequestSystemMessageContent::Text(t) => parts.push(t.clone()),
+                ChatCompletionRequestSystemMessageContent::Array(arr) => {
+                    for p in arr {
+                        match p {
+                            ChatCompletionRequestSystemMessageContentPart::Text(t) => {
+                                parts.push(t.text.clone())
+                            }
+                        }
+                    }
+                }
+            },
+            ChatCompletionRequestMessage::User(usr) => match &usr.content {
+                ChatCompletionRequestUserMessageContent::Text(t) => parts.push(t.clone()),
+                ChatCompletionRequestUserMessageContent::Array(arr) => {
+                    for p in arr {
+                        match p {
+                            ChatCompletionRequestUserMessageContentPart::Text(t) => {
+                                parts.push(t.text.clone())
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            },
+            ChatCompletionRequestMessage::Assistant(ass) => {
+                if let Some(content) = &ass.content {
+                    match content {
+                        ChatCompletionRequestAssistantMessageContent::Text(t) => {
+                            parts.push(t.clone())
+                        }
+                        ChatCompletionRequestAssistantMessageContent::Array(arr) => {
+                            for p in arr {
+                                match p {
+                                    ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
+                                        parts.push(t.text.clone())
+                                    }
+                                    ChatCompletionRequestAssistantMessageContentPart::Refusal(
+                                        r,
+                                    ) => parts.push(r.refusal.clone()),
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(tcs) = &ass.tool_calls {
+                    for tc in tcs {
+                        if let Ok(s) = serde_json::to_string(tc) {
+                            parts.push(s);
+                        }
+                    }
+                }
+            }
+            ChatCompletionRequestMessage::Tool(tool) => match &tool.content {
+                ChatCompletionRequestToolMessageContent::Text(t) => parts.push(t.clone()),
+                ChatCompletionRequestToolMessageContent::Array(arr) => {
+                    for p in arr {
+                        match p {
+                            ChatCompletionRequestToolMessageContentPart::Text(t) => {
+                                parts.push(t.text.clone())
+                            }
+                        }
+                    }
+                }
+            },
+            ChatCompletionRequestMessage::Developer(dev) => match &dev.content {
+                ChatCompletionRequestDeveloperMessageContent::Text(t) => parts.push(t.clone()),
+                ChatCompletionRequestDeveloperMessageContent::Array(arr) => {
+                    for p in arr {
+                        match p {
+                            ChatCompletionRequestDeveloperMessageContentPart::Text(t) => {
+                                parts.push(t.text.clone())
+                            }
+                        }
+                    }
+                }
+            },
+            ChatCompletionRequestMessage::Function(f) => {
+                if let Some(c) = &f.content {
+                    parts.push(c.clone());
+                }
+            }
+        }
+    }
+
+    if let Some(tools) = &req.tools {
+        for tool in tools {
+            if let Ok(s) = serde_json::to_string(tool) {
+                parts.push(s);
+            }
+        }
+    }
+
+    parts.join("\n")
+}

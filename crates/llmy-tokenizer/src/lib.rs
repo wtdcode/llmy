@@ -82,6 +82,12 @@ pub struct ModelConfig {
     pub pricing: Option<ModelPricing>,
 }
 
+impl ModelConfig {
+    pub fn count_tokens(&self, text: &str) -> Option<usize> {
+        Encoding::from_str(&self.encoding).map(|enc| count_tokens(text, enc))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Models registry
 // ---------------------------------------------------------------------------

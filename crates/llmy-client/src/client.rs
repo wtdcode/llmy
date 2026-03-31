@@ -267,6 +267,12 @@ impl LLMInner {
             tracing::warn!("Fail to save user due to {}", e);
         }
 
+        let estimated_tokens = {
+            let text = debug::extract_raw_text(&req);
+            tracing::trace!("Text is {:?}", text);
+            self.model.config.count_tokens(&text)
+        };
+
         tracing::trace!(
             "Sending completion request: {:?}",
             &serde_json::to_string(&req)
@@ -348,6 +354,22 @@ impl LLMInner {
                     );
                 }
             }
+            if let Some(est) = estimated_tokens {
+                let actual = usage.prompt_tokens as f64;
+                let diff = (est as f64 - actual).abs();
+                let pct = if actual > 0.0 {
+                    diff / actual * 100.0
+                } else {
+                    0.0
+                };
+                tracing::info!(
+                    "Token estimate: {} estimated vs {} actual (diff {:.1}%)",
+                    est,
+                    usage.prompt_tokens,
+                    pct
+                );
+            }
+
             usage.completion_tokens
         } else {
             tracing::warn!("No usage from {:?}?!", &resp);
