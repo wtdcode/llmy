@@ -12,4 +12,5 @@ repository.workspace = true
 llmy-clap.workspace = true
 llmy-client.workspace = true
 llmy-types.workspace = true
+llmy-tokenizer.workspace = true
 async-openai.workspace = true

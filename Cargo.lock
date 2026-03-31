@@ -900,6 +900,7 @@ dependencies = [
  "async-openai",
  "llmy-clap",
  "llmy-client",
+ "llmy-tokenizer",
  "llmy-types",
 ]
 
