@@ -83,8 +83,11 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    pub fn encoding(&self) -> Option<Encoding> {
+        Encoding::from_str(&self.encoding)
+    }
     pub fn count_tokens(&self, text: &str) -> Option<usize> {
-        Encoding::from_str(&self.encoding).map(|enc| count_tokens(text, enc))
+        self.encoding().map(|enc| count_tokens(text, enc))
     }
 }
 
