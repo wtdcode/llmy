@@ -77,7 +77,7 @@ pub struct ModelConfig {
     pub encoding: String,
     pub tokens: ModelTokens,
     pub name: String,
-    pub context_window: u64,
+    pub max_input_tokens: u64,
     pub max_tokens: u64,
     pub pricing: Option<ModelPricing>,
 }
@@ -86,6 +86,15 @@ impl ModelConfig {
     pub fn encoding(&self) -> Option<Encoding> {
         Encoding::from_str(&self.encoding)
     }
+
+    pub fn max_input(&self) -> u64 {
+        self.max_input_tokens
+    }
+
+    pub fn max_output(&self) -> u64 {
+        self.max_tokens
+    }
+
     pub fn count_tokens(&self, text: &str) -> Option<usize> {
         self.encoding().map(|enc| count_tokens(text, enc))
     }
@@ -236,5 +245,15 @@ mod tests {
         let count = count_tokens_for_model("Hello, world!", "openai/gpt-4o");
         assert!(count.is_some());
         assert!(count.unwrap() > 0);
+    }
+
+    #[test]
+    fn test_model_config_limits() {
+        let model = get_model("openai/gpt-5.1").expect("known model");
+
+        assert_eq!(model.max_input_tokens, 272000);
+        assert_eq!(model.max_tokens, 128000);
+        assert_eq!(model.max_input(), 272000);
+        assert_eq!(model.max_output(), 128000);
     }
 }

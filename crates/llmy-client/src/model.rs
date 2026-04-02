@@ -26,7 +26,7 @@ impl OpenAIModel {
     }
 
     pub fn info(&self) -> (u64, u64) {
-        (self.config.context_window, self.config.max_tokens)
+        (self.config.max_input_tokens, self.config.max_tokens)
     }
 }
 
@@ -96,7 +96,7 @@ impl FromStr for OpenAIModel {
                     encoding: "o200k_base".to_string(),
                     tokens: ModelTokens::default(),
                     name: name.to_string(),
-                    context_window: 0,
+                    max_input_tokens: 0,
                     max_tokens: 0,
                     pricing: Some(pricing),
                 },
@@ -122,7 +122,7 @@ impl FromStr for OpenAIModel {
                 encoding: "o200k_base".to_string(),
                 tokens: ModelTokens::default(),
                 name: s.to_string(),
-                context_window: 0,
+                max_input_tokens: 0,
                 max_tokens: 0,
                 pricing: None,
             },

@@ -44,7 +44,7 @@ struct ModelConfig {
     encoding: String,
     tokens: ModelTokens,
     name: String,
-    context_window: u64,
+    max_input_tokens: u64,
     max_tokens: u64,
     #[serde(default)]
     pricing: Option<ModelPricing>,
@@ -137,7 +137,7 @@ fn generate_models(data_dir: &Path, out_dir: &str) {
                 per_array_of_objects: {pao},
             }},
             name: {name:?}.to_string(),
-            context_window: {cw},
+            max_input_tokens: {mit},
             max_tokens: {mt},
             pricing: {pricing},
         }}),\n",
@@ -156,7 +156,7 @@ fn generate_models(data_dir: &Path, out_dir: &str) {
             pno = c.tokens.per_nested_object,
             pao = c.tokens.per_array_of_objects,
             name = c.name,
-            cw = c.context_window,
+            mit = c.max_input_tokens,
             mt = c.max_tokens,
             pricing = pricing,
         ));

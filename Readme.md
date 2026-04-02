@@ -41,16 +41,16 @@ llmy tokenizer --encoding cl100k_base --input my_prompt.txt --verbose
 ### `llmy models` — list supported models
 
 ```
-Model                           Input (per 1M)  Output (per 1M) Context Window  Encoding
-anthropic/claude-sonnet-4       $3.00           $15.00          200000          claude
-google/gemini-2.5-flash         $0.30           $2.50           1000000         o200k_base
-google/gemini-2.5-pro           $1.25           $10.00          1048576         o200k_base
-openai/gpt-4.1                  $2.00           $8.00           1047576         o200k_base
-openai/gpt-4o                   $2.50           $10.00          128000          o200k_base
-openai/gpt-4o-mini              $0.15           $0.60           128000          o200k_base
-openai/o1                       $15.00          $60.00          200000          o200k_base
-openai/o3                       $2.00           $8.00           200000          o200k_base
-openai/o4-mini                  $1.10           $4.40           200000          o200k_base
+Model                           Input (per 1M)  Output (per 1M) Max Input  Max Output  Encoding
+anthropic/claude-sonnet-4       $3.00           $15.00          136000     64000       claude
+google/gemini-2.5-flash         $0.30           $2.50           936000     64000       o200k_base
+google/gemini-2.5-pro           $1.25           $10.00          983040     65536       o200k_base
+openai/gpt-4.1                  $2.00           $8.00           1014808    32768       o200k_base
+openai/gpt-4o                   $2.50           $10.00          111616     16384       o200k_base
+openai/gpt-4o-mini              $0.15           $0.60           111616     16384       o200k_base
+openai/o1                       $15.00          $60.00          100000     100000      o200k_base
+openai/o3                       $2.00           $8.00           100000     100000      o200k_base
+openai/o4-mini                  $1.10           $4.40           100000     100000      o200k_base
 …                               (112 models total)
 ```
 

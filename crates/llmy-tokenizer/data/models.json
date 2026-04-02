@@ -16,14 +16,14 @@
       "perArrayOfObjects": 13
     },
     "name": "Claude 3 Haiku",
-    "contextWindow": 200000,
     "maxTokens": 4096,
     "pricing": {
       "input": 2.5e-07,
       "output": 1.25e-06,
       "input_cache_read": 3e-08,
       "input_cache_write": 3e-07
-    }
+    },
+    "maxInputTokens": 195904
   },
   "anthropic/claude-3-opus": {
     "encoding": "claude",
@@ -42,14 +42,14 @@
       "perArrayOfObjects": 13
     },
     "name": "Claude 3 Opus",
-    "contextWindow": 200000,
     "maxTokens": 4096,
     "pricing": {
       "input": 1.5e-05,
       "output": 7.5e-05,
       "input_cache_read": 1.5e-06,
       "input_cache_write": 1.875e-05
-    }
+    },
+    "maxInputTokens": 195904
   },
   "anthropic/claude-3.5-haiku": {
     "encoding": "claude",
@@ -68,14 +68,14 @@
       "perArrayOfObjects": 13
     },
     "name": "Claude 3.5 Haiku",
-    "contextWindow": 200000,
     "maxTokens": 8192,
     "pricing": {
       "input": 8e-07,
       "output": 4e-06,
       "input_cache_read": 8e-08,
       "input_cache_write": 1e-06
-    }
+    },
+    "maxInputTokens": 191808
   },
   "anthropic/claude-3.5-sonnet": {
     "encoding": "claude",
@@ -94,14 +94,14 @@
       "perArrayOfObjects": 13
     },
     "name": "Claude 3.5 Sonnet",
-    "contextWindow": 200000,
     "maxTokens": 8192,
     "pricing": {
       "input": 3e-06,
       "output": 1.5e-05,
       "input_cache_read": 3e-07,
       "input_cache_write": 3.75e-06
-    }
+    },
+    "maxInputTokens": 191808
   },
   "anthropic/claude-3.5-sonnet-20240620": {
     "encoding": "claude",
@@ -120,12 +120,12 @@
       "perArrayOfObjects": 13
     },
     "name": "Claude 3.5 Sonnet (2024-06-20)",
-    "contextWindow": 200000,
     "maxTokens": 8192,
     "pricing": {
       "input": 3e-06,
       "output": 1.5e-05
-    }
+    },
+    "maxInputTokens": 191808
   },
   "anthropic/claude-3.7-sonnet": {
     "encoding": "claude",
@@ -144,14 +144,14 @@
       "perArrayOfObjects": 13
     },
     "name": "Claude 3.7 Sonnet",
-    "contextWindow": 200000,
     "maxTokens": 64000,
     "pricing": {
       "input": 3e-06,
       "output": 1.5e-05,
       "input_cache_read": 3e-07,
       "input_cache_write": 3.75e-06
-    }
+    },
+    "maxInputTokens": 136000
   },
   "anthropic/claude-opus-4": {
     "encoding": "claude",
@@ -170,14 +170,14 @@
       "perArrayOfObjects": 13
     },
     "name": "Claude Opus 4",
-    "contextWindow": 200000,
     "maxTokens": 32000,
     "pricing": {
       "input": 1.5e-05,
       "output": 7.5e-05,
       "input_cache_read": 1.5e-06,
       "input_cache_write": 1.875e-05
-    }
+    },
+    "maxInputTokens": 168000
   },
   "anthropic/claude-opus-4.1": {
     "encoding": "claude",
@@ -196,14 +196,14 @@
       "perArrayOfObjects": 13
     },
     "name": "Claude Opus 4.1",
-    "contextWindow": 200000,
     "maxTokens": 32000,
     "pricing": {
       "input": 1.5e-05,
       "output": 7.5e-05,
       "input_cache_read": 1.5e-06,
       "input_cache_write": 1.875e-05
-    }
+    },
+    "maxInputTokens": 168000
   },
   "anthropic/claude-sonnet-4": {
     "encoding": "claude",
@@ -222,14 +222,14 @@
       "perArrayOfObjects": 13
     },
     "name": "Claude Sonnet 4",
-    "contextWindow": 200000,
     "maxTokens": 64000,
     "pricing": {
       "input": 3e-06,
       "output": 1.5e-05,
       "input_cache_read": 3e-07,
       "input_cache_write": 3.75e-06
-    }
+    },
+    "maxInputTokens": 136000
   },
   "anthropic/claude-sonnet-4.5": {
     "encoding": "claude",
@@ -248,14 +248,14 @@
       "perArrayOfObjects": 13
     },
     "name": "Claude Sonnet 4.5",
-    "contextWindow": 200000,
     "maxTokens": 64000,
     "pricing": {
       "input": 3e-06,
       "output": 1.5e-05,
       "input_cache_read": 3e-07,
       "input_cache_write": 3.75e-06
-    }
+    },
+    "maxInputTokens": 136000
   },
   "openai/gpt-4-turbo": {
     "encoding": "cl100k_base",
@@ -274,12 +274,12 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-4 Turbo",
-    "contextWindow": 128000,
     "maxTokens": 4096,
     "pricing": {
       "input": 1e-05,
       "output": 3e-05
-    }
+    },
+    "maxInputTokens": 123904
   },
   "openai/gpt-4.1": {
     "encoding": "o200k_base",
@@ -298,14 +298,14 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-4.1",
-    "contextWindow": 1047576,
     "maxTokens": 32768,
     "pricing": {
       "input": 2e-06,
       "output": 8e-06,
       "input_cache_read": 5e-07,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 1014808
   },
   "openai/gpt-4.1-mini": {
     "encoding": "o200k_base",
@@ -324,14 +324,14 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-4.1 mini",
-    "contextWindow": 1047576,
     "maxTokens": 32768,
     "pricing": {
       "input": 4e-07,
       "output": 1.6e-06,
       "input_cache_read": 1e-07,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 1014808
   },
   "openai/gpt-4o": {
     "encoding": "o200k_base",
@@ -350,14 +350,14 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-4o",
-    "contextWindow": 128000,
     "maxTokens": 16384,
     "pricing": {
       "input": 2.5e-06,
       "output": 1e-05,
       "input_cache_read": 1.25e-06,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 111616
   },
   "openai/gpt-4o-mini": {
     "encoding": "o200k_base",
@@ -376,14 +376,14 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-4o mini",
-    "contextWindow": 128000,
     "maxTokens": 16384,
     "pricing": {
       "input": 1.5e-07,
       "output": 6e-07,
       "input_cache_read": 7.5e-08,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 111616
   },
   "openai/gpt-5": {
     "encoding": "o200k_base",
@@ -402,14 +402,14 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-5",
-    "contextWindow": 400000,
     "maxTokens": 128000,
     "pricing": {
       "input": 1.25e-06,
       "output": 1e-05,
       "input_cache_read": 1.3e-07,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 272000
   },
   "openai/gpt-5-mini": {
     "encoding": "o200k_base",
@@ -428,14 +428,14 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-5 mini",
-    "contextWindow": 400000,
     "maxTokens": 128000,
     "pricing": {
       "input": 2.5e-07,
       "output": 2e-06,
       "input_cache_read": 3e-08,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 272000
   },
   "openai/gpt-5-nano": {
     "encoding": "o200k_base",
@@ -454,14 +454,14 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-5 nano",
-    "contextWindow": 400000,
     "maxTokens": 128000,
     "pricing": {
       "input": 5e-08,
       "output": 4e-07,
       "input_cache_read": 1e-08,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 272000
   },
   "openai/gpt-oss-120b": {
     "encoding": "p50k_base",
@@ -480,12 +480,12 @@
       "perArrayOfObjects": 9
     },
     "name": "gpt-oss-120b",
-    "contextWindow": 131072,
     "maxTokens": 131072,
     "pricing": {
       "input": 1e-07,
       "output": 5e-07
-    }
+    },
+    "maxInputTokens": 0
   },
   "openai/gpt-oss-20b": {
     "encoding": "p50k_base",
@@ -504,12 +504,12 @@
       "perArrayOfObjects": 9
     },
     "name": "gpt-oss-20b",
-    "contextWindow": 128000,
     "maxTokens": 8192,
     "pricing": {
       "input": 7e-08,
       "output": 3e-07
-    }
+    },
+    "maxInputTokens": 119808
   },
   "openai/o1": {
     "encoding": "o200k_base",
@@ -528,14 +528,14 @@
       "perArrayOfObjects": 1
     },
     "name": "o1",
-    "contextWindow": 200000,
     "maxTokens": 100000,
     "pricing": {
       "input": 1.5e-05,
       "output": 6e-05,
       "input_cache_read": 7.5e-06,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 100000
   },
   "openai/o3": {
     "encoding": "o200k_base",
@@ -554,14 +554,14 @@
       "perArrayOfObjects": 1
     },
     "name": "o3",
-    "contextWindow": 200000,
     "maxTokens": 100000,
     "pricing": {
       "input": 2e-06,
       "output": 8e-06,
       "input_cache_read": 5e-07,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 100000
   },
   "openai/o3-mini": {
     "encoding": "o200k_base",
@@ -580,14 +580,14 @@
       "perArrayOfObjects": 1
     },
     "name": "o3-mini",
-    "contextWindow": 200000,
     "maxTokens": 100000,
     "pricing": {
       "input": 1.1e-06,
       "output": 4.4e-06,
       "input_cache_read": 5.5e-07,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 100000
   },
   "openai/o4-mini": {
     "encoding": "o200k_base",
@@ -606,14 +606,14 @@
       "perArrayOfObjects": 1
     },
     "name": "o4-mini",
-    "contextWindow": 200000,
     "maxTokens": 100000,
     "pricing": {
       "input": 1.1e-06,
       "output": 4.4e-06,
       "input_cache_read": 2.75e-07,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 100000
   },
   "xai/grok-2": {
     "encoding": "cl100k_base",
@@ -632,12 +632,12 @@
       "perArrayOfObjects": 10
     },
     "name": "Grok 2",
-    "contextWindow": 131072,
     "maxTokens": 4000,
     "pricing": {
       "input": 2e-06,
       "output": 1e-05
-    }
+    },
+    "maxInputTokens": 127072
   },
   "xai/grok-2-vision": {
     "encoding": "cl100k_base",
@@ -656,12 +656,12 @@
       "perArrayOfObjects": 10
     },
     "name": "Grok 2 Vision",
-    "contextWindow": 32768,
     "maxTokens": 32768,
     "pricing": {
       "input": 2e-06,
       "output": 1e-05
-    }
+    },
+    "maxInputTokens": 0
   },
   "xai/grok-3": {
     "encoding": "o200k_base",
@@ -680,12 +680,12 @@
       "perArrayOfObjects": 8
     },
     "name": "Grok 3 Beta",
-    "contextWindow": 131072,
     "maxTokens": 131072,
     "pricing": {
       "input": 3e-06,
       "output": 1.5e-05
-    }
+    },
+    "maxInputTokens": 0
   },
   "xai/grok-3-fast": {
     "encoding": "o200k_base",
@@ -704,12 +704,12 @@
       "perArrayOfObjects": 8
     },
     "name": "Grok 3 Fast Beta",
-    "contextWindow": 131072,
     "maxTokens": 131072,
     "pricing": {
       "input": 5e-06,
       "output": 2.5e-05
-    }
+    },
+    "maxInputTokens": 0
   },
   "xai/grok-3-mini": {
     "encoding": "o200k_base",
@@ -728,12 +728,12 @@
       "perArrayOfObjects": 8
     },
     "name": "Grok 3 Mini Beta",
-    "contextWindow": 131072,
     "maxTokens": 131072,
     "pricing": {
       "input": 3e-07,
       "output": 5e-07
-    }
+    },
+    "maxInputTokens": 0
   },
   "xai/grok-3-mini-fast": {
     "encoding": "o200k_base",
@@ -752,12 +752,12 @@
       "perArrayOfObjects": 8
     },
     "name": "Grok 3 Mini Fast Beta",
-    "contextWindow": 131072,
     "maxTokens": 131072,
     "pricing": {
       "input": 6e-07,
       "output": 4e-06
-    }
+    },
+    "maxInputTokens": 0
   },
   "xai/grok-4": {
     "encoding": "p50k_base",
@@ -776,12 +776,12 @@
       "perArrayOfObjects": 8
     },
     "name": "Grok 4",
-    "contextWindow": 256000,
     "maxTokens": 256000,
     "pricing": {
       "input": 3e-06,
       "output": 1.5e-05
-    }
+    },
+    "maxInputTokens": 0
   },
   "xai/grok-4-fast-non-reasoning": {
     "encoding": "p50k_base",
@@ -800,13 +800,13 @@
       "perArrayOfObjects": 8
     },
     "name": "Grok 4 Fast Non-Reasoning",
-    "contextWindow": 2000000,
     "maxTokens": 256000,
     "pricing": {
       "input": 2e-07,
       "output": 5e-07,
       "input_cache_read": 5e-08
-    }
+    },
+    "maxInputTokens": 1744000
   },
   "xai/grok-4-fast-reasoning": {
     "encoding": "p50k_base",
@@ -825,13 +825,13 @@
       "perArrayOfObjects": 8
     },
     "name": "Grok 4 Fast Reasoning",
-    "contextWindow": 2000000,
     "maxTokens": 256000,
     "pricing": {
       "input": 2e-07,
       "output": 5e-07,
       "input_cache_read": 5e-08
-    }
+    },
+    "maxInputTokens": 1744000
   },
   "xai/grok-code-fast-1": {
     "encoding": "p50k_base",
@@ -850,13 +850,13 @@
       "perArrayOfObjects": 8
     },
     "name": "Grok Code Fast 1",
-    "contextWindow": 256000,
     "maxTokens": 256000,
     "pricing": {
       "input": 2e-07,
       "output": 1.5e-06,
       "input_cache_read": 2e-08
-    }
+    },
+    "maxInputTokens": 0
   },
   "alibaba/qwen-3-14b": {
     "encoding": "cl100k_base",
@@ -875,12 +875,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Qwen3-14B",
-    "contextWindow": 40960,
     "maxTokens": 16384,
     "pricing": {
       "input": 6e-08,
       "output": 2.4e-07
-    }
+    },
+    "maxInputTokens": 24576
   },
   "alibaba/qwen-3-235b": {
     "encoding": "cl100k_base",
@@ -899,12 +899,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Qwen3 235B A22B Instruct 2507",
-    "contextWindow": 40960,
     "maxTokens": 16384,
     "pricing": {
       "input": 1.3e-07,
       "output": 6e-07
-    }
+    },
+    "maxInputTokens": 24576
   },
   "alibaba/qwen-3-30b": {
     "encoding": "cl100k_base",
@@ -923,12 +923,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Qwen3-30B-A3B",
-    "contextWindow": 40960,
     "maxTokens": 16384,
     "pricing": {
       "input": 8e-08,
       "output": 2.9e-07
-    }
+    },
+    "maxInputTokens": 24576
   },
   "alibaba/qwen-3-32b": {
     "encoding": "cl100k_base",
@@ -947,12 +947,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Qwen 3.32B",
-    "contextWindow": 40960,
     "maxTokens": 16384,
     "pricing": {
       "input": 1e-07,
       "output": 3e-07
-    }
+    },
+    "maxInputTokens": 24576
   },
   "alibaba/qwen3-coder": {
     "encoding": "cl100k_base",
@@ -971,12 +971,12 @@
       "perArrayOfObjects": -16
     },
     "name": "Qwen3 Coder 480B A35B Instruct",
-    "contextWindow": 262144,
     "maxTokens": 66536,
     "pricing": {
       "input": 3.8e-07,
       "output": 1.53e-06
-    }
+    },
+    "maxInputTokens": 195608
   },
   "alibaba/qwen3-coder-plus": {
     "encoding": "cl100k_base",
@@ -995,12 +995,12 @@
       "perArrayOfObjects": -15
     },
     "name": "Qwen3 Coder Plus",
-    "contextWindow": 1000000,
     "maxTokens": 65536,
     "pricing": {
       "input": 1e-06,
       "output": 5e-06
-    }
+    },
+    "maxInputTokens": 934464
   },
   "alibaba/qwen3-max": {
     "encoding": "cl100k_base",
@@ -1019,13 +1019,13 @@
       "perArrayOfObjects": 11
     },
     "name": "Qwen3 Max",
-    "contextWindow": 262144,
     "maxTokens": 32768,
     "pricing": {
       "input": 1.2e-06,
       "output": 6e-06,
       "input_cache_read": 2.4e-07
-    }
+    },
+    "maxInputTokens": 229376
   },
   "alibaba/qwen3-next-80b-a3b-instruct": {
     "encoding": "cl100k_base",
@@ -1044,12 +1044,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Qwen3 Next 80B A3B Instruct",
-    "contextWindow": 65536,
     "maxTokens": 65536,
     "pricing": {
       "input": 1.5e-07,
       "output": 1.5e-06
-    }
+    },
+    "maxInputTokens": 0
   },
   "alibaba/qwen3-next-80b-a3b-thinking": {
     "encoding": "cl100k_base",
@@ -1068,12 +1068,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Qwen3 Next 80B A3B Thinking",
-    "contextWindow": 65536,
     "maxTokens": 65536,
     "pricing": {
       "input": 1.5e-07,
       "output": 1.5e-06
-    }
+    },
+    "maxInputTokens": 0
   },
   "alibaba/qwen3-vl-instruct": {
     "encoding": "cl100k_base",
@@ -1092,12 +1092,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Qwen3 VL 235B A22B Instruct",
-    "contextWindow": 131072,
     "maxTokens": 129024,
     "pricing": {
       "input": 7e-07,
       "output": 2.8e-06
-    }
+    },
+    "maxInputTokens": 2048
   },
   "amazon/nova-lite": {
     "encoding": "cl100k_base",
@@ -1116,12 +1116,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Nova Lite",
-    "contextWindow": 300000,
     "maxTokens": 8192,
     "pricing": {
       "input": 6e-08,
       "output": 2.4e-07
-    }
+    },
+    "maxInputTokens": 291808
   },
   "amazon/nova-micro": {
     "encoding": "cl100k_base",
@@ -1140,12 +1140,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Nova Micro",
-    "contextWindow": 128000,
     "maxTokens": 8192,
     "pricing": {
       "input": 3.5e-08,
       "output": 1.4e-07
-    }
+    },
+    "maxInputTokens": 119808
   },
   "amazon/nova-pro": {
     "encoding": "cl100k_base",
@@ -1164,12 +1164,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Nova Pro",
-    "contextWindow": 300000,
     "maxTokens": 8192,
     "pricing": {
       "input": 8e-07,
       "output": 3.2e-06
-    }
+    },
+    "maxInputTokens": 291808
   },
   "deepseek/deepseek-v3": {
     "encoding": "o200k_base",
@@ -1188,12 +1188,12 @@
       "perArrayOfObjects": 11
     },
     "name": "DeepSeek V3 0324",
-    "contextWindow": 163840,
     "maxTokens": 16384,
     "pricing": {
       "input": 7.7e-07,
       "output": 7.7e-07
-    }
+    },
+    "maxInputTokens": 147456
   },
   "deepseek/deepseek-v3.1": {
     "encoding": "o200k_base",
@@ -1212,12 +1212,12 @@
       "perArrayOfObjects": 11
     },
     "name": "DeepSeek-V3.1",
-    "contextWindow": 163840,
     "maxTokens": 128000,
     "pricing": {
       "input": 3e-07,
       "output": 1e-06
-    }
+    },
+    "maxInputTokens": 35840
   },
   "deepseek/deepseek-v3.1-terminus": {
     "encoding": "o200k_base",
@@ -1236,12 +1236,12 @@
       "perArrayOfObjects": 11
     },
     "name": "DeepSeek V3.1 Terminus",
-    "contextWindow": 131072,
     "maxTokens": 65536,
     "pricing": {
       "input": 2.7e-07,
       "output": 1e-06
-    }
+    },
+    "maxInputTokens": 65536
   },
   "deepseek/deepseek-v3.2-exp": {
     "encoding": "o200k_base",
@@ -1260,12 +1260,12 @@
       "perArrayOfObjects": 10
     },
     "name": "DeepSeek V3.2 Exp",
-    "contextWindow": 163840,
     "maxTokens": 163840,
     "pricing": {
       "input": 2.7e-07,
       "output": 4e-07
-    }
+    },
+    "maxInputTokens": 0
   },
   "deepseek/deepseek-v3.2-exp-thinking": {
     "encoding": "o200k_base",
@@ -1284,13 +1284,13 @@
       "perArrayOfObjects": 10
     },
     "name": "DeepSeek V3.2 Exp Thinking",
-    "contextWindow": 163840,
     "maxTokens": 8192,
     "pricing": {
       "input": 2.8e-07,
       "output": 4.2e-07,
       "input_cache_read": 2.8e-08
-    }
+    },
+    "maxInputTokens": 155648
   },
   "meituan/longcat-flash-chat": {
     "encoding": "claude",
@@ -1309,12 +1309,12 @@
       "perArrayOfObjects": 84
     },
     "name": "LongCat Flash Chat",
-    "contextWindow": 128000,
     "maxTokens": 8192,
     "pricing": {
       "input": 0,
       "output": 0
-    }
+    },
+    "maxInputTokens": 119808
   },
   "meta/llama-3.1-8b": {
     "encoding": "cl100k_base",
@@ -1333,12 +1333,12 @@
       "perArrayOfObjects": 10
     },
     "name": "Llama 3.1 8B Instruct",
-    "contextWindow": 131000,
-    "maxTokens": 131072,
+    "maxTokens": 131000,
     "pricing": {
       "input": 5e-08,
       "output": 8e-08
-    }
+    },
+    "maxInputTokens": 0
   },
   "meta/llama-4-scout": {
     "encoding": "claude",
@@ -1357,12 +1357,12 @@
       "perArrayOfObjects": -8
     },
     "name": "Llama 4 Scout 17B Instruct",
-    "contextWindow": 131072,
     "maxTokens": 8192,
     "pricing": {
       "input": 8e-08,
       "output": 3e-07
-    }
+    },
+    "maxInputTokens": 122880
   },
   "mistral/codestral": {
     "encoding": "cl100k_base",
@@ -1381,12 +1381,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Mistral Codestral",
-    "contextWindow": 128000,
     "maxTokens": 4000,
     "pricing": {
       "input": 3e-07,
       "output": 9e-07
-    }
+    },
+    "maxInputTokens": 124000
   },
   "mistral/devstral-small": {
     "encoding": "cl100k_base",
@@ -1405,12 +1405,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Devstral Small",
-    "contextWindow": 128000,
     "maxTokens": 64000,
     "pricing": {
       "input": 1e-07,
       "output": 3e-07
-    }
+    },
+    "maxInputTokens": 64000
   },
   "mistral/magistral-medium": {
     "encoding": "cl100k_base",
@@ -1429,12 +1429,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Magistral Medium 2509",
-    "contextWindow": 128000,
     "maxTokens": 64000,
     "pricing": {
       "input": 2e-06,
       "output": 5e-06
-    }
+    },
+    "maxInputTokens": 64000
   },
   "mistral/magistral-small": {
     "encoding": "cl100k_base",
@@ -1453,12 +1453,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Magistral Small 2509",
-    "contextWindow": 128000,
     "maxTokens": 64000,
     "pricing": {
       "input": 5e-07,
       "output": 1.5e-06
-    }
+    },
+    "maxInputTokens": 64000
   },
   "moonshotai/kimi-k2": {
     "encoding": "claude",
@@ -1477,12 +1477,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Kimi K2",
-    "contextWindow": 131072,
     "maxTokens": 16384,
     "pricing": {
       "input": 5e-07,
       "output": 2e-06
-    }
+    },
+    "maxInputTokens": 114688
   },
   "moonshotai/kimi-k2-0905": {
     "encoding": "claude",
@@ -1501,12 +1501,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Kimi K2 0905",
-    "contextWindow": 131072,
     "maxTokens": 16384,
     "pricing": {
       "input": 6e-07,
       "output": 2.5e-06
-    }
+    },
+    "maxInputTokens": 114688
   },
   "moonshotai/kimi-k2-turbo": {
     "encoding": "o200k_base",
@@ -1525,12 +1525,12 @@
       "perArrayOfObjects": 10
     },
     "name": "Kimi K2 Turbo",
-    "contextWindow": 256000,
     "maxTokens": 16384,
     "pricing": {
       "input": 2.4e-06,
       "output": 1e-05
-    }
+    },
+    "maxInputTokens": 239616
   },
   "stealth/sonoma-dusk-alpha": {
     "encoding": "p50k_base",
@@ -1549,13 +1549,13 @@
       "perArrayOfObjects": 8
     },
     "name": "Sonoma Dusk Alpha",
-    "contextWindow": 2000000,
     "maxTokens": 131072,
     "pricing": {
       "input": 2e-07,
       "output": 5e-07,
       "input_cache_read": 5e-08
-    }
+    },
+    "maxInputTokens": 1868928
   },
   "stealth/sonoma-sky-alpha": {
     "encoding": "p50k_base",
@@ -1574,13 +1574,13 @@
       "perArrayOfObjects": 8
     },
     "name": "Sonoma Sky Alpha",
-    "contextWindow": 2000000,
     "maxTokens": 131072,
     "pricing": {
       "input": 2e-07,
       "output": 5e-07,
       "input_cache_read": 5e-08
-    }
+    },
+    "maxInputTokens": 1868928
   },
   "vercel/v0-1.0-md": {
     "encoding": "p50k_base",
@@ -1599,12 +1599,12 @@
       "perArrayOfObjects": 17
     },
     "name": "v0-1.0-md",
-    "contextWindow": 128000,
     "maxTokens": 32000,
     "pricing": {
       "input": 3e-06,
       "output": 1.5e-05
-    }
+    },
+    "maxInputTokens": 96000
   },
   "vercel/v0-1.5-md": {
     "encoding": "p50k_base",
@@ -1623,12 +1623,12 @@
       "perArrayOfObjects": 17
     },
     "name": "v0-1.5-md",
-    "contextWindow": 128000,
     "maxTokens": 32768,
     "pricing": {
       "input": 3e-06,
       "output": 1.5e-05
-    }
+    },
+    "maxInputTokens": 95232
   },
   "zai/glm-4.5": {
     "encoding": "cl100k_base",
@@ -1647,12 +1647,12 @@
       "perArrayOfObjects": 11
     },
     "name": "GLM-4.5",
-    "contextWindow": 131072,
     "maxTokens": 131072,
     "pricing": {
       "input": 6e-07,
       "output": 2.2e-06
-    }
+    },
+    "maxInputTokens": 0
   },
   "zai/glm-4.5-air": {
     "encoding": "o200k_base",
@@ -1671,12 +1671,12 @@
       "perArrayOfObjects": 11
     },
     "name": "GLM 4.5 Air",
-    "contextWindow": 128000,
     "maxTokens": 96000,
     "pricing": {
       "input": 2e-07,
       "output": 1.1e-06
-    }
+    },
+    "maxInputTokens": 32000
   },
   "zai/glm-4.5v": {
     "encoding": "cl100k_base",
@@ -1695,12 +1695,12 @@
       "perArrayOfObjects": 11
     },
     "name": "GLM 4.5V",
-    "contextWindow": 65536,
-    "maxTokens": 66000,
+    "maxTokens": 65536,
     "pricing": {
       "input": 6e-07,
       "output": 1.8e-06
-    }
+    },
+    "maxInputTokens": 0
   },
   "meta/llama-3.3-70b": {
     "encoding": "claude",
@@ -1719,12 +1719,12 @@
       "perArrayOfObjects": 10
     },
     "name": "Llama 3.3 70B Instruct",
-    "contextWindow": 128000,
     "maxTokens": 8192,
     "pricing": {
       "input": 7.2e-07,
       "output": 7.2e-07
-    }
+    },
+    "maxInputTokens": 119808
   },
   "mistral/mistral-large": {
     "encoding": "cl100k_base",
@@ -1743,12 +1743,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Mistral Large",
-    "contextWindow": 32000,
     "maxTokens": 4000,
     "pricing": {
       "input": 2e-06,
       "output": 6e-06
-    }
+    },
+    "maxInputTokens": 28000
   },
   "mistral/mistral-medium": {
     "encoding": "cl100k_base",
@@ -1767,12 +1767,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Mistral Medium 3.1",
-    "contextWindow": 128000,
     "maxTokens": 64000,
     "pricing": {
       "input": 4e-07,
       "output": 2e-06
-    }
+    },
+    "maxInputTokens": 64000
   },
   "mistral/mistral-small": {
     "encoding": "cl100k_base",
@@ -1791,12 +1791,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Mistral Small",
-    "contextWindow": 32000,
     "maxTokens": 4000,
     "pricing": {
       "input": 1e-07,
       "output": 3e-07
-    }
+    },
+    "maxInputTokens": 28000
   },
   "mistral/pixtral-large": {
     "encoding": "claude",
@@ -1815,12 +1815,12 @@
       "perArrayOfObjects": 11
     },
     "name": "Pixtral Large",
-    "contextWindow": 128000,
     "maxTokens": 4000,
     "pricing": {
       "input": 2e-06,
       "output": 6e-06
-    }
+    },
+    "maxInputTokens": 124000
   },
   "openai/gpt-5-codex": {
     "encoding": "o200k_base",
@@ -1839,14 +1839,14 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-5-Codex",
-    "contextWindow": 400000,
     "maxTokens": 128000,
     "pricing": {
       "input": 1.25e-06,
       "output": 1e-05,
       "input_cache_read": 1.3e-07,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 272000
   },
   "openai/gpt-5-pro": {
     "encoding": "o200k_base",
@@ -1865,12 +1865,12 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-5 pro",
-    "contextWindow": 400000,
     "maxTokens": 272000,
     "pricing": {
       "input": 1.5e-05,
       "output": 0.00012
-    }
+    },
+    "maxInputTokens": 128000
   },
   "google/gemini-2.0-flash": {
     "encoding": "o200k_base",
@@ -1889,13 +1889,13 @@
       "perArrayOfObjects": 0
     },
     "name": "Gemini 2.0 Flash",
-    "contextWindow": 1000000,
     "maxTokens": 8192,
     "pricing": {
       "input": 1e-07,
       "output": 4e-07,
       "input_cache_read": 2.5e-08
-    }
+    },
+    "maxInputTokens": 991808
   },
   "google/gemini-2.0-flash-lite": {
     "encoding": "o200k_base",
@@ -1914,12 +1914,12 @@
       "perArrayOfObjects": 0
     },
     "name": "Gemini 2.0 Flash Lite",
-    "contextWindow": 1048576,
     "maxTokens": 8192,
     "pricing": {
       "input": 7.5e-08,
       "output": 3e-07
-    }
+    },
+    "maxInputTokens": 1040384
   },
   "google/gemini-2.5-flash": {
     "encoding": "o200k_base",
@@ -1938,13 +1938,13 @@
       "perArrayOfObjects": 0
     },
     "name": "Gemini 2.5 Flash",
-    "contextWindow": 1000000,
     "maxTokens": 64000,
     "pricing": {
       "input": 3e-07,
       "output": 2.5e-06,
       "input_cache_read": 3e-08
-    }
+    },
+    "maxInputTokens": 936000
   },
   "google/gemini-2.5-flash-lite": {
     "encoding": "o200k_base",
@@ -1963,13 +1963,13 @@
       "perArrayOfObjects": 0
     },
     "name": "Gemini 2.5 Flash Lite",
-    "contextWindow": 1048576,
     "maxTokens": 65536,
     "pricing": {
       "input": 1e-07,
       "output": 4e-07,
       "input_cache_read": 1e-08
-    }
+    },
+    "maxInputTokens": 983040
   },
   "google/gemini-2.5-flash-lite-preview-09-2025": {
     "encoding": "o200k_base",
@@ -1988,12 +1988,12 @@
       "perArrayOfObjects": 29
     },
     "name": "Gemini 2.5 Flash Lite Preview 09-2025",
-    "contextWindow": 1048576,
     "maxTokens": 65536,
     "pricing": {
       "input": 1e-07,
       "output": 4e-07
-    }
+    },
+    "maxInputTokens": 983040
   },
   "google/gemini-2.5-flash-preview-09-2025": {
     "encoding": "o200k_base",
@@ -2012,13 +2012,13 @@
       "perArrayOfObjects": 29
     },
     "name": "Gemini 2.5 Flash Preview 09-2025",
-    "contextWindow": 1000000,
     "maxTokens": 65536,
     "pricing": {
       "input": 3e-07,
       "output": 2.5e-06,
       "input_cache_read": 3e-08
-    }
+    },
+    "maxInputTokens": 934464
   },
   "google/gemini-2.5-pro": {
     "encoding": "o200k_base",
@@ -2037,13 +2037,13 @@
       "perArrayOfObjects": 0
     },
     "name": "Gemini 2.5 Pro",
-    "contextWindow": 1048576,
     "maxTokens": 65536,
     "pricing": {
       "input": 1.25e-06,
       "output": 1e-05,
       "input_cache_read": 1.25e-07
-    }
+    },
+    "maxInputTokens": 983040
   },
   "deepseek/deepseek-r1": {
     "encoding": "o200k_base",
@@ -2062,13 +2062,13 @@
       "perArrayOfObjects": 1
     },
     "name": "DeepSeek-R1",
-    "contextWindow": 160000,
     "maxTokens": 16384,
     "pricing": {
       "input": 5e-07,
       "output": 2.15e-06,
       "input_cache_read": 4e-07
-    }
+    },
+    "maxInputTokens": 143616
   },
   "anthropic/claude-haiku-4.5": {
     "encoding": "claude",
@@ -2087,14 +2087,14 @@
       "contentMultiplier": 1.1
     },
     "name": "Claude Haiku 4.5",
-    "contextWindow": 200000,
     "maxTokens": 64000,
     "pricing": {
       "input": 1e-06,
       "output": 5e-06,
       "input_cache_read": 1e-07,
       "input_cache_write": 1.25e-06
-    }
+    },
+    "maxInputTokens": 136000
   },
   "minimax/minimax-m2": {
     "encoding": "claude",
@@ -2113,12 +2113,12 @@
       "contentMultiplier": 1.1
     },
     "name": "MiniMax M2",
-    "contextWindow": 262114,
     "maxTokens": 262114,
     "pricing": {
       "input": 2.7e-07,
       "output": 1.15e-06
-    }
+    },
+    "maxInputTokens": 0
   },
   "moonshotai/kimi-k2-thinking": {
     "encoding": "o200k_base",
@@ -2137,12 +2137,12 @@
       "contentMultiplier": 1
     },
     "name": "Kimi K2 Thinking",
-    "contextWindow": 262114,
     "maxTokens": 262114,
     "pricing": {
       "input": 6e-07,
       "output": 2.5e-06
-    }
+    },
+    "maxInputTokens": 0
   },
   "moonshotai/kimi-k2-thinking-turbo": {
     "encoding": "o200k_base",
@@ -2161,13 +2161,13 @@
       "contentMultiplier": 1
     },
     "name": "Kimi K2 Thinking Turbo",
-    "contextWindow": 262114,
     "maxTokens": 262114,
     "pricing": {
       "input": 1.15e-06,
       "output": 8e-06,
       "input_cache_read": 1.5e-07
-    }
+    },
+    "maxInputTokens": 0
   },
   "openai/gpt-5-chat": {
     "encoding": "o200k_base",
@@ -2186,13 +2186,13 @@
       "contentMultiplier": 1
     },
     "name": "GPT-5 Chat",
-    "contextWindow": 128000,
     "maxTokens": 16384,
     "pricing": {
       "input": 1.25e-06,
       "output": 1e-05,
       "input_cache_read": 1.25e-07
-    }
+    },
+    "maxInputTokens": 111616
   },
   "openai/gpt-oss-safeguard-20b": {
     "encoding": "p50k_base",
@@ -2211,13 +2211,13 @@
       "contentMultiplier": 1
     },
     "name": "gpt-oss-safeguard-20b",
-    "contextWindow": 131072,
     "maxTokens": 65536,
     "pricing": {
       "input": 7.5e-08,
       "output": 3e-07,
       "input_cache_read": 3.7e-08
-    }
+    },
+    "maxInputTokens": 65536
   },
   "alibaba/qwen3-235b-a22b-thinking": {
     "encoding": "cl100k_base",
@@ -2236,12 +2236,12 @@
       "contentMultiplier": 1
     },
     "name": "Qwen3 235B A22B Thinking 2507",
-    "contextWindow": 262114,
     "maxTokens": 262114,
     "pricing": {
       "input": 3e-07,
       "output": 2.9e-06
-    }
+    },
+    "maxInputTokens": 0
   },
   "anthropic/claude-opus-4.5": {
     "encoding": "claude",
@@ -2260,14 +2260,14 @@
       "contentMultiplier": 1.1
     },
     "name": "Claude Opus 4.5",
-    "contextWindow": 200000,
     "maxTokens": 64000,
     "pricing": {
       "input": 5e-06,
       "output": 2.5e-05,
       "input_cache_read": 5e-07,
       "input_cache_write": 6.25e-06
-    }
+    },
+    "maxInputTokens": 136000
   },
   "google/gemini-3-pro-preview": {
     "encoding": "o200k_base",
@@ -2286,13 +2286,13 @@
       "contentMultiplier": 1.08
     },
     "name": "Gemini 3 Pro Preview",
-    "contextWindow": 1000000,
     "maxTokens": 64000,
     "pricing": {
       "input": 2e-06,
       "output": 1.2e-05,
       "input_cache_read": 2e-07
-    }
+    },
+    "maxInputTokens": 936000
   },
   "prime-intellect/intellect-3": {
     "encoding": "cl100k_base",
@@ -2311,12 +2311,12 @@
       "contentMultiplier": 1
     },
     "name": "INTELLECT 3",
-    "contextWindow": 131072,
     "maxTokens": 131072,
     "pricing": {
       "input": 2e-07,
       "output": 1.1e-06
-    }
+    },
+    "maxInputTokens": 0
   },
   "xai/grok-4.1-fast-non-reasoning": {
     "encoding": "p50k_base",
@@ -2335,13 +2335,13 @@
       "contentMultiplier": 1
     },
     "name": "Grok 4.1 Fast Non-Reasoning",
-    "contextWindow": 2000000,
     "maxTokens": 2000000,
     "pricing": {
       "input": 2e-07,
       "output": 5e-07,
       "input_cache_read": 5e-08
-    }
+    },
+    "maxInputTokens": 0
   },
   "xai/grok-4.1-fast-reasoning": {
     "encoding": "p50k_base",
@@ -2360,13 +2360,13 @@
       "contentMultiplier": 1
     },
     "name": "Grok 4.1 Fast Reasoning",
-    "contextWindow": 2000000,
     "maxTokens": 2000000,
     "pricing": {
       "input": 2e-07,
       "output": 5e-07,
       "input_cache_read": 5e-08
-    }
+    },
+    "maxInputTokens": 0
   },
   "openai/gpt-5.1-codex": {
     "encoding": "o200k_base",
@@ -2385,13 +2385,13 @@
       "contentMultiplier": 1
     },
     "name": "GPT-5.1-Codex",
-    "contextWindow": 400000,
     "maxTokens": 128000,
     "pricing": {
       "input": 1.25e-06,
       "output": 1e-05,
       "input_cache_read": 1.25e-07
-    }
+    },
+    "maxInputTokens": 272000
   },
   "openai/gpt-5.1-instant": {
     "encoding": "o200k_base",
@@ -2410,13 +2410,13 @@
       "contentMultiplier": 1
     },
     "name": "GPT-5.1 Instant",
-    "contextWindow": 128000,
     "maxTokens": 16384,
     "pricing": {
       "input": 1.25e-06,
       "output": 1e-05,
       "input_cache_read": 1.25e-07
-    }
+    },
+    "maxInputTokens": 111616
   },
   "openai/gpt-5.1-thinking": {
     "encoding": "o200k_base",
@@ -2435,13 +2435,13 @@
       "contentMultiplier": 1
     },
     "name": "GPT 5.1 Thinking",
-    "contextWindow": 400000,
     "maxTokens": 128000,
     "pricing": {
       "input": 1.25e-06,
       "output": 1e-05,
       "input_cache_read": 1.25e-07
-    }
+    },
+    "maxInputTokens": 272000
   },
   "openai/gpt-5.1-codex-mini": {
     "encoding": "o200k_base",
@@ -2460,13 +2460,13 @@
       "contentMultiplier": 1
     },
     "name": "GPT-5.1 Codex mini",
-    "contextWindow": 400000,
     "maxTokens": 128000,
     "pricing": {
       "input": 2.5e-07,
       "output": 2e-06,
       "input_cache_read": 2.5e-08
-    }
+    },
+    "maxInputTokens": 272000
   },
   "openai/gpt-4": {
     "encoding": "cl100k_base",
@@ -2485,12 +2485,12 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-4",
-    "contextWindow": 8192,
     "maxTokens": 8192,
     "pricing": {
       "input": 3e-05,
       "output": 6e-05
-    }
+    },
+    "maxInputTokens": 0
   },
   "openai/gpt-3.5-turbo": {
     "encoding": "cl100k_base",
@@ -2509,12 +2509,12 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-3.5 Turbo",
-    "contextWindow": 16385,
     "maxTokens": 4096,
     "pricing": {
       "input": 5e-07,
       "output": 1.5e-06
-    }
+    },
+    "maxInputTokens": 12289
   },
   "openai/o1-mini": {
     "encoding": "o200k_base",
@@ -2533,14 +2533,14 @@
       "perArrayOfObjects": 1
     },
     "name": "o1-mini",
-    "contextWindow": 128000,
     "maxTokens": 65536,
     "pricing": {
       "input": 1.1e-06,
       "output": 4.4e-06,
       "input_cache_read": 5.5e-07,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 62464
   },
   "openai/o3-pro": {
     "encoding": "o200k_base",
@@ -2559,12 +2559,12 @@
       "perArrayOfObjects": 1
     },
     "name": "o3-pro",
-    "contextWindow": 200000,
     "maxTokens": 100000,
     "pricing": {
       "input": 2e-05,
       "output": 8e-05
-    }
+    },
+    "maxInputTokens": 100000
   },
   "openai/gpt-4.1-nano": {
     "encoding": "o200k_base",
@@ -2583,14 +2583,14 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-4.1 nano",
-    "contextWindow": 1047576,
     "maxTokens": 32768,
     "pricing": {
       "input": 1e-07,
       "output": 4e-07,
       "input_cache_read": 2.5e-08,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 1014808
   },
   "openai/gpt-5.1": {
     "encoding": "o200k_base",
@@ -2609,14 +2609,14 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-5.1",
-    "contextWindow": 400000,
     "maxTokens": 128000,
     "pricing": {
       "input": 1.25e-06,
       "output": 1e-05,
       "input_cache_read": 1.25e-07,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 272000
   },
   "openai/gpt-5.2": {
     "encoding": "o200k_base",
@@ -2635,14 +2635,14 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-5.2",
-    "contextWindow": 400000,
     "maxTokens": 128000,
     "pricing": {
       "input": 1.75e-06,
       "output": 1.4e-05,
       "input_cache_read": 1.75e-07,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 272000
   },
   "openai/gpt-5.4": {
     "encoding": "o200k_base",
@@ -2661,14 +2661,14 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-5.4",
-    "contextWindow": 1050000,
     "maxTokens": 128000,
     "pricing": {
       "input": 2.5e-06,
       "output": 1.5e-05,
       "input_cache_read": 2.5e-07,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 922000
   },
   "openai/gpt-5.4-mini": {
     "encoding": "o200k_base",
@@ -2687,14 +2687,14 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-5.4 mini",
-    "contextWindow": 400000,
     "maxTokens": 128000,
     "pricing": {
       "input": 7.5e-07,
       "output": 4.5e-06,
       "input_cache_read": 7.5e-08,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 272000
   },
   "openai/gpt-5.4-nano": {
     "encoding": "o200k_base",
@@ -2713,14 +2713,14 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-5.4 nano",
-    "contextWindow": 400000,
     "maxTokens": 128000,
     "pricing": {
       "input": 2e-07,
       "output": 1.25e-06,
       "input_cache_read": 2e-08,
       "input_cache_write": 0
-    }
+    },
+    "maxInputTokens": 272000
   },
   "openai/gpt-5.4-pro": {
     "encoding": "o200k_base",
@@ -2739,12 +2739,12 @@
       "perArrayOfObjects": 1
     },
     "name": "GPT-5.4 pro",
-    "contextWindow": 1050000,
     "maxTokens": 128000,
     "pricing": {
       "input": 3e-05,
       "output": 0.00018
-    }
+    },
+    "maxInputTokens": 922000
   },
   "google/gemini-3-flash-preview": {
     "encoding": "o200k_base",
@@ -2763,11 +2763,11 @@
       "perArrayOfObjects": 0
     },
     "name": "Gemini 3 Flash Preview",
-    "contextWindow": 1048576,
     "maxTokens": 65536,
     "pricing": {
       "input": 5e-07,
       "output": 3e-06
-    }
+    },
+    "maxInputTokens": 983040
   }
 }
