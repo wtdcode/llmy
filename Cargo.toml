@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.5"
+version = "0.3.6"
 edition = "2024"
 license = "MIT"
 readme = "Readme.md"
@@ -26,9 +26,9 @@ tracing = "0.1"
 tokio = "1"
 tokio-stream = "0.1"
 
-llmy-clap = {version = "0.3.5", path = "./crates/llmy-clap"}
-llmy-client = {version = "0.3.5", path = "./crates/llmy-client"}
-llmy-types = {version = "0.3.5", path = "./crates/llmy-types"}
-llmy-tokenizer = {version = "0.3.5", path = "./crates/llmy-tokenizer"}
-llmy = {version = "0.3.5", path = "./crates/llmy"}
-llm-cli = {version = "0.3.5", path = "./crates/llmy-cli"}
+llmy-clap = {version = "0.3.6", path = "./crates/llmy-clap"}
+llmy-client = {version = "0.3.6", path = "./crates/llmy-client"}
+llmy-types = {version = "0.3.6", path = "./crates/llmy-types"}
+llmy-tokenizer = {version = "0.3.6", path = "./crates/llmy-tokenizer"}
+llmy = {version = "0.3.6", path = "./crates/llmy"}
+llm-cli = {version = "0.3.6", path = "./crates/llmy-cli"}
