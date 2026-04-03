@@ -174,10 +174,10 @@ pub struct LLMInner {
 }
 
 impl LLMInner {
-    fn on_llm_debug(&self, prefix: &str) -> Option<PathBuf> {
+    fn on_llm_debug(&self, debug_prefix: &str) -> Option<PathBuf> {
         if let Some(output_folder) = self.llm_debug.as_ref() {
             let idx = self.llm_debug_index.fetch_add(1, Ordering::SeqCst);
-            let fpath = output_folder.join(format!("{}-{:0>12}.xml", prefix, idx));
+            let fpath = output_folder.join(format!("{}-{:0>12}.xml", debug_prefix, idx));
             Some(fpath)
         } else {
             None
@@ -189,7 +189,8 @@ impl LLMInner {
         &self,
         sys_msg: &str,
         user_msg: &str,
-        prefix: Option<&str>,
+        debug_prefix: Option<&str>,
+        cache_key: Option<&str>,
         settings: Option<LLMSettings>,
     ) -> Result<CreateChatCompletionResponse, LLMYError> {
         let settings = settings.unwrap_or_else(|| self.default_settings.clone());
@@ -214,20 +215,20 @@ impl LLMInner {
         if let Some(effort) = settings.reasoning_effort {
             req.reasoning_effort(effort.0);
         }
-        if let Some(prefix) = prefix {
-            req.prompt_cache_key(prefix.to_string());
+        if let Some(cache_key) = cache_key {
+            req.prompt_cache_key(cache_key.to_string());
         }
 
         let req = req.build()?;
 
-        self.complete_once_with_retry(&req, prefix, Some(timeout), Some(settings.llm_retry))
+        self.complete_once_with_retry(&req, debug_prefix, Some(timeout), Some(settings.llm_retry))
             .await
     }
 
     pub async fn complete_once_with_retry(
         &self,
         req: &CreateChatCompletionRequest,
-        prefix: Option<&str>,
+        debug_prefix: Option<&str>,
         timeout: Option<Duration>,
         retry: Option<u64>,
     ) -> Result<CreateChatCompletionResponse, LLMYError> {
@@ -235,7 +236,7 @@ impl LLMInner {
 
         let mut last = None;
         for idx in 0..retry {
-            match self.complete(req.clone(), prefix, timeout).await {
+            match self.complete(req.clone(), debug_prefix, timeout).await {
                 Ok(r) => return Ok(r),
                 Err(e) => {
                     tracing::warn!("Having an error {} during {} retry", e, idx);
@@ -250,16 +251,16 @@ impl LLMInner {
     pub async fn complete(
         &self,
         req: CreateChatCompletionRequest,
-        prefix: Option<&str>,
+        debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
     ) -> Result<CreateChatCompletionResponse, LLMYError> {
         let use_stream = self.default_settings.llm_stream;
-        let prefix = if let Some(prefix) = prefix {
-            prefix.to_string()
+        let debug_prefix = if let Some(debug_prefix) = debug_prefix {
+            debug_prefix.to_string()
         } else {
             "llm".to_string()
         };
-        let debug_fp = self.on_llm_debug(&prefix);
+        let debug_fp = self.on_llm_debug(&debug_prefix);
 
         if let Some(debug_fp) = debug_fp.as_ref()
             && let Err(e) = debug::save_llm_user(debug_fp, &req).await
@@ -545,7 +546,8 @@ impl LLMInner {
         &self,
         sys_msg: &str,
         user_msg: &str,
-        prefix: Option<&str>,
+        debug_prefix: Option<&str>,
+        cache_key: Option<&str>,
         settings: Option<LLMSettings>,
     ) -> Result<CreateChatCompletionResponse, LLMYError> {
         let settings = settings.unwrap_or_else(|| self.default_settings.clone());
@@ -566,8 +568,8 @@ impl LLMInner {
             req.reasoning_effort(effort.0);
         }
 
-        if let Some(prefix) = prefix.as_ref() {
-            req.prompt_cache_key(prefix.to_string());
+        if let Some(cache_key) = cache_key {
+            req.prompt_cache_key(cache_key.to_string());
         }
         let req = req
             .messages(vec![sys.into(), user.into()])
@@ -576,6 +578,6 @@ impl LLMInner {
             .presence_penalty(settings.llm_presence_penalty)
             .max_completion_tokens(settings.llm_max_completion_tokens)
             .build()?;
-        self.complete(req, prefix, None).await
+        self.complete(req, debug_prefix, None).await
     }
 }

@@ -94,6 +94,7 @@ async fn main() {
             "Explain async Rust in one sentence.",
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -202,7 +203,7 @@ let llm = LLM::new(
     None,
 );
 
-match llm.prompt_once("system", "user", None, None).await {
+match llm.prompt_once("system", "user", None, None, None).await {
     Ok(resp) => { /* … */ }
     Err(llmy::LLMYError::Billing(cap, current)) => {
         eprintln!("Budget exceeded: ${:.4} / ${:.2}", current, cap);
