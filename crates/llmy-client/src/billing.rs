@@ -20,11 +20,11 @@ impl Display for ModelBilling {
             self.current, self.cap, self.input_tokens, if self.input_tokens == 0 {
                 0.0f64
             } else {
-                self.cache_tokens as f64 / self.input_tokens as f64
+                100f64 * self.cache_tokens as f64 / self.input_tokens as f64
             }, self.cache_tokens, self.output_tokens, if self.output_tokens == 0 {
                 0.0f64
             } else {
-                self.reasoning_tokens as f64 / self.output_tokens as f64
+                100f64 * self.reasoning_tokens as f64 / self.output_tokens as f64
             }, self.reasoning_tokens
         ))
     }
