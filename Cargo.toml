@@ -25,10 +25,16 @@ chrono = "0.4"
 tracing = "0.1"
 tokio = "1"
 tokio-stream = "0.1"
+dyn-clone = "1"
+schemars = "0.9"
 
 llmy-clap = {version = "0.4.1", path = "./crates/llmy-clap"}
 llmy-client = {version = "0.4.1", path = "./crates/llmy-client"}
 llmy-types = {version = "0.4.1", path = "./crates/llmy-types"}
 llmy-tokenizer = {version = "0.4.1", path = "./crates/llmy-tokenizer"}
+llmy-agent = {version = "0.4.1", path = "./crates/llmy-agent"}
+llmy-agent-tools = {version = "0.4.1", path = "./crates/llmy-agent-tools"}
+llmy-agent-derive = {version = "0.4.1", path = "./crates/llmy-agent-derive"}
+
 llmy = {version = "0.4.1", path = "./crates/llmy"}
 llm-cli = {version = "0.4.1", path = "./crates/llmy-cli"}

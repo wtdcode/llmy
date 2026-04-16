@@ -1,0 +1,28 @@
+[package]
+name = "llmy-agent-derive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+heck = "0.5"
+proc-macro-crate = "3"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "parsing"] }
+
+[dev-dependencies]
+llmy.workspace = true
+llmy-agent.workspace = true
+schemars.workspace = true
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+llmy-types.workspace = true

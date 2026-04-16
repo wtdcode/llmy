@@ -249,6 +249,91 @@ let n = count_tokens_for_model("Hello, world!", "anthropic/claude-sonnet-4"); //
 
 The model registry is generated from the same source-of-truth JSON used by the billing system, so model look-ups, pricing, and token counts always stay in sync.
 
+---
+
+### 5. Defining tools with `Tool` and `#[tool(...)]`
+
+`llmy-agent` models callable tools as a Rust trait. A tool has a strongly typed argument struct, a stable tool name, an optional description, and an async `invoke` method that returns `Result<String, LLMYError>`.
+
+You can depend on either the focused crate pair:
+
+```toml
+[dependencies]
+llmy-agent = "0.4"
+llmy-agent-derive = "0.4"
+```
+
+or the root crate plus the derive crate:
+
+```toml
+[dependencies]
+llmy = "0.4"
+llmy-agent-derive = "0.4"
+```
+
+The trait contract is:
+
+```rust
+use std::future::Future;
+
+use llmy_agent::{LLMYError, Tool};
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
+
+pub trait Tool: Send + Sync + std::fmt::Debug {
+    type ARGUMENTS: DeserializeOwned + JsonSchema + Send;
+    const NAME: &str;
+    const DESCRIPTION: Option<&str>;
+
+    fn invoke(
+        &self,
+        arguments: Self::ARGUMENTS,
+    ) -> impl Future<Output = Result<String, LLMYError>> + Send;
+}
+```
+
+In practice you usually write the typed arguments and the async method, then let `llmy-agent-derive` generate the `impl Tool` for you:
+
+```rust
+use std::path::PathBuf;
+
+use llmy::agent::LLMYError;
+use llmy_agent_derive::tool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(Deserialize, JsonSchema, Default)]
+pub struct ReadFileArgs {
+    /// The path of the file to read
+    pub file_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+#[tool(
+    arguments = ReadFileArgs,
+    invoke = read_file,
+    description = "Read file contents from `file_path`.",
+    name = "read_file",
+)]
+pub struct ReadFileTool {
+    pub cwd: PathBuf,
+}
+
+impl ReadFileTool {
+    pub async fn read_file(&self, args: ReadFileArgs) -> Result<String, LLMYError> {
+        let path = self.cwd.join(args.file_path);
+        Ok(tokio::fs::read_to_string(path).await?)
+    }
+}
+```
+
+Notes:
+
+- `arguments` and `invoke` are required in `#[tool(...)]`.
+- `description` is optional.
+- `name` is optional; if omitted, the struct name is converted to `snake_case`, for example `ReadFileTool -> read_file_tool`.
+- The generated impl works with either `llmy_agent::Tool` or `llmy::agent::Tool`.
+
 ## License
 
 MIT

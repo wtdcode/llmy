@@ -1,5 +1,5 @@
 [package]
-name = "llmy"
+name = "llmy-agent-tools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,11 +9,10 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
-llmy-clap.workspace = true
-llmy-client.workspace = true
+glob = "0.3"
 llmy-agent.workspace = true
-llmy-agent-tools.workspace = true
 llmy-agent-derive.workspace = true
-llmy-types.workspace = true
-llmy-tokenizer.workspace = true
-async-openai.workspace = true
+schemars.workspace = true
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+walkdir = "2"

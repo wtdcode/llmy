@@ -6,6 +6,13 @@ pub mod client {
     pub use llmy_client::*;
 }
 
+pub mod agent {
+    pub mod tools {
+        pub use llmy_agent_tools::*;
+    }
+    pub use llmy_agent::*;
+}
+
 pub mod tokenizer {
     pub use llmy_tokenizer::*;
 }

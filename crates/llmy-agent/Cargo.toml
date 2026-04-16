@@ -1,0 +1,20 @@
+[package]
+name = "llmy-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+tracing.workspace = true
+dyn-clone.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-openai = {workspace = true, features = ["chat-completion-types"]}
+
+llmy-agent-derive.workspace = true
+llmy-types.workspace = true
