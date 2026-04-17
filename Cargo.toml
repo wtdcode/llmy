@@ -27,6 +27,7 @@ tokio = "1"
 tokio-stream = "0.1"
 dyn-clone = "1"
 schemars = "0.9"
+fastembed = "5"
 
 llmy-clap = {version = "0.4.1", path = "./crates/llmy-clap"}
 llmy-client = {version = "0.4.1", path = "./crates/llmy-client"}

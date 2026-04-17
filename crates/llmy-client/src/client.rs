@@ -15,8 +15,9 @@ use async_openai::{
     error::OpenAIError,
     types::chat::{
         ChatChoice, ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-        ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionStreamOptions,
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+        ChatCompletionRequestUserMessageArgs, ChatCompletionResponseMessage,
+        ChatCompletionResponseStream, ChatCompletionStreamOptions, ChatCompletionTools,
         CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
         CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason,
         FunctionCall, Role,
@@ -193,8 +194,6 @@ impl LLMInner {
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
     ) -> Result<CreateChatCompletionResponse, LLMYError> {
-        let settings = settings.unwrap_or_else(|| self.default_settings.clone());
-        let timeout = settings.timeout();
         let sys = ChatCompletionRequestSystemMessageArgs::default()
             .content(sys_msg)
             .build()?;
@@ -202,27 +201,14 @@ impl LLMInner {
         let user = ChatCompletionRequestUserMessageArgs::default()
             .content(user_msg)
             .build()?;
-        let mut req = CreateChatCompletionRequestArgs::default();
-        req.messages(vec![sys.into(), user.into()])
-            .model(self.model.to_string())
-            .temperature(settings.llm_temperature)
-            .presence_penalty(settings.llm_presence_penalty)
-            .max_completion_tokens(settings.llm_max_completion_tokens);
-
-        if let Some(tc) = settings.llm_tool_choice {
-            req.tool_choice(tc);
-        }
-        if let Some(effort) = settings.reasoning_effort {
-            req.reasoning_effort(effort.0);
-        }
-        if let Some(cache_key) = cache_key {
-            req.prompt_cache_key(cache_key.to_string());
-        }
-
-        let req = req.build()?;
-
-        self.complete_once_with_retry(&req, debug_prefix, Some(timeout), Some(settings.llm_retry))
-            .await
+        self.prompt_messages_once(
+            vec![sys.into(), user.into()],
+            debug_prefix,
+            cache_key,
+            settings,
+            None,
+        )
+        .await
     }
 
     pub async fn complete_once_with_retry(
@@ -542,23 +528,23 @@ impl LLMInner {
         })
     }
 
-    pub async fn prompt_once(
+    pub async fn prompt_messages_once(
         &self,
-        sys_msg: &str,
-        user_msg: &str,
+        messages: Vec<ChatCompletionRequestMessage>,
         debug_prefix: Option<&str>,
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
+        tools: Option<Vec<ChatCompletionTools>>,
     ) -> Result<CreateChatCompletionResponse, LLMYError> {
         let settings = settings.unwrap_or_else(|| self.default_settings.clone());
-        let sys = ChatCompletionRequestSystemMessageArgs::default()
-            .content(sys_msg)
-            .build()?;
+        let timeout = settings.timeout();
+        let retry = settings.llm_retry;
 
-        let user = ChatCompletionRequestUserMessageArgs::default()
-            .content(user_msg)
-            .build()?;
         let mut req = CreateChatCompletionRequestArgs::default();
+
+        if let Some(tools) = tools {
+            req.tools(tools);
+        }
 
         if let Some(tc) = settings.llm_tool_choice {
             req.tool_choice(tc);
@@ -572,12 +558,38 @@ impl LLMInner {
             req.prompt_cache_key(cache_key.to_string());
         }
         let req = req
-            .messages(vec![sys.into(), user.into()])
+            .messages(messages)
             .model(self.model.to_string())
             .temperature(settings.llm_temperature)
             .presence_penalty(settings.llm_presence_penalty)
             .max_completion_tokens(settings.llm_max_completion_tokens)
             .build()?;
-        self.complete(req, debug_prefix, None).await
+        self.complete_once_with_retry(&req, debug_prefix, Some(timeout), Some(retry))
+            .await
+    }
+
+    pub async fn prompt_once(
+        &self,
+        sys_msg: &str,
+        user_msg: &str,
+        debug_prefix: Option<&str>,
+        cache_key: Option<&str>,
+        settings: Option<LLMSettings>,
+    ) -> Result<CreateChatCompletionResponse, LLMYError> {
+        let sys = ChatCompletionRequestSystemMessageArgs::default()
+            .content(sys_msg)
+            .build()?;
+
+        let user = ChatCompletionRequestUserMessageArgs::default()
+            .content(user_msg)
+            .build()?;
+        self.prompt_messages_once(
+            vec![sys.into(), user.into()],
+            debug_prefix,
+            cache_key,
+            settings,
+            None,
+        )
+        .await
     }
 }
