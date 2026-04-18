@@ -18,11 +18,13 @@ async-openai = {workspace = true, features = ["chat-completion-types"]}
 llmy-clap.workspace = true
 llmy-agent.workspace = true
 llmy-agent-tools.workspace = true
+llmy-harness.workspace = true
 llmy-client.workspace = true
 llmy-tokenizer.workspace = true
 tokio = {workspace = true, features = ["full"]}
 tracing.workspace = true
-color-eyre = "0"
-dotenvy = "0"
-rustyline = "15"
-tracing-subscriber = {version = "0", features = ["env-filter"]}
+color-eyre.workspace = true
+dotenvy.workspace = true
+rustyline.workspace = true
+shlex.workspace = true
+tracing-subscriber = {workspace = true, features = ["env-filter"]}

@@ -1,5 +1,5 @@
 [package]
-name = "llmy-agent"
+name = "llmy-harness"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,13 +9,12 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
-tracing.workspace = true
-dyn-clone.workspace = true
-schemars.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-async-openai = {workspace = true, features = ["chat-completion-types"]}
+async-openai = { workspace = true, features = ["chat-completion-types"] }
+color-eyre.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
-llmy-agent-derive.workspace = true
+llmy-agent-tools.workspace = true
+llmy-agent.workspace = true
+llmy-client.workspace = true
 llmy-types.workspace = true

@@ -13,6 +13,10 @@ pub mod agent {
     pub use llmy_agent::*;
 }
 
+pub mod harness {
+    pub use llmy_harness::*;
+}
+
 pub mod tokenizer {
     pub use llmy_tokenizer::*;
 }

@@ -57,7 +57,7 @@ pub struct SimilarityModelConfig {
 impl Display for SimilarityModelConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
-            "TextConfig(model={},cache_dir={})",
+            "SimilarityConfig(model={},cache_dir={})",
             EmbeddingModel::get_model_info(&self.model)
                 .unwrap()
                 .model_code,

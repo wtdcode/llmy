@@ -1627,6 +1627,7 @@ dependencies = [
  "llmy-agent-tools",
  "llmy-clap",
  "llmy-client",
+ "llmy-harness",
  "llmy-tokenizer",
  "llmy-types",
 ]
@@ -1636,16 +1637,12 @@ name = "llmy-agent"
 version = "0.4.1"
 dependencies = [
  "async-openai",
- "color-eyre",
  "dyn-clone",
- "fastembed",
  "llmy-agent-derive",
- "llmy-client",
  "llmy-types",
  "schemars",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
  "tracing",
 ]
@@ -1671,12 +1668,17 @@ dependencies = [
 name = "llmy-agent-tools"
 version = "0.4.1"
 dependencies = [
+ "color-eyre",
+ "fastembed",
  "glob",
  "llmy-agent",
  "llmy-agent-derive",
+ "llmy-types",
  "schemars",
  "serde",
+ "tempfile",
  "tokio",
+ "tracing",
  "walkdir",
 ]
 
@@ -1700,8 +1702,10 @@ dependencies = [
  "llmy-agent-tools",
  "llmy-clap",
  "llmy-client",
+ "llmy-harness",
  "llmy-tokenizer",
  "rustyline",
+ "shlex",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1720,6 +1724,20 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tracing",
+]
+
+[[package]]
+name = "llmy-harness"
+version = "0.4.1"
+dependencies = [
+ "async-openai",
+ "color-eyre",
+ "llmy-agent",
+ "llmy-agent-tools",
+ "llmy-client",
+ "llmy-types",
+ "tokio",
  "tracing",
 ]
 

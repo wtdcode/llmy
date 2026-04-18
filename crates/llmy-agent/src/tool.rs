@@ -3,11 +3,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, fmt::Debug};
 
-use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
+use async_openai::types::chat::{
+    ChatCompletionRequestMessage, ChatCompletionRequestToolMessage,
+    ChatCompletionRequestToolMessageContent, ChatCompletionTool, ChatCompletionTools,
+    FunctionObject,
+};
 use dyn_clone::DynClone;
-use llmy_types::error::LLMYError;
+use llmy_types::error::{GeneralToolCall, LLMYError};
 use schemars::schema_for;
 use serde::de::DeserializeOwned;
+use tokio::task::JoinSet;
 use tracing::debug;
 
 pub trait ToolDyn: DynClone + Debug + Send + Sync + std::any::Any {
@@ -83,12 +88,20 @@ impl<T: Tool + DynClone + 'static> ToolDyn for T {
 
 #[derive(Default, Clone, Debug)]
 pub struct ToolBox {
-    pub tools: HashMap<String, Arc<Box<dyn ToolDyn>>>,
+    tools: HashMap<String, Arc<Box<dyn ToolDyn>>>,
 }
 
 impl ToolBox {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.tools.len()
+    }
+
+    pub fn extend(&mut self, rhs: Self) {
+        self.tools.extend(rhs.tools.into_iter());
     }
 
     pub fn has_tool(&self, tool: &String) -> bool {
@@ -121,5 +134,47 @@ impl ToolBox {
         } else {
             None
         }
+    }
+
+    pub async fn invoke_many(
+        &self,
+        calls: Vec<GeneralToolCall>,
+    ) -> Vec<(GeneralToolCall, Option<Result<String, LLMYError>>)> {
+        let mut js = JoinSet::new();
+        for call in calls {
+            let tb = self.clone();
+            js.spawn(async move {
+                let tc: GeneralToolCall = call.clone();
+                tracing::info!("Calling {}", &tc);
+                (tc, tb.invoke(call.tool_name, call.tool_args).await)
+            });
+        }
+
+        js.join_all().await
+    }
+
+    pub async fn agent_invoke_many(
+        &self,
+        calls: Vec<GeneralToolCall>,
+    ) -> Result<Vec<(GeneralToolCall, ChatCompletionRequestMessage)>, LLMYError> {
+        let invokes = self.invoke_many(calls).await;
+
+        let mut out = vec![];
+        for (call, result) in invokes {
+            let result = result
+                .unwrap()
+                .map_err(|e| LLMYError::ToolCallError(call.clone(), Box::new(e)))?;
+            let id = call.tool_id.clone();
+            out.push((
+                call,
+                ChatCompletionRequestToolMessage {
+                    content: ChatCompletionRequestToolMessageContent::Text(result),
+                    tool_call_id: id,
+                }
+                .into(),
+            ));
+        }
+
+        Ok(out)
     }
 }
