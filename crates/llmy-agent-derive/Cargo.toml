@@ -17,12 +17,3 @@ proc-macro-crate = "3"
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full", "parsing"] }
-
-[dev-dependencies]
-llmy.workspace = true
-llmy-agent.workspace = true
-schemars.workspace = true
-serde = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, features = ["macros", "rt"] }
-
-llmy-types.workspace = true

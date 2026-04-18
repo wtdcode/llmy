@@ -5,7 +5,9 @@ use async_openai::types::chat::{
 };
 use color_eyre::eyre::eyre;
 use llmy_agent::{LLMYError, StepResult, Tool, tool::ToolBox};
-use llmy_agent_tools::memory::{AgentMemoryContext, UpdateMemoryTool, WriteMemoryTool};
+use llmy_agent_tools::memory::{
+    AgentMemory, AgentMemoryContent, AgentMemoryContext, UpdateMemoryTool, WriteMemoryTool,
+};
 use llmy_client::debug::completion_to_string;
 use llmy_client::{client::LLM, settings::LLMSettings};
 
@@ -86,6 +88,20 @@ impl Agent {
         std::iter::once(Self::system_message(self.system_prompt.clone()))
             .chain(self.context.clone())
             .collect()
+    }
+
+    pub fn render_context(&self) -> String {
+        self.conversation_context()
+            .iter()
+            .map(completion_to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub async fn render_memory(&self) -> Option<String> {
+        let memory = self.memory.as_ref()?;
+        let guard = memory.context.memory.read().await;
+        Some(render_memory_snapshot(&guard))
     }
 
     pub fn last_step(&self) -> &Option<StepResult> {
@@ -312,12 +328,7 @@ impl Agent {
     }
 
     fn compact_history_text(&self) -> String {
-        let mut messages = Vec::with_capacity(self.context.len() + 1);
-        messages.push(completion_to_string(&Self::system_message(
-            self.system_prompt.clone(),
-        )));
-        messages.extend(self.context.iter().map(completion_to_string));
-        messages.join("\n")
+        self.render_context()
     }
 
     fn did_write_memory(&self) -> bool {
@@ -358,6 +369,41 @@ fn compact_settings(settings: Option<LLMSettings>, memory_enabled: bool) -> Opti
     })
 }
 
+fn render_memory_snapshot(memory: &AgentMemory) -> String {
+    [
+        render_memory_section("Long-term memory entries", memory.long_term.values()),
+        render_memory_section("Short-term memory entries", memory.short_term.values()),
+    ]
+    .join("\n\n")
+}
+
+fn render_memory_section<'a>(
+    title: &str,
+    memories: impl IntoIterator<Item = &'a AgentMemoryContent>,
+) -> String {
+    let rendered = memories
+        .into_iter()
+        .map(render_memory_entry)
+        .collect::<Vec<_>>();
+
+    if rendered.is_empty() {
+        format!("{title}:\n<none/>")
+    } else {
+        format!("{title}:\n\n{}", rendered.join("\n\n---\n\n"))
+    }
+}
+
+fn render_memory_entry(memory: &AgentMemoryContent) -> String {
+    let mut rendered = memory.render_full();
+
+    if let Some(raw_content) = memory.raw_content.as_deref() {
+        rendered.push_str("\nraw_content:\n");
+        rendered.push_str(raw_content);
+    }
+
+    rendered
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,10 +417,54 @@ mod tests {
         );
         agent.push_user_message("implement compaction".to_string());
 
-        let rendered = agent.compact_history_text();
+        let rendered = agent.render_context();
 
         assert!(rendered.contains("<SYSTEM>\nbase system prompt\n</SYSTEM>"));
         assert!(rendered.contains("<USER>\nimplement compaction\n</USER>"));
+    }
+
+    #[tokio::test]
+    async fn render_memory_returns_none_without_shared_memory() {
+        let agent = Agent::new(
+            "base system prompt".to_string(),
+            ToolBox::new(),
+            "cache".to_string(),
+        );
+
+        assert_eq!(agent.render_memory().await, None);
+    }
+
+    #[test]
+    fn render_memory_snapshot_includes_long_short_and_raw_content() {
+        let mut memory = AgentMemory::default();
+        memory.long_term.insert(
+            "long".to_string(),
+            AgentMemoryContent {
+                title: "long".to_string(),
+                related_context: "repo".to_string(),
+                trigger_scenario: "planning".to_string(),
+                content: "long-term detail".to_string(),
+                raw_content: Some("full long-term transcript".to_string()),
+            },
+        );
+        memory.short_term.insert(
+            "short".to_string(),
+            AgentMemoryContent {
+                title: "short".to_string(),
+                related_context: "task".to_string(),
+                trigger_scenario: "active work".to_string(),
+                content: "short-term detail".to_string(),
+                raw_content: None,
+            },
+        );
+
+        let rendered = render_memory_snapshot(&memory);
+
+        assert!(rendered.contains("Long-term memory entries:"));
+        assert!(rendered.contains("Short-term memory entries:"));
+        assert!(rendered.contains("content:\nlong-term detail"));
+        assert!(rendered.contains("content:\nshort-term detail"));
+        assert!(rendered.contains("raw_content:\nfull long-term transcript"));
     }
 
     #[test]
@@ -424,11 +514,15 @@ mod tests {
             embed::{SimilarityModel, SimilarityModelConfig},
         };
 
+        let cache_dir = tempfile::tempdir().unwrap();
         let memory = AgentMemoryContext::new(
             AgentMemory::default(),
-            SimilarityModel::new(SimilarityModelConfig::default())
-                .await
-                .unwrap(),
+            SimilarityModel::new(SimilarityModelConfig {
+                cache_dir: Some(cache_dir.path().to_path_buf()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
         );
         {
             let mut guard = memory.memory.write().await;

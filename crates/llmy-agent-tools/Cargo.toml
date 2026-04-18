@@ -23,5 +23,5 @@ llmy-agent.workspace = true
 llmy-agent-derive.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }

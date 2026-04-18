@@ -17,7 +17,6 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_tool(args, item_struct).into()
 }
 
-#[derive(Debug)]
 struct ToolArgs {
     description: Option<LitStr>,
     arguments: Type,
@@ -234,23 +233,27 @@ mod tests {
 
     #[test]
     fn rejects_missing_required_arguments() {
-        let err = parse2::<ToolArgs>(quote! {
+        let err = match parse2::<ToolArgs>(quote! {
             description = "Read a file",
             invoke = read_file
-        })
-        .expect_err("missing arguments should fail");
+        }) {
+            Ok(_) => panic!("missing arguments should fail"),
+            Err(err) => err,
+        };
 
         assert_eq!(err.to_string(), "missing required `arguments` argument");
     }
 
     #[test]
     fn rejects_duplicate_arguments() {
-        let err = parse2::<ToolArgs>(quote! {
+        let err = match parse2::<ToolArgs>(quote! {
             arguments = FirstArgs,
             arguments = SecondArgs,
             invoke = read_file
-        })
-        .expect_err("duplicate arguments should fail");
+        }) {
+            Ok(_) => panic!("duplicate arguments should fail"),
+            Err(err) => err,
+        };
 
         assert_eq!(err.to_string(), "duplicate `arguments` argument");
     }

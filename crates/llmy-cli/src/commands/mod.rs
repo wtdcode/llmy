@@ -1,4 +1,5 @@
 pub mod chat;
+mod chat_commands;
 pub mod models;
 pub mod tokenizer;
 

@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use clap::{Args, Parser, Subcommand};
+use clap::Args;
 use llmy_agent::tool::ToolBox;
 use llmy_agent_tools::files::{FindFileTool, ListDirectoryTool, ReadFileTool, WriteFileTool};
 use llmy_agent_tools::memory::{
@@ -14,6 +14,8 @@ use llmy_clap::OpenAISetup;
 use llmy_client::client::LLM;
 use llmy_harness::{Agent, memory::AgentMemorySystemPromptCriteria};
 use rustyline::{DefaultEditor, error::ReadlineError};
+
+use super::chat_commands::{ChatInput, parse_chat_input, run_chat_command};
 
 #[derive(Args)]
 pub struct ChatArgs {
@@ -39,24 +41,6 @@ pub struct ChatArgs {
     /// Cache directory for the local embedding model. Used only with --memory.
     #[arg(long)]
     memory_cache_dir: Option<PathBuf>,
-}
-
-#[derive(Debug)]
-enum ChatInput {
-    User(String),
-    Command(ChatCommand),
-}
-
-#[derive(Debug, Parser)]
-#[command(name = "/", no_binary_name = true, disable_help_flag = true)]
-struct ChatCommandLine {
-    #[command(subcommand)]
-    command: ChatCommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum ChatCommand {
-    Compact,
 }
 
 pub async fn run_chat(args: ChatArgs) -> color_eyre::Result<()> {
@@ -89,9 +73,9 @@ pub async fn run_chat(args: ChatArgs) -> color_eyre::Result<()> {
                 }
             }
             Ok(ChatInput::Command(command)) => {
-                agent = run_chat_command(
+                run_chat_command(
                     command,
-                    agent,
+                    &mut agent,
                     &llm,
                     Some("chat"),
                     Some(settings.clone()),
@@ -152,48 +136,6 @@ fn build_memory_config(args: &ChatArgs) -> color_eyre::Result<SimilarityModelCon
 
 fn default_memory_embed_model() -> String {
     SimilarityModelConfig::default().model.to_string()
-}
-
-fn parse_chat_input(input: &str) -> Result<ChatInput, String> {
-    if !input.starts_with('/') {
-        return Ok(ChatInput::User(input.to_string()));
-    }
-
-    let command_text = input.trim_start_matches('/');
-    let Some(tokens) = shlex::split(command_text) else {
-        return Err(
-            "Failed to parse command line: unmatched quotes or escape sequence.".to_string(),
-        );
-    };
-
-    if tokens.is_empty() {
-        return Err("Empty command. Try /compact.".to_string());
-    }
-
-    ChatCommandLine::try_parse_from(tokens)
-        .map(|parsed| ChatInput::Command(parsed.command))
-        .map_err(|error| error.to_string())
-}
-
-async fn run_chat_command(
-    command: ChatCommand,
-    agent: Agent,
-    llm: &LLM,
-    debug_prefix: Option<&str>,
-    settings: Option<llmy_client::settings::LLMSettings>,
-    is_tty: bool,
-) -> color_eyre::Result<Agent> {
-    match command {
-        ChatCommand::Compact => {
-            let compacted = agent.compact(llm, debug_prefix, settings).await?;
-            if is_tty {
-                println!("\nConversation compacted.\n");
-            } else {
-                println!("Conversation compacted.");
-            }
-            Ok(compacted)
-        }
-    }
 }
 
 fn resolve_files_root(root: Option<PathBuf>) -> color_eyre::Result<Option<PathBuf>> {
@@ -293,31 +235,6 @@ impl ChatReader {
                     return Ok(Some(input.to_string()));
                 }
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_chat_input_keeps_plain_user_text() {
-        let parsed = parse_chat_input("hello world").unwrap();
-
-        match parsed {
-            ChatInput::User(text) => assert_eq!(text, "hello world"),
-            ChatInput::Command(_) => panic!("expected plain user input"),
-        }
-    }
-
-    #[test]
-    fn parse_chat_input_parses_compact_command() {
-        let parsed = parse_chat_input("/compact").unwrap();
-
-        match parsed {
-            ChatInput::Command(ChatCommand::Compact) => {}
-            ChatInput::User(_) => panic!("expected compact command"),
         }
     }
 }

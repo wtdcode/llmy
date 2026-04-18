@@ -175,6 +175,10 @@ pub struct LLMInner {
 }
 
 impl LLMInner {
+    pub async fn billing_snapshot(&self) -> ModelBilling {
+        self.billing.read().await.clone()
+    }
+
     fn on_llm_debug(&self, debug_prefix: &str) -> Option<PathBuf> {
         if let Some(output_folder) = self.llm_debug.as_ref() {
             let idx = self.llm_debug_index.fetch_add(1, Ordering::SeqCst);
