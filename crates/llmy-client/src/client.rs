@@ -379,6 +379,7 @@ impl LLMInner {
         Ok(resp)
     }
 
+    #[allow(deprecated)]
     async fn complete_streaming(
         &self,
         mut req: CreateChatCompletionRequest,

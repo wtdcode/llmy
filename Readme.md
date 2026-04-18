@@ -2,6 +2,78 @@
 
 All-in-one LLM utilities for Rust — plug OpenAI / Azure settings straight into [clap](https://crates.io/crates/clap), track spend with built-in billing, and replay every request when things go wrong.
 
+## Harnessing An Agent
+
+The harness layer gives you a concrete in-memory `Agent` that can hold conversation state, expose tools to the model, and run a full user turn through any tool-call loop. A minimal coding agent only needs a system prompt, an `LLM`, and a `ToolBox` with the tools you want to expose.
+
+The example below builds a basic agent that can read files, list directories, and search for files by glob pattern:
+
+```toml
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+llmy = "0.5"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+```rust
+use std::path::PathBuf;
+
+use clap::Parser;
+use llmy::agent::tool::ToolBox;
+use llmy::agent::tools::files::{FindFileTool, ListDirectoryTool, ReadFileTool};
+use llmy::clap::OpenAISetup;
+use llmy::harness::Agent;
+
+#[derive(Parser)]
+struct Cli {
+    #[command(flatten)]
+    llm: OpenAISetup,
+
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), llmy::LLMYError> {
+    let cli = Cli::parse();
+    let settings = cli.llm.settings();
+    let llm = cli.llm.to_llm();
+
+    let mut tools = ToolBox::new();
+    tools.add_tool(ReadFileTool::new(cli.root.clone()));
+    tools.add_tool(ListDirectoryTool::new_root(cli.root.clone()));
+    tools.add_tool(FindFileTool::new(cli.root.clone()));
+
+    let mut agent = Agent::new(
+        "You are a coding assistant. Use the available file tools whenever you need to inspect the workspace.".to_string(),
+        tools,
+        "readme-basic-agent".to_string(),
+    );
+
+    let result = agent
+        .loop_step_user(
+            "List the root directory, find Rust files under src, and then read Cargo.toml."
+                .to_string(),
+            &llm,
+            Some("readme-basic-agent"),
+            Some(settings),
+        )
+        .await?;
+
+    if let Some(message) = result.assistant_message() {
+        println!("{message}");
+    }
+
+    Ok(())
+}
+```
+
+Run it with your OpenAI settings:
+
+```bash
+OPENAI_API_KEY=sk-... cargo run -- --model gpt-4o --root .
+```
+
 ## CLI
 
 Install the command-line tool:
@@ -60,7 +132,7 @@ Add the dependency (the root crate re-exports everything):
 
 ```toml
 [dependencies]
-llmy = "0.3"
+llmy = "0.5"
 ```
 
 ### 1. Clap integration — up to 3 LLM slots
@@ -259,16 +331,16 @@ You can depend on either the focused crate pair:
 
 ```toml
 [dependencies]
-llmy-agent = "0.4"
-llmy-agent-derive = "0.4"
+llmy-agent = "0.5"
+llmy-agent-derive = "0.5"
 ```
 
 or the root crate plus the derive crate:
 
 ```toml
 [dependencies]
-llmy = "0.4"
-llmy-agent-derive = "0.4"
+llmy = "0.5"
+llmy-agent-derive = "0.5"
 ```
 
 The trait contract is:

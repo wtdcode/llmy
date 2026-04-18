@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 readme = "Readme.md"
@@ -35,14 +35,14 @@ rustyline = "15"
 shlex = "1"
 tracing-subscriber = "0"
 
-llmy-clap = {version = "0.4.1", path = "./crates/llmy-clap"}
-llmy-client = {version = "0.4.1", path = "./crates/llmy-client"}
-llmy-types = {version = "0.4.1", path = "./crates/llmy-types"}
-llmy-tokenizer = {version = "0.4.1", path = "./crates/llmy-tokenizer"}
-llmy-agent = {version = "0.4.1", path = "./crates/llmy-agent"}
-llmy-agent-tools = {version = "0.4.1", path = "./crates/llmy-agent-tools"}
-llmy-agent-derive = {version = "0.4.1", path = "./crates/llmy-agent-derive"}
-llmy-harness = {version = "0.4.1", path = "./crates/llmy-harness"}
+llmy-clap = {version = "0.5.0", path = "./crates/llmy-clap"}
+llmy-client = {version = "0.5.0", path = "./crates/llmy-client"}
+llmy-types = {version = "0.5.0", path = "./crates/llmy-types"}
+llmy-tokenizer = {version = "0.5.0", path = "./crates/llmy-tokenizer"}
+llmy-agent = {version = "0.5.0", path = "./crates/llmy-agent"}
+llmy-agent-tools = {version = "0.5.0", path = "./crates/llmy-agent-tools"}
+llmy-agent-derive = {version = "0.5.0", path = "./crates/llmy-agent-derive"}
+llmy-harness = {version = "0.5.0", path = "./crates/llmy-harness"}
 
-llmy = {version = "0.4.1", path = "./crates/llmy"}
-llm-cli = {version = "0.4.1", path = "./crates/llmy-cli"}
+llmy = {version = "0.5.0", path = "./crates/llmy"}
+llm-cli = {version = "0.5.0", path = "./crates/llmy-cli"}
