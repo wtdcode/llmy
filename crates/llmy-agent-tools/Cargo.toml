@@ -9,10 +9,11 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
+const_format.workspace = true
 glob.workspace = true
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+tokio = { workspace = true, features = ["fs", "io-util", "process", "rt", "time"] }
 fastembed = {workspace = true, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"]}
 walkdir.workspace = true
 color-eyre.workspace = true
@@ -24,4 +25,4 @@ llmy-agent-derive.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

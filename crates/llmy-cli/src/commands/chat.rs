@@ -5,7 +5,10 @@ use std::{
 
 use clap::Args;
 use llmy_agent::tool::ToolBox;
-use llmy_agent_tools::files::{FindFileTool, ListDirectoryTool, ReadFileTool, WriteFileTool};
+use llmy_agent_tools::bash::{BashTool, BashToolConfig};
+use llmy_agent_tools::files::{
+    DeleteFileTool, EditFileTool, FindFileTool, ListDirectoryTool, ReadFileTool, WriteFileTool,
+};
 use llmy_agent_tools::memory::{
     AgentMemory, AgentMemoryContext,
     embed::{SimilarityModel, SimilarityModelConfig},
@@ -30,6 +33,10 @@ pub struct ChatArgs {
     #[arg(long, value_name = "ROOT", num_args = 0..=1, default_missing_value = ".")]
     agent_files: Option<PathBuf>,
 
+    /// Enable a dangerous bash tool for the agent.
+    #[arg(long, default_value_t = false)]
+    agent_bash: bool,
+
     /// Enable shared memory tools for the chat agent.
     #[arg(long, default_value_t = false)]
     memory: bool,
@@ -51,8 +58,9 @@ pub async fn run_chat(args: ChatArgs) -> color_eyre::Result<()> {
         .as_deref()
         .unwrap_or("You are a helpful assistant.");
     let files_root = resolve_files_root(args.agent_files.clone())?;
-    let system_prompt = build_system_prompt(system, files_root.as_deref());
-    let tools = build_toolbox(files_root.clone());
+    let bash_root = resolve_bash_root(args.agent_bash)?;
+    let system_prompt = build_system_prompt(system, files_root.as_deref(), bash_root.as_deref());
+    let tools = build_toolbox(files_root.clone(), bash_root);
     let mut agent = build_agent(&args, system_prompt, tools).await?;
 
     let stdin = std::io::stdin();
@@ -149,28 +157,50 @@ fn resolve_files_root(root: Option<PathBuf>) -> color_eyre::Result<Option<PathBu
     .transpose()
 }
 
-fn build_toolbox(files_root: Option<PathBuf>) -> ToolBox {
+fn resolve_bash_root(enabled: bool) -> color_eyre::Result<Option<PathBuf>> {
+    enabled
+        .then(std::env::current_dir)
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn build_toolbox(files_root: Option<PathBuf>, bash_root: Option<PathBuf>) -> ToolBox {
     let mut toolbox = ToolBox::new();
+
+    if let Some(root) = bash_root {
+        toolbox.add_tool(BashTool::new(root, BashToolConfig::default()));
+    }
 
     if let Some(root) = files_root {
         toolbox.add_tool(ReadFileTool::new(root.clone()));
         toolbox.add_tool(ListDirectoryTool::new_root(root.clone()));
         toolbox.add_tool(FindFileTool::new(root.clone()));
-        toolbox.add_tool(WriteFileTool::new(root));
+        toolbox.add_tool(WriteFileTool::new(root.clone()));
+        toolbox.add_tool(DeleteFileTool::new(root.clone()));
+        toolbox.add_tool(EditFileTool::new(root));
     }
 
     toolbox
 }
 
-fn build_system_prompt(base: &str, files_root: Option<&Path>) -> String {
+fn build_system_prompt(base: &str, files_root: Option<&Path>, bash_root: Option<&Path>) -> String {
+    let mut sections = vec![base.to_string()];
+
     if let Some(root) = files_root {
-        format!(
-            "{base}\n\nYou can use sandboxed file tools rooted at {}. All tool paths must be relative to this root. Use the available file tools when you need to inspect or modify files.",
+        sections.push(format!(
+            "You can use sandboxed file tools rooted at {}. All tool paths must be relative to this root. Use the available file tools when you need to inspect or modify files.",
             root.display()
-        )
-    } else {
-        base.to_string()
+        ));
     }
+
+    if let Some(root) = bash_root {
+        sections.push(format!(
+            "You can use the dangerous bash tool to execute shell commands. Commands start in {} unless `working_directory` is provided. This tool can modify files, run programs, and access the network, so use it carefully.",
+            root.display()
+        ));
+    }
+
+    sections.join("\n\n")
 }
 
 fn print_last_step(agent: &Agent, is_tty: bool) -> bool {

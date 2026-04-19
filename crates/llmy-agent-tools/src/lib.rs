@@ -1,3 +1,5 @@
+/// Shell command execution tools.
+pub mod bash;
 /// File-system oriented tools built on top of `llmy-agent`.
 pub mod files;
 /// Memory related tools

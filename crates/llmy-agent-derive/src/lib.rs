@@ -18,7 +18,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 struct ToolArgs {
-    description: Option<LitStr>,
+    description: Option<Expr>,
     arguments: Type,
     name: Option<LitStr>,
     invoke: Ident,
@@ -42,12 +42,7 @@ impl Parse for ToolArgs {
 
             match key.as_str() {
                 "description" => {
-                    assign_once(
-                        &mut description,
-                        parse_string_literal(&arg.value, "description")?,
-                        "description",
-                        &arg,
-                    )?;
+                    assign_once(&mut description, arg.value.clone(), "description", &arg)?;
                 }
                 "arguments" => {
                     assign_once(
@@ -220,7 +215,16 @@ mod tests {
         .expect("tool args should parse");
 
         assert_eq!(
-            args.description.as_ref().map(LitStr::value).as_deref(),
+            args.description
+                .as_ref()
+                .and_then(|expr| match expr {
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Str(value),
+                        ..
+                    }) => Some(value.value()),
+                    _ => None,
+                })
+                .as_deref(),
             Some("Read a file")
         );
         assert_eq!(
@@ -299,5 +303,18 @@ mod tests {
 
         assert_eq!(tool_path.to_string(), "crate :: agent :: Tool");
         assert_eq!(error_path.to_string(), "crate :: agent :: LLMYError");
+    }
+
+    #[test]
+    fn parses_concat_macro_description() {
+        let args: ToolArgs = parse2(quote! {
+            description = concat!("Read ", "a file"),
+            arguments = ReadFileToolArgs,
+            name = "read_file",
+            invoke = read_file
+        })
+        .expect("tool args should parse");
+
+        assert!(matches!(args.description, Some(Expr::Macro(_))));
     }
 }
