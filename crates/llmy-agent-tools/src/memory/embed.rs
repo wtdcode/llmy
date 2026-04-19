@@ -72,6 +72,7 @@ impl Display for SimilarityModelConfig {
 pub struct SimilarityModelInner {
     embedding: Mutex<TextEmbedding>,
     pub config: SimilarityModelConfig,
+    max_input_tokens: usize,
 }
 
 impl SimilarityModelInner {
@@ -89,6 +90,72 @@ impl SimilarityModelInner {
             .map(|v| v.into_iter().map(f64::from).collect::<Vec<f64>>())
             .map(|v| Embeding(v))
             .collect())
+    }
+
+    pub fn count_tokens(&self, text: &str) -> Result<usize, LLMYError> {
+        let model = self
+            .embedding
+            .lock()
+            .map_err(|_| eyre!("local embedding model lock was poisoned"))?;
+        let mut tokenizer = model.tokenizer.clone();
+        tokenizer
+            .with_truncation(None)
+            .map_err(|error| eyre!("failed to disable embedding tokenizer truncation: {error}"))?;
+        let encoding = tokenizer
+            .encode(text, false)
+            .map_err(|error| eyre!("failed to tokenize embedding input: {error}"))?;
+
+        Ok(encoding.len())
+    }
+
+    pub fn truncate_to_token_limit(
+        &self,
+        text: &str,
+        token_limit: usize,
+    ) -> Result<String, LLMYError> {
+        if text.is_empty() {
+            return Ok(String::new());
+        }
+
+        let model = self
+            .embedding
+            .lock()
+            .map_err(|_| eyre!("local embedding model lock was poisoned"))?;
+        let mut tokenizer = model.tokenizer.clone();
+        tokenizer
+            .with_truncation(None)
+            .map_err(|error| eyre!("failed to disable embedding tokenizer truncation: {error}"))?;
+
+        let token_count = tokenizer
+            .encode(text, false)
+            .map_err(|error| eyre!("failed to tokenize embedding input: {error}"))?
+            .len();
+        if token_count <= token_limit {
+            return Ok(text.to_string());
+        }
+
+        let mut lo = 0usize;
+        let mut hi = text.len();
+        let mut best = 0usize;
+
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            let boundary = char_boundary_before(text, mid);
+            let prefix = &text[..boundary];
+            let tokens = tokenizer
+                .encode(prefix, false)
+                .map_err(|error| eyre!("failed to tokenize embedding input: {error}"))?
+                .len();
+
+            if tokens <= token_limit {
+                best = best.max(boundary);
+                lo = mid.saturating_add(1);
+            } else {
+                hi = mid.saturating_sub(1);
+            }
+        }
+
+        Ok(text[..best].to_string())
     }
 }
 
@@ -128,12 +195,23 @@ impl SimilarityModel {
         .await
         .map_err(|error| eyre!("local embedding initialization panicked: {error}"))??;
 
+        let max_input_tokens = embedding
+            .tokenizer
+            .get_truncation()
+            .map(|params| params.max_length)
+            .ok_or_else(|| eyre!("embedding tokenizer was initialized without truncation"))?;
+
         Ok(Self {
             inner: Arc::new(SimilarityModelInner {
                 embedding: Mutex::new(embedding),
                 config,
+                max_input_tokens,
             }),
         })
+    }
+
+    pub fn max_input_tokens(&self) -> usize {
+        self.inner.max_input_tokens
     }
 
     pub async fn batch_embed(&self, queries: Vec<String>) -> Result<Vec<Embeding>, LLMYError> {
@@ -141,6 +219,21 @@ impl SimilarityModel {
         tokio::task::spawn_blocking(move || inner.batch_embed(queries))
             .await
             .expect("batch embed paniced")
+    }
+
+    pub async fn count_tokens(&self, text: String) -> Result<usize, LLMYError> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || inner.count_tokens(&text))
+            .await
+            .expect("count tokens paniced")
+    }
+
+    pub async fn truncate_to_input_tokens(&self, text: String) -> Result<String, LLMYError> {
+        let inner = self.inner.clone();
+        let token_limit = self.max_input_tokens();
+        tokio::task::spawn_blocking(move || inner.truncate_to_token_limit(&text, token_limit))
+            .await
+            .expect("truncate input paniced")
     }
 
     pub async fn batch_similarity(
@@ -218,6 +311,14 @@ impl SimilarityModel {
     }
 }
 
+fn char_boundary_before(text: &str, byte_offset: usize) -> usize {
+    let position = byte_offset.min(text.len());
+    (0..=position)
+        .rev()
+        .find(|&index| text.is_char_boundary(index))
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +361,62 @@ mod tests {
         assert_eq!(embeddings.len(), 2);
         assert!(!embeddings[0].0.is_empty());
         assert_eq!(embeddings[0].0.len(), embeddings[1].0.len());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn count_tokens_reports_non_zero_for_non_empty_text() {
+        let model = shared_model().await;
+
+        let token_count = model
+            .count_tokens("tokio runtime async rust".to_string())
+            .await
+            .expect("failed to count tokens");
+
+        assert!(token_count > 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn count_tokens_can_exceed_model_input_limit_for_overlong_text() {
+        let model = shared_model().await;
+        let max_input_tokens = model.max_input_tokens();
+        let mut repetitions = 1usize;
+
+        loop {
+            let text = "tokio runtime async rust ".repeat(repetitions);
+            let token_count = model
+                .count_tokens(text)
+                .await
+                .expect("failed to count tokens for overlong text");
+
+            if token_count > max_input_tokens {
+                assert!(token_count > max_input_tokens);
+                break;
+            }
+
+            repetitions = repetitions.saturating_mul(2);
+            assert!(
+                repetitions <= max_input_tokens.max(1),
+                "failed to produce an overlong text within the expected repetition bound"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn truncate_to_input_tokens_reduces_long_text() {
+        let model = shared_model().await;
+        let text = "tokio runtime async rust ".repeat(model.max_input_tokens());
+
+        let truncated = model
+            .truncate_to_input_tokens(text.clone())
+            .await
+            .expect("failed to truncate text");
+        let token_count = model
+            .count_tokens(truncated.clone())
+            .await
+            .expect("failed to count truncated tokens");
+
+        assert!(truncated.len() < text.len());
+        assert!(token_count <= model.max_input_tokens());
     }
 
     #[tokio::test(flavor = "current_thread")]

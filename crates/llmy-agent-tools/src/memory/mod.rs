@@ -17,6 +17,57 @@ use tokio::sync::RwLock;
 
 use crate::memory::embed::{Embeding, SimilarityModel};
 
+#[derive(Clone, Debug)]
+pub struct AgentMemorySearchWeights {
+    pub title: f64,
+    pub related_context: f64,
+    pub trigger_scenario: f64,
+    pub content: f64,
+}
+
+impl Default for AgentMemorySearchWeights {
+    fn default() -> Self {
+        Self {
+            title: 0.5,
+            related_context: 0.2,
+            trigger_scenario: 0.2,
+            content: 0.1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CachedMemoryEmbeddings {
+    title: Option<Embeding>,
+    related_context: Option<Embeding>,
+    trigger_scenario: Option<Embeding>,
+    content: Option<Embeding>,
+}
+
+#[derive(Clone, Debug)]
+struct SearchableMemoryEntry {
+    title: String,
+    related_context: String,
+    trigger_scenario: String,
+    content: String,
+}
+
+#[derive(Clone, Debug)]
+struct MemoryFieldLengthViolation {
+    field_name: &'static str,
+    token_count: usize,
+    max_tokens: usize,
+}
+
+impl MemoryFieldLengthViolation {
+    fn render(&self) -> String {
+        format!(
+            "Field {:?} is too long for the local memory embedding model: {} tokens exceeds the limit of {}. Regenerate that field with a shorter, denser value and call the tool again.",
+            self.field_name, self.token_count, self.max_tokens
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentMemoryContent {
     /// The title of the memory and should be concise, i.e., less than 128 characters in English.
@@ -68,7 +119,8 @@ pub struct AgentMemory {
 pub struct AgentMemoryContextInner {
     pub memory: RwLock<AgentMemory>,
     pub embed: SimilarityModel,
-    title_embed_cache: RwLock<BTreeMap<String, Embeding>>,
+    search_weights: AgentMemorySearchWeights,
+    search_embed_cache: RwLock<BTreeMap<String, CachedMemoryEmbeddings>>,
 }
 
 #[derive(Clone)]
@@ -91,11 +143,20 @@ impl Deref for AgentMemoryContext {
 
 impl AgentMemoryContext {
     pub fn new(memory: AgentMemory, embed: SimilarityModel) -> Self {
+        Self::new_with_search_weights(memory, embed, AgentMemorySearchWeights::default())
+    }
+
+    pub fn new_with_search_weights(
+        memory: AgentMemory,
+        embed: SimilarityModel,
+        search_weights: AgentMemorySearchWeights,
+    ) -> Self {
         Self {
             inner: Arc::new(AgentMemoryContextInner {
                 memory: RwLock::new(memory),
                 embed,
-                title_embed_cache: RwLock::new(BTreeMap::new()),
+                search_weights,
+                search_embed_cache: RwLock::new(BTreeMap::new()),
             }),
         }
     }
@@ -117,6 +178,23 @@ impl AgentMemoryContext {
         memory_content: AgentMemoryContent,
         is_long_term: bool,
     ) -> MemoryWriteResult {
+        if let Some(violation) = self
+            .validate_searchable_fields([
+                ("title", Some(memory_content.title.as_str())),
+                (
+                    "related_context",
+                    Some(memory_content.related_context.as_str()),
+                ),
+                (
+                    "trigger_scenario",
+                    Some(memory_content.trigger_scenario.as_str()),
+                ),
+            ])
+            .await
+        {
+            return MemoryWriteResult::ValidationRejected { violation };
+        }
+
         let mut memory = self.memory.write().await;
         let title = memory_content.title.clone();
 
@@ -159,6 +237,16 @@ impl AgentMemoryContext {
         content: Option<String>,
         raw_content: Option<String>,
     ) -> MemoryUpdateResult {
+        if let Some(violation) = self
+            .validate_searchable_fields([
+                ("related_context", related_context.as_deref()),
+                ("trigger_scenario", trigger_scenario.as_deref()),
+            ])
+            .await
+        {
+            return MemoryUpdateResult::ValidationRejected { violation };
+        }
+
         let mut memory = self.memory.write().await;
 
         let target = if let Some(memory_content) = memory.short_term.get_mut(title) {
@@ -199,6 +287,13 @@ impl AgentMemoryContext {
         if updated_fields.is_empty() {
             MemoryUpdateResult::NoChanges
         } else {
+            if updated_fields
+                .iter()
+                .any(|field| matches!(*field, "related_context" | "trigger_scenario" | "content"))
+            {
+                self.search_embed_cache.write().await.remove(title);
+            }
+
             MemoryUpdateResult::Updated {
                 scope,
                 updated_fields,
@@ -221,7 +316,7 @@ impl AgentMemoryContext {
 
         match deleted_scope {
             Some(scope) => {
-                self.title_embed_cache.write().await.remove(title);
+                self.search_embed_cache.write().await.remove(title);
                 MemoryDeleteResult::Deleted { scope }
             }
             None => MemoryDeleteResult::NotFound,
@@ -252,12 +347,12 @@ impl AgentMemoryContext {
             return Ok(Vec::new());
         }
 
-        let titles = {
+        let entries = {
             let memory = self.memory.read().await;
-            collect_memory_titles(&memory)
+            collect_searchable_memory_entries(&memory)
         };
 
-        if titles.is_empty() {
+        if entries.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -268,10 +363,16 @@ impl AgentMemoryContext {
             .into_iter()
             .next()
             .ok_or_else(|| eyre!("local embedding model returned no query embedding"))?;
-        let title_embeddings = self.cached_title_embeddings(&titles).await?;
-        let scores = query_embedding.calculate_similarity(&title_embeddings);
-
-        let mut ranked = titles.into_iter().zip(scores).collect::<Vec<_>>();
+        let cached_embeddings = self.cached_memory_embeddings(&entries).await?;
+        let mut ranked = entries
+            .into_iter()
+            .zip(cached_embeddings)
+            .map(|(entry, embeddings)| {
+                let score =
+                    weighted_similarity(&query_embedding, &embeddings, &self.search_weights);
+                (entry.title, score)
+            })
+            .collect::<Vec<_>>();
         ranked.sort_by(|(title_a, score_a), (title_b, score_b)| {
             score_b
                 .partial_cmp(score_a)
@@ -285,32 +386,129 @@ impl AgentMemoryContext {
             .collect::<Vec<_>>())
     }
 
-    async fn cached_title_embeddings(&self, titles: &[String]) -> Result<Vec<Embeding>, LLMYError> {
-        let missing_titles = {
-            let cache = self.title_embed_cache.read().await;
-            titles
+    async fn validate_searchable_fields<const N: usize>(
+        &self,
+        fields: [(&'static str, Option<&str>); N],
+    ) -> Option<MemoryFieldLengthViolation> {
+        let max_tokens = self.embed.max_input_tokens();
+
+        for (field_name, value) in fields {
+            let Some(value) = value else {
+                continue;
+            };
+
+            if value.trim().is_empty() {
+                continue;
+            }
+
+            let token_count = match self.embed.count_tokens(value.to_string()).await {
+                Ok(token_count) => token_count,
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to count tokens for memory field {:?}: {}",
+                        field_name,
+                        error
+                    );
+                    continue;
+                }
+            };
+
+            if token_count > max_tokens {
+                return Some(MemoryFieldLengthViolation {
+                    field_name,
+                    token_count,
+                    max_tokens,
+                });
+            }
+        }
+
+        None
+    }
+
+    async fn cached_memory_embeddings(
+        &self,
+        entries: &[SearchableMemoryEntry],
+    ) -> Result<Vec<CachedMemoryEmbeddings>, LLMYError> {
+        let missing_entries = {
+            let cache = self.search_embed_cache.read().await;
+            entries
                 .iter()
-                .filter(|title| !cache.contains_key(*title))
+                .filter(|entry| !cache.contains_key(&entry.title))
                 .cloned()
                 .collect::<Vec<_>>()
         };
 
-        if !missing_titles.is_empty() {
-            let embeddings = self.embed.batch_embed(missing_titles.clone()).await?;
-            let mut cache = self.title_embed_cache.write().await;
-            for (title, embedding) in missing_titles.into_iter().zip(embeddings) {
-                cache.insert(title, embedding);
+        if !missing_entries.is_empty() {
+            let mut pending_fields = Vec::new();
+            let mut pending_inputs = Vec::new();
+
+            for entry in &missing_entries {
+                queue_search_embedding(
+                    &mut pending_fields,
+                    &mut pending_inputs,
+                    &entry.title,
+                    SearchField::Title,
+                    entry.title.clone(),
+                );
+                queue_search_embedding(
+                    &mut pending_fields,
+                    &mut pending_inputs,
+                    &entry.title,
+                    SearchField::RelatedContext,
+                    entry.related_context.clone(),
+                );
+                queue_search_embedding(
+                    &mut pending_fields,
+                    &mut pending_inputs,
+                    &entry.title,
+                    SearchField::TriggerScenario,
+                    entry.trigger_scenario.clone(),
+                );
+
+                let truncated_content = self
+                    .embed
+                    .truncate_to_input_tokens(entry.content.clone())
+                    .await?;
+                queue_search_embedding(
+                    &mut pending_fields,
+                    &mut pending_inputs,
+                    &entry.title,
+                    SearchField::Content,
+                    truncated_content,
+                );
+            }
+
+            let embeddings = if pending_inputs.is_empty() {
+                Vec::new()
+            } else {
+                self.embed.batch_embed(pending_inputs).await?
+            };
+
+            let mut assembled = BTreeMap::<String, CachedMemoryEmbeddings>::new();
+            for ((title, field), embedding) in pending_fields.into_iter().zip(embeddings) {
+                let cache_entry = assembled.entry(title).or_default();
+                match field {
+                    SearchField::Title => cache_entry.title = Some(embedding),
+                    SearchField::RelatedContext => cache_entry.related_context = Some(embedding),
+                    SearchField::TriggerScenario => cache_entry.trigger_scenario = Some(embedding),
+                    SearchField::Content => cache_entry.content = Some(embedding),
+                }
+            }
+
+            let mut cache = self.search_embed_cache.write().await;
+            for entry in missing_entries {
+                let cached = assembled.remove(&entry.title).unwrap_or_default();
+                cache.insert(entry.title, cached);
             }
         }
 
-        let cache = self.title_embed_cache.read().await;
-        titles
+        let cache = self.search_embed_cache.read().await;
+        entries
             .iter()
-            .map(|title| {
-                cache
-                    .get(title)
-                    .cloned()
-                    .ok_or_else(|| eyre!("missing cached title embedding for {:?}", title).into())
+            .map(|entry| {
+                cache.get(&entry.title).cloned().ok_or_else(|| {
+                    eyre!("missing cached memory embedding for {:?}", entry.title).into()
+                })
             })
             .collect()
     }
@@ -332,8 +530,13 @@ impl fmt::Display for MemoryScope {
 }
 
 enum MemoryWriteResult {
-    Stored { scope: MemoryScope },
+    Stored {
+        scope: MemoryScope,
+    },
     AlreadyExists,
+    ValidationRejected {
+        violation: MemoryFieldLengthViolation,
+    },
 }
 
 enum MemoryUpdateResult {
@@ -343,6 +546,9 @@ enum MemoryUpdateResult {
     },
     NoChanges,
     NotFound,
+    ValidationRejected {
+        violation: MemoryFieldLengthViolation,
+    },
 }
 
 enum MemoryDeleteResult {
@@ -369,6 +575,98 @@ fn collect_memory_titles(memory: &AgentMemory) -> Vec<String> {
     titles
 }
 
+fn collect_searchable_memory_entries(memory: &AgentMemory) -> Vec<SearchableMemoryEntry> {
+    let mut seen_titles = BTreeSet::new();
+    let mut entries = Vec::with_capacity(memory.short_term.len() + memory.long_term.len());
+
+    for memory_content in memory.short_term.values() {
+        if seen_titles.insert(memory_content.title.clone()) {
+            entries.push(SearchableMemoryEntry {
+                title: memory_content.title.clone(),
+                related_context: memory_content.related_context.clone(),
+                trigger_scenario: memory_content.trigger_scenario.clone(),
+                content: memory_content.content.clone(),
+            });
+        }
+    }
+
+    for memory_content in memory.long_term.values() {
+        if seen_titles.insert(memory_content.title.clone()) {
+            entries.push(SearchableMemoryEntry {
+                title: memory_content.title.clone(),
+                related_context: memory_content.related_context.clone(),
+                trigger_scenario: memory_content.trigger_scenario.clone(),
+                content: memory_content.content.clone(),
+            });
+        }
+    }
+
+    entries
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SearchField {
+    Title,
+    RelatedContext,
+    TriggerScenario,
+    Content,
+}
+
+fn queue_search_embedding(
+    pending_fields: &mut Vec<(String, SearchField)>,
+    pending_inputs: &mut Vec<String>,
+    title: &str,
+    field: SearchField,
+    value: String,
+) {
+    if value.trim().is_empty() {
+        return;
+    }
+
+    pending_fields.push((title.to_string(), field));
+    pending_inputs.push(value);
+}
+
+fn weighted_similarity(
+    query_embedding: &Embeding,
+    cached_embeddings: &CachedMemoryEmbeddings,
+    weights: &AgentMemorySearchWeights,
+) -> f64 {
+    weighted_field_similarity(
+        query_embedding,
+        cached_embeddings.title.as_ref(),
+        weights.title,
+    ) + weighted_field_similarity(
+        query_embedding,
+        cached_embeddings.related_context.as_ref(),
+        weights.related_context,
+    ) + weighted_field_similarity(
+        query_embedding,
+        cached_embeddings.trigger_scenario.as_ref(),
+        weights.trigger_scenario,
+    ) + weighted_field_similarity(
+        query_embedding,
+        cached_embeddings.content.as_ref(),
+        weights.content,
+    )
+}
+
+fn weighted_field_similarity(
+    query_embedding: &Embeding,
+    target: Option<&Embeding>,
+    weight: f64,
+) -> f64 {
+    if weight <= 0.0 {
+        return 0.0;
+    }
+
+    let Some(target) = target else {
+        return 0.0;
+    };
+
+    query_embedding.cosine_similarity(target).unwrap_or(0.0) * weight
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WriteMemoryArgs {
     pub title: String,
@@ -384,7 +682,7 @@ pub struct WriteMemoryArgs {
     arguments = WriteMemoryArgs,
     invoke = write_memory,
     name = "write_memory",
-    description = "Write a memory entry into the shared agent memory context. `title` must be concise and ideally stay under 128 English characters. `related_context` should describe the surrounding context that makes this memory relevant. `trigger_scenario` should explain when the agent ought to read this memory later. `content` is the actual memory content; keep it concise and structured for long-term memory, while short-term memory may be longer and more detailed. `raw_content` is optional and can store the full detailed form, including original details and tool-call-heavy transcripts, so it may be very long. `is_long_term` controls where the memory is stored: true writes to long-term memory and false writes to short-term memory.",
+    description = "Write a memory entry into the shared agent memory context. `title` must be concise and ideally stay under 128 English characters. `related_context` should describe the surrounding context that makes this memory relevant. `trigger_scenario` should explain when the agent ought to read this memory later. `content` is the actual memory content; keep it concise and structured for long-term memory, while short-term memory may be longer and more detailed. `raw_content` is optional and can store the full detailed form, including original details and tool-call-heavy transcripts, so it may be very long. `is_long_term` controls where the memory is stored: true writes to long-term memory and false writes to short-term memory. `title`, `related_context`, and `trigger_scenario` must stay short enough to fit within the local embedding model's input limit; if they are too long, the tool will reject the write and ask for a shorter version.",
 )]
 pub struct WriteMemoryTool {
     pub context: AgentMemoryContext,
@@ -417,6 +715,7 @@ impl WriteMemoryTool {
                     "Memory {:?} already exists. Do not replace it with write_memory; call update_memory instead.",
                     title
                 ),
+                MemoryWriteResult::ValidationRejected { violation } => violation.render(),
             },
         )
     }
@@ -436,7 +735,7 @@ pub struct UpdateMemoryArgs {
     arguments = UpdateMemoryArgs,
     invoke = update_memory,
     name = "update_memory",
-    description = "Update an existing memory by exact `title` match in the shared agent memory context. `title` is required and is never changed. `related_context`, `trigger_scenario`, `content`, and `raw_content` are optional; only fields provided as Some values are updated, and omitted fields are left unchanged. `raw_content` is the full detailed form and may be very long. The lookup prefers short-term memory and falls back to long-term memory if the title does not exist in short-term memory.",
+    description = "Update an existing memory by exact `title` match in the shared agent memory context. `title` is required and is never changed. `related_context`, `trigger_scenario`, `content`, and `raw_content` are optional; only fields provided as Some values are updated, and omitted fields are left unchanged. `raw_content` is the full detailed form and may be very long. The lookup prefers short-term memory and falls back to long-term memory if the title does not exist in short-term memory. If `related_context` or `trigger_scenario` is too long for the local embedding model, the tool rejects the update and asks for a shorter value.",
 )]
 pub struct UpdateMemoryTool {
     pub context: AgentMemoryContext,
@@ -476,6 +775,7 @@ impl UpdateMemoryTool {
                 MemoryUpdateResult::NotFound => {
                     format!("No exact memory found with title {:?}", args.title)
                 }
+                MemoryUpdateResult::ValidationRejected { violation } => violation.render(),
             },
         )
     }
@@ -623,7 +923,7 @@ pub struct SearchMemoryArgs {
     arguments = SearchMemoryArgs,
     invoke = search_memory,
     name = "search_memory",
-    description = "Search the shared agent memory context semantically using embeddings. `query` should describe the concept or scenario you want to find. The result contains only matching memory titles, one title per line, so the caller can fetch full details later through `read_memory`.",
+    description = "Search the shared agent memory context semantically using embeddings. `query` should describe the concept or scenario you want to find. The search considers `title`, `related_context`, `trigger_scenario`, and summarized `content`, weighting title matches most heavily. The result contains only matching memory titles, one title per line, so the caller can fetch full details later through `read_memory`.",
 )]
 pub struct SearchMemoryTool {
     pub context: AgentMemoryContext,
@@ -935,7 +1235,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn search_memory_uses_title_embeddings_and_caches_them() {
+    async fn search_memory_weights_title_related_context_and_content() {
         let context = new_context().await;
         let writer = WriteMemoryTool::new(context.clone());
         let searcher = SearchMemoryTool::new(context);
@@ -944,8 +1244,8 @@ mod tests {
             .write_memory(WriteMemoryArgs {
                 title: "Rust async notes".to_string(),
                 related_context: "irrelevant".to_string(),
-                trigger_scenario: "building async services".to_string(),
-                content: "banana recipe content that should not help search".to_string(),
+                trigger_scenario: "irrelevant".to_string(),
+                content: "irrelevant".to_string(),
                 raw_content: None,
                 is_long_term: false,
             })
@@ -953,10 +1253,21 @@ mod tests {
             .unwrap();
         writer
             .write_memory(WriteMemoryArgs {
-                title: "Banana bread".to_string(),
-                related_context: "tokio and futures".to_string(),
-                trigger_scenario: "cooking".to_string(),
-                content: "Use tokio runtime for async rust workloads.".to_string(),
+                title: "Banana bread related context".to_string(),
+                related_context: "tokio async runtime".to_string(),
+                trigger_scenario: "irrelevant".to_string(),
+                content: "irrelevant".to_string(),
+                raw_content: None,
+                is_long_term: true,
+            })
+            .await
+            .unwrap();
+        writer
+            .write_memory(WriteMemoryArgs {
+                title: "Banana bread content".to_string(),
+                related_context: "irrelevant".to_string(),
+                trigger_scenario: "irrelevant".to_string(),
+                content: "tokio async runtime".to_string(),
                 raw_content: None,
                 is_long_term: true,
             })
@@ -974,7 +1285,15 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(titles.first().map(String::as_str), Some("Rust async notes"));
-        assert_eq!(titles.len(), 2);
+        assert_eq!(
+            titles.get(1).map(String::as_str),
+            Some("Banana bread related context")
+        );
+        assert_eq!(
+            titles.get(2).map(String::as_str),
+            Some("Banana bread content")
+        );
+        assert_eq!(titles.len(), 3);
         assert!(titles.iter().all(|title| !title.contains("content:")));
         assert!(
             titles
@@ -984,7 +1303,7 @@ mod tests {
 
         let cached_titles = searcher
             .context
-            .title_embed_cache
+            .search_embed_cache
             .read()
             .await
             .keys()
@@ -992,12 +1311,40 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             cached_titles,
-            vec!["Banana bread".to_string(), "Rust async notes".to_string()]
+            vec![
+                "Banana bread content".to_string(),
+                "Banana bread related context".to_string(),
+                "Rust async notes".to_string()
+            ]
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn delete_memory_removes_memory_and_cached_title_embedding() {
+    async fn write_memory_rejects_overlong_searchable_fields() {
+        let context = new_context().await;
+        let writer = WriteMemoryTool::new(context.clone());
+        let max_tokens = context.embed.max_input_tokens();
+        let overlong_title = "tokio runtime ".repeat(max_tokens);
+
+        let result = writer
+            .write_memory(WriteMemoryArgs {
+                title: overlong_title,
+                related_context: "systems".to_string(),
+                trigger_scenario: "planning".to_string(),
+                content: "content can stay long".to_string(),
+                raw_content: None,
+                is_long_term: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.contains("Field \"title\" is too long"));
+        assert!(result.contains("Regenerate that field with a shorter"));
+        assert!(context.list_memories(10, 0).await.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_memory_removes_memory_and_cached_search_embedding() {
         let context = new_context().await;
         let writer = WriteMemoryTool::new(context.clone());
         let searcher = SearchMemoryTool::new(context.clone());
@@ -1025,7 +1372,7 @@ mod tests {
         assert!(
             searcher
                 .context
-                .title_embed_cache
+                .search_embed_cache
                 .read()
                 .await
                 .contains_key("Rust async notes")
@@ -1052,7 +1399,7 @@ mod tests {
         assert!(
             !searcher
                 .context
-                .title_embed_cache
+                .search_embed_cache
                 .read()
                 .await
                 .contains_key("Rust async notes")

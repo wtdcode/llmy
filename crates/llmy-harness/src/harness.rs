@@ -9,7 +9,7 @@ use llmy_agent_tools::memory::{
     AgentMemory, AgentMemoryContent, AgentMemoryContext, UpdateMemoryTool, WriteMemoryTool,
 };
 use llmy_client::debug::completion_to_string;
-use llmy_client::{client::LLM, settings::LLMSettings};
+use llmy_client::{client::LLM, model::ModelConfig, settings::LLMSettings};
 
 use crate::{
     memory::AgentMemorySystemPromptCriteria,
@@ -96,6 +96,20 @@ impl Agent {
             .map(completion_to_string)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    pub fn render_tools(&self, details: bool) -> String {
+        let tools = self.tools.render_tools(details);
+
+        if tools.is_empty() {
+            return "No tools are enabled for this chat.".to_string();
+        }
+
+        format!("Enabled tools ({}):\n- {}", tools.len(), tools.join("\n- "))
+    }
+
+    pub fn approx_context_tokens(&self, model: &ModelConfig) -> Option<usize> {
+        model.count_tokens(&self.render_context())
     }
 
     pub async fn render_memory(&self) -> Option<String> {
@@ -407,6 +421,33 @@ fn render_memory_entry(memory: &AgentMemoryContent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+
+    #[derive(Debug, Clone)]
+    struct ZebraTool;
+
+    #[derive(Debug, Clone)]
+    struct AlphaTool;
+
+    impl Tool for ZebraTool {
+        type ARGUMENTS = ();
+        const NAME: &str = "zebra_tool";
+        const DESCRIPTION: Option<&str> = Some("test tool");
+
+        async fn invoke(&self, _arguments: Self::ARGUMENTS) -> Result<String, LLMYError> {
+            Ok("ok".to_string())
+        }
+    }
+
+    impl Tool for AlphaTool {
+        type ARGUMENTS = ();
+        const NAME: &str = "alpha_tool";
+        const DESCRIPTION: Option<&str> = Some("test tool");
+
+        async fn invoke(&self, _arguments: Self::ARGUMENTS) -> Result<String, LLMYError> {
+            Ok("ok".to_string())
+        }
+    }
 
     #[test]
     fn compact_history_text_includes_system_and_user_messages() {
@@ -421,6 +462,66 @@ mod tests {
 
         assert!(rendered.contains("<SYSTEM>\nbase system prompt\n</SYSTEM>"));
         assert!(rendered.contains("<USER>\nimplement compaction\n</USER>"));
+    }
+
+    #[test]
+    fn render_tools_lists_sorted_tool_names() {
+        let mut tools = ToolBox::new();
+        tools.add_tool(ZebraTool);
+        tools.add_tool(AlphaTool);
+
+        let agent = Agent::new("base system prompt".to_string(), tools, "cache".to_string());
+
+        assert_eq!(
+            agent.render_tools(false),
+            "Enabled tools (2):\n- alpha_tool\n- zebra_tool"
+        );
+    }
+
+    #[test]
+    fn render_tools_with_details_includes_description() {
+        let mut tools = ToolBox::new();
+        tools.add_tool(ZebraTool);
+        tools.add_tool(AlphaTool);
+
+        let agent = Agent::new("base system prompt".to_string(), tools, "cache".to_string());
+
+        assert_eq!(
+            agent.render_tools(true),
+            "Enabled tools (2):\n- alpha_tool: test tool\n- zebra_tool: test tool"
+        );
+    }
+
+    #[test]
+    fn render_tools_reports_when_no_tools_are_enabled() {
+        let agent = Agent::new(
+            "base system prompt".to_string(),
+            ToolBox::new(),
+            "cache".to_string(),
+        );
+
+        assert_eq!(
+            agent.render_tools(false),
+            "No tools are enabled for this chat."
+        );
+    }
+
+    #[test]
+    fn approx_context_tokens_uses_model_tokenizer() {
+        let mut agent = Agent::new(
+            "base system prompt".to_string(),
+            ToolBox::new(),
+            "cache".to_string(),
+        );
+        agent.push_user_message("implement compaction".to_string());
+
+        let model =
+            llmy_client::model::OpenAIModel::from_str("o1").expect("failed to load built-in model");
+        let token_count = agent
+            .approx_context_tokens(&model.config)
+            .expect("expected tokenizer-backed token count");
+
+        assert!(token_count > 0);
     }
 
     #[tokio::test]

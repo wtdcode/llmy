@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
+use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, fmt::Debug};
 
 use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionRequestToolMessage,
@@ -17,6 +18,7 @@ use tracing::debug;
 
 pub trait ToolDyn: DynClone + Debug + Send + Sync + std::any::Any {
     fn name(&self) -> String;
+    fn description(&self) -> Option<String>;
     fn to_openai_obejct(&self) -> ChatCompletionTool;
     fn call(
         &self,
@@ -74,6 +76,9 @@ impl<T: Tool + DynClone + 'static> ToolDyn for T {
     fn name(&self) -> String {
         Self::NAME.to_string()
     }
+    fn description(&self) -> Option<String> {
+        Self::DESCRIPTION.map(|v| v.to_string())
+    }
     fn call(
         &self,
         arguments: String,
@@ -88,7 +93,7 @@ impl<T: Tool + DynClone + 'static> ToolDyn for T {
 
 #[derive(Default, Clone, Debug)]
 pub struct ToolBox {
-    tools: HashMap<String, Arc<Box<dyn ToolDyn>>>,
+    tools: BTreeMap<String, Arc<Box<dyn ToolDyn>>>,
 }
 
 impl ToolBox {
@@ -98,6 +103,24 @@ impl ToolBox {
 
     pub fn len(&self) -> usize {
         self.tools.len()
+    }
+
+    pub fn render_tools(&self, details: bool) -> Vec<String> {
+        self.tools
+            .iter()
+            .map(|(name, tool)| {
+                if details {
+                    format!(
+                        "`{}`: {:?}", // description may contain new lines
+                        name,
+                        tool.description()
+                            .unwrap_or_else(|| "no description is provided".to_string())
+                    )
+                } else {
+                    name.clone()
+                }
+            })
+            .collect()
     }
 
     pub fn extend(&mut self, rhs: Self) {

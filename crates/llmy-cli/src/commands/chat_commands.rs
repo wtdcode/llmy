@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use llmy_client::{billing::ModelBilling, client::LLM, settings::LLMSettings};
+use llmy_client::{billing::ModelBilling, client::LLM, model::ModelConfig, settings::LLMSettings};
 use llmy_harness::Agent;
 
 #[derive(Debug)]
@@ -21,6 +21,10 @@ pub(crate) enum ChatCommand {
     Context,
     Memory,
     Tokens,
+    Tools {
+        #[arg(long, default_value_t = false)]
+        details: bool,
+    },
 }
 
 pub(crate) fn parse_chat_input(input: &str) -> Result<ChatInput, String> {
@@ -36,7 +40,9 @@ pub(crate) fn parse_chat_input(input: &str) -> Result<ChatInput, String> {
     };
 
     if tokens.is_empty() {
-        return Err("Empty command. Try /compact, /context, /memory, or /tokens.".to_string());
+        return Err(
+            "Empty command. Try /compact, /context, /memory, /tokens, or /tools.".to_string(),
+        );
     }
 
     ChatCommandLine::try_parse_from(tokens)
@@ -69,7 +75,14 @@ pub(crate) async fn run_chat_command(
         }
         ChatCommand::Tokens => {
             let billing = llm.billing_snapshot().await;
-            print_command_output(&format_token_usage(&billing), is_tty);
+            let approx_context_tokens = agent.approx_context_tokens(&llm.model.config);
+            print_command_output(
+                &format_token_usage(&billing, approx_context_tokens, &llm.model.config),
+                is_tty,
+            );
+        }
+        ChatCommand::Tools { details } => {
+            print_command_output(&agent.render_tools(details), is_tty);
         }
     }
 
@@ -84,13 +97,34 @@ fn print_command_output(output: &str, is_tty: bool) {
     }
 }
 
-fn format_token_usage(billing: &ModelBilling) -> String {
+fn format_token_usage(
+    billing: &ModelBilling,
+    approx_context_tokens: Option<usize>,
+    model: &ModelConfig,
+) -> String {
     let uncached_input_tokens = billing.input_tokens.saturating_sub(billing.cache_tokens);
     let non_reasoning_output_tokens = billing
         .output_tokens
         .saturating_sub(billing.reasoning_tokens);
+    let context_usage = match (approx_context_tokens, model.max_input_tokens) {
+        (Some(tokens), max_input_tokens) if max_input_tokens > 0 => format!(
+            "approx_context_tokens: {} / {} (remaining={})",
+            tokens,
+            max_input_tokens,
+            max_input_tokens.saturating_sub(tokens as u64)
+        ),
+        (Some(tokens), _) => format!("approx_context_tokens: {}", tokens),
+        (None, max_input_tokens) if max_input_tokens > 0 => {
+            format!("approx_context_tokens: unavailable / {}", max_input_tokens)
+        }
+        (None, _) => "approx_context_tokens: unavailable".to_string(),
+    };
 
     [
+        format!("Current model: {}", model.name),
+        "Current context estimate:".to_string(),
+        context_usage,
+        String::new(),
         "Session token usage:".to_string(),
         format!(
             "input_tokens: total={} uncached={} cached={}",
@@ -112,6 +146,7 @@ fn format_token_usage(billing: &ModelBilling) -> String {
 mod tests {
     use super::*;
     use llmy_client::billing::ModelBilling;
+    use std::str::FromStr;
 
     #[test]
     fn parse_chat_input_keeps_plain_user_text() {
@@ -168,16 +203,49 @@ mod tests {
     }
 
     #[test]
-    fn format_token_usage_renders_cached_and_reasoning_breakdown() {
-        let rendered = format_token_usage(&ModelBilling {
-            input_tokens: 120,
-            output_tokens: 45,
-            cache_tokens: 20,
-            reasoning_tokens: 5,
-            current: 0.0123,
-            cap: 10.0,
-        });
+    fn parse_chat_input_parses_tools_command() {
+        let parsed = parse_chat_input("/tools").unwrap();
 
+        match parsed {
+            ChatInput::Command(ChatCommand::Tools { details: false }) => {}
+            ChatInput::User(_) => panic!("expected tools command"),
+            ChatInput::Command(other) => panic!("expected tools command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_chat_input_parses_tools_details_command() {
+        let parsed = parse_chat_input("/tools --details").unwrap();
+
+        match parsed {
+            ChatInput::Command(ChatCommand::Tools { details: true }) => {}
+            ChatInput::User(_) => panic!("expected tools details command"),
+            ChatInput::Command(other) => {
+                panic!("expected tools details command, got {:?}", other)
+            }
+        }
+    }
+
+    #[test]
+    fn format_token_usage_renders_cached_and_reasoning_breakdown() {
+        let rendered = format_token_usage(
+            &ModelBilling {
+                input_tokens: 120,
+                output_tokens: 45,
+                cache_tokens: 20,
+                reasoning_tokens: 5,
+                current: 0.0123,
+                cap: 10.0,
+            },
+            Some(512),
+            &llmy_client::model::OpenAIModel::from_str("o1")
+                .expect("failed to load built-in model")
+                .config,
+        );
+
+        assert!(rendered.contains("Current model:"));
+        assert!(rendered.contains("Current context estimate:"));
+        assert!(rendered.contains("approx_context_tokens: 512"));
         assert!(rendered.contains("Session token usage:"));
         assert!(rendered.contains("input_tokens: total=120 uncached=100 cached=20"));
         assert!(rendered.contains("output_tokens: total=45 response=40 reasoning=5"));
