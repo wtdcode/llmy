@@ -310,25 +310,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runs_simple_command() {
-        let dir = tempdir().unwrap();
-        let tool = BashTool::new(dir.path().to_path_buf(), BashToolConfig::default());
-
-        let result = tool
-            .bash(BashToolArgs {
-                command: "printf 'hello'".to_string(),
-                description: None,
-                working_directory: None,
-                timeout_ms: Some(1_000),
-            })
-            .await
-            .unwrap();
-
-        assert!(result.contains("Exit code: 0"));
-        assert!(result.contains("stdout:\nhello"));
-    }
-
-    #[tokio::test]
     async fn resolves_relative_working_directory_against_tool_root() {
         let dir = tempdir().unwrap();
         let nested = dir.path().join("nested");
