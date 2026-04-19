@@ -488,7 +488,7 @@ mod tests {
 
         assert_eq!(
             agent.render_tools(true),
-            "Enabled tools (2):\n- alpha_tool: test tool\n- zebra_tool: test tool"
+            "Enabled tools (2):\n- `alpha_tool`: \"test tool\"\n- `zebra_tool`: \"test tool\""
         );
     }
 
