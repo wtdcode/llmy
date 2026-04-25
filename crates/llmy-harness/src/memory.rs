@@ -9,16 +9,16 @@ use crate::prompt::{
 #[derive(Debug, Clone)]
 pub struct AgentMemorySystemPromptCriteria {
     // these two criteria define how to classify the two memories
-    pub long_term_memory_criteria: Vec<String>,
-    pub short_term_memory_criteria: Vec<String>,
+    pub long_term_memory_criteria: String,
+    pub short_term_memory_criteria: String,
 
     // these two operators define how to write/update existing memories
-    pub long_term_memory_operator: Vec<String>,
-    pub short_term_memory_operator: Vec<String>,
+    pub long_term_memory_operator: String,
+    pub short_term_memory_operator: String,
 
     // these two triggers define when to write/update new memories
-    pub long_term_memory_trigger: Vec<String>,
-    pub short_term_memory_trigger: Vec<String>,
+    pub long_term_memory_trigger: String,
+    pub short_term_memory_trigger: String,
 }
 
 impl AgentMemorySystemPromptCriteria {
@@ -26,15 +26,24 @@ impl AgentMemorySystemPromptCriteria {
         AgentMemorySystemPromptCriteriaBuilder::default()
     }
 
-    fn render_section(title: &str, values: &[String]) -> String {
-        let items = if values.is_empty() {
+    fn render_values<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
+        let rendered = values
+            .into_iter()
+            .map(|value| format!("- {value}"))
+            .collect::<Vec<_>>();
+
+        if rendered.is_empty() {
             "- None.".to_string()
         } else {
+            rendered.join("\n")
+        }
+    }
+
+    fn render_section(title: &str, values: &str) -> String {
+        let items = if values.trim().is_empty() {
+            "- None."
+        } else {
             values
-                .iter()
-                .map(|value| format!("- {value}"))
-                .collect::<Vec<_>>()
-                .join("\n")
         };
 
         format!("{title}:\n{items}")
@@ -45,27 +54,27 @@ impl AgentMemorySystemPromptCriteria {
             "You are equipped with a shared memory system. Use the memory tools deliberately to preserve durable knowledge and active task state for long-running work.".to_string(),
             Self::render_section(
                 "Long-term memory criteria",
-                &self.long_term_memory_criteria,
+                self.long_term_memory_criteria.as_str(),
             ),
             Self::render_section(
                 "Short-term memory criteria",
-                &self.short_term_memory_criteria,
+                self.short_term_memory_criteria.as_str(),
             ),
             Self::render_section(
                 "Long-term memory operators",
-                &self.long_term_memory_operator,
+                self.long_term_memory_operator.as_str(),
             ),
             Self::render_section(
                 "Short-term memory operators",
-                &self.short_term_memory_operator,
+                self.short_term_memory_operator.as_str(),
             ),
             Self::render_section(
                 "Long-term memory triggers",
-                &self.long_term_memory_trigger,
+                self.long_term_memory_trigger.as_str(),
             ),
             Self::render_section(
                 "Short-term memory triggers",
-                &self.short_term_memory_trigger,
+                self.short_term_memory_trigger.as_str(),
             ),
         ]
         .join("\n\n")
@@ -101,17 +110,14 @@ impl AgentMemorySystemPromptCriteria {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AgentMemorySystemPromptCriteriaBuilder {
-    criteria: AgentMemorySystemPromptCriteria,
-}
-
-impl Default for AgentMemorySystemPromptCriteriaBuilder {
-    fn default() -> Self {
-        Self {
-            criteria: AgentMemorySystemPromptCriteria::default(),
-        }
-    }
+    long_term_memory_criteria: Vec<String>,
+    short_term_memory_criteria: Vec<String>,
+    long_term_memory_operator: Vec<String>,
+    short_term_memory_operator: Vec<String>,
+    long_term_memory_trigger: Vec<String>,
+    short_term_memory_trigger: Vec<String>,
 }
 
 impl AgentMemorySystemPromptCriteriaBuilder {
@@ -120,67 +126,80 @@ impl AgentMemorySystemPromptCriteriaBuilder {
     }
 
     pub fn append_long_term_memory_criteria(mut self, value: String) -> Self {
-        self.criteria.long_term_memory_criteria.push(value);
+        self.long_term_memory_criteria.push(value);
         self
     }
 
     pub fn append_short_term_memory_criteria(mut self, value: String) -> Self {
-        self.criteria.short_term_memory_criteria.push(value);
+        self.short_term_memory_criteria.push(value);
         self
     }
 
     pub fn append_long_term_memory_operator(mut self, value: String) -> Self {
-        self.criteria.long_term_memory_operator.push(value);
+        self.long_term_memory_operator.push(value);
         self
     }
 
     pub fn append_short_term_memory_operator(mut self, value: String) -> Self {
-        self.criteria.short_term_memory_operator.push(value);
+        self.short_term_memory_operator.push(value);
         self
     }
 
     pub fn append_long_term_memory_trigger(mut self, value: String) -> Self {
-        self.criteria.long_term_memory_trigger.push(value);
+        self.long_term_memory_trigger.push(value);
         self
     }
 
     pub fn append_short_term_memory_trigger(mut self, value: String) -> Self {
-        self.criteria.short_term_memory_trigger.push(value);
+        self.short_term_memory_trigger.push(value);
         self
     }
 
     pub fn build(self) -> AgentMemorySystemPromptCriteria {
-        self.criteria
+        AgentMemorySystemPromptCriteria {
+            long_term_memory_criteria: AgentMemorySystemPromptCriteria::render_values(
+                self.long_term_memory_criteria.iter().map(String::as_str),
+            ),
+            short_term_memory_criteria: AgentMemorySystemPromptCriteria::render_values(
+                self.short_term_memory_criteria.iter().map(String::as_str),
+            ),
+            long_term_memory_operator: AgentMemorySystemPromptCriteria::render_values(
+                self.long_term_memory_operator.iter().map(String::as_str),
+            ),
+            short_term_memory_operator: AgentMemorySystemPromptCriteria::render_values(
+                self.short_term_memory_operator.iter().map(String::as_str),
+            ),
+            long_term_memory_trigger: AgentMemorySystemPromptCriteria::render_values(
+                self.long_term_memory_trigger.iter().map(String::as_str),
+            ),
+            short_term_memory_trigger: AgentMemorySystemPromptCriteria::render_values(
+                self.short_term_memory_trigger.iter().map(String::as_str),
+            ),
+        }
     }
 }
 
 impl Default for AgentMemorySystemPromptCriteria {
     fn default() -> Self {
         Self {
-            long_term_memory_criteria: DEFAULT_LONG_TERM_MEMORY_CRITERIA
-                .iter()
-                .map(|v| (*v).to_string())
-                .collect(),
-            short_term_memory_criteria: DEFAULT_SHORT_TERM_MEMORY_CRITERIA
-                .iter()
-                .map(|v| (*v).to_string())
-                .collect(),
-            long_term_memory_operator: DEFAULT_LONG_TERM_MEMORY_OPERATOR
-                .iter()
-                .map(|v| (*v).to_string())
-                .collect(),
-            short_term_memory_operator: DEFAULT_SHORT_TERM_MEMORY_OPERATOR
-                .iter()
-                .map(|v| (*v).to_string())
-                .collect(),
-            long_term_memory_trigger: DEFAULT_LONG_TERM_MEMORY_TRIGGER
-                .iter()
-                .map(|v| (*v).to_string())
-                .collect(),
-            short_term_memory_trigger: DEFAULT_SHORT_TERM_MEMORY_TRIGGER
-                .iter()
-                .map(|v| (*v).to_string())
-                .collect(),
+            long_term_memory_criteria: Self::render_values(
+                DEFAULT_LONG_TERM_MEMORY_CRITERIA.iter().copied(),
+            ),
+            short_term_memory_criteria: Self::render_values(
+                DEFAULT_SHORT_TERM_MEMORY_CRITERIA.iter().copied(),
+            ),
+            long_term_memory_operator: Self::render_values(
+                DEFAULT_LONG_TERM_MEMORY_OPERATOR.iter().copied(),
+            ),
+            short_term_memory_operator: Self::render_values(
+                DEFAULT_SHORT_TERM_MEMORY_OPERATOR.iter().copied(),
+            ),
+            long_term_memory_trigger: Self::render_values(
+                DEFAULT_LONG_TERM_MEMORY_TRIGGER.iter().copied(),
+            ),
+            short_term_memory_trigger: Self::render_values(
+                DEFAULT_SHORT_TERM_MEMORY_TRIGGER.iter().copied(),
+            ),
         }
     }
 }
@@ -236,44 +255,59 @@ mod tests {
             .append_short_term_memory_trigger("st trigger".to_string())
             .build();
 
-        assert_eq!(
+        assert_eq!(criteria.long_term_memory_criteria, "- lt criteria");
+        assert_eq!(criteria.short_term_memory_criteria, "- st criteria");
+        assert_eq!(criteria.long_term_memory_operator, "- lt operator");
+        assert_eq!(criteria.short_term_memory_operator, "- st operator");
+        assert_eq!(criteria.long_term_memory_trigger, "- lt trigger");
+        assert_eq!(criteria.short_term_memory_trigger, "- st trigger");
+    }
+
+    #[test]
+    fn criteria_builder_default_is_empty() {
+        let criteria = AgentMemorySystemPromptCriteria::builder().build();
+
+        assert_eq!(criteria.long_term_memory_criteria, "- None.");
+        assert_eq!(criteria.short_term_memory_criteria, "- None.");
+        assert_eq!(criteria.long_term_memory_operator, "- None.");
+        assert_eq!(criteria.short_term_memory_operator, "- None.");
+        assert_eq!(criteria.long_term_memory_trigger, "- None.");
+        assert_eq!(criteria.short_term_memory_trigger, "- None.");
+    }
+
+    #[test]
+    fn criteria_default_renders_default_sections() {
+        let criteria = AgentMemorySystemPromptCriteria::default();
+
+        assert!(
             criteria
                 .long_term_memory_criteria
-                .last()
-                .map(String::as_str),
-            Some("lt criteria")
+                .contains(DEFAULT_LONG_TERM_MEMORY_CRITERIA[0])
         );
-        assert_eq!(
+        assert!(
             criteria
                 .short_term_memory_criteria
-                .last()
-                .map(String::as_str),
-            Some("st criteria")
+                .contains(DEFAULT_SHORT_TERM_MEMORY_CRITERIA[0])
         );
-        assert_eq!(
+        assert!(
             criteria
                 .long_term_memory_operator
-                .last()
-                .map(String::as_str),
-            Some("lt operator")
+                .contains(DEFAULT_LONG_TERM_MEMORY_OPERATOR[0])
         );
-        assert_eq!(
+        assert!(
             criteria
                 .short_term_memory_operator
-                .last()
-                .map(String::as_str),
-            Some("st operator")
+                .contains(DEFAULT_SHORT_TERM_MEMORY_OPERATOR[0])
         );
-        assert_eq!(
-            criteria.long_term_memory_trigger.last().map(String::as_str),
-            Some("lt trigger")
+        assert!(
+            criteria
+                .long_term_memory_trigger
+                .contains(DEFAULT_LONG_TERM_MEMORY_TRIGGER[0])
         );
-        assert_eq!(
+        assert!(
             criteria
                 .short_term_memory_trigger
-                .last()
-                .map(String::as_str),
-            Some("st trigger")
+                .contains(DEFAULT_SHORT_TERM_MEMORY_TRIGGER[0])
         );
     }
 
