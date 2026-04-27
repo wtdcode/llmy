@@ -176,6 +176,21 @@ impl ToolBox {
         js.join_all().await
     }
 
+    pub async fn invoke_many_sequential(
+        &self,
+        calls: Vec<GeneralToolCall>,
+    ) -> Vec<(GeneralToolCall, Option<Result<String, LLMYError>>)> {
+        let mut out = Vec::with_capacity(calls.len());
+
+        for call in calls {
+            let tc: GeneralToolCall = call.clone();
+            tracing::info!("Calling {}", &tc);
+            out.push((tc, self.invoke(call.tool_name, call.tool_args).await));
+        }
+
+        out
+    }
+
     pub async fn agent_invoke_many(
         &self,
         calls: Vec<GeneralToolCall>,
@@ -184,7 +199,26 @@ impl ToolBox {
         Option<Result<ChatCompletionRequestMessage, LLMYError>>,
     )> {
         let invokes = self.invoke_many(calls).await;
+        Self::agent_messages_from_invokes(invokes)
+    }
 
+    pub async fn agent_invoke_many_sequential(
+        &self,
+        calls: Vec<GeneralToolCall>,
+    ) -> Vec<(
+        GeneralToolCall,
+        Option<Result<ChatCompletionRequestMessage, LLMYError>>,
+    )> {
+        let invokes = self.invoke_many_sequential(calls).await;
+        Self::agent_messages_from_invokes(invokes)
+    }
+
+    fn agent_messages_from_invokes(
+        invokes: Vec<(GeneralToolCall, Option<Result<String, LLMYError>>)>,
+    ) -> Vec<(
+        GeneralToolCall,
+        Option<Result<ChatCompletionRequestMessage, LLMYError>>,
+    )> {
         let mut out = vec![];
         for (call, result) in invokes {
             let id = call.tool_id.clone();

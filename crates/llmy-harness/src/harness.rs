@@ -11,6 +11,7 @@ use llmy_agent_tools::memory::{
 };
 use llmy_client::debug::completion_to_string;
 use llmy_client::{client::LLM, model::ModelConfig, settings::LLMSettings};
+use llmy_types::error::GeneralToolCall;
 
 use crate::{
     memory::AgentMemorySystemPromptCriteria,
@@ -26,6 +27,19 @@ struct AgentMemoryRuntime {
     criteria: AgentMemorySystemPromptCriteria,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentConfig {
+    pub sequential_tool_call: bool,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            sequential_tool_call: false,
+        }
+    }
+}
+
 /// Agent implementation backed by an in-memory conversation context and toolbox.
 #[derive(Clone)]
 pub struct Agent {
@@ -37,10 +51,20 @@ pub struct Agent {
     last_step: Option<StepResult>,
     cache_key: String,
     memory: Option<AgentMemoryRuntime>,
+    config: AgentConfig,
 }
 
 impl Agent {
     pub fn new(system_prompt: String, tools: ToolBox, cache_key: String) -> Self {
+        Self::new_with_config(system_prompt, tools, cache_key, AgentConfig::default())
+    }
+
+    pub fn new_with_config(
+        system_prompt: String,
+        tools: ToolBox,
+        cache_key: String,
+        config: AgentConfig,
+    ) -> Self {
         Self {
             base_system_prompt: system_prompt.clone(),
             system_prompt,
@@ -50,15 +74,35 @@ impl Agent {
             last_step: None,
             cache_key,
             memory: None,
+            config,
         }
     }
 
     pub async fn with_memory(
         system_prompt: String,
+        tools: ToolBox,
+        cache_key: String,
+        memory: &AgentMemoryContext,
+        criteria: &AgentMemorySystemPromptCriteria,
+    ) -> Self {
+        Self::with_memory_config(
+            system_prompt,
+            tools,
+            cache_key,
+            memory,
+            criteria,
+            AgentConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn with_memory_config(
+        system_prompt: String,
         mut tools: ToolBox,
         cache_key: String,
         memory: &AgentMemoryContext,
         criteria: &AgentMemorySystemPromptCriteria,
+        config: AgentConfig,
     ) -> Self {
         tools.extend(memory.tool_box());
         let guard = memory.memory.read().await;
@@ -75,6 +119,7 @@ impl Agent {
                 context: memory.clone(),
                 criteria: criteria.clone(),
             }),
+            config,
         }
     }
 
@@ -121,6 +166,10 @@ impl Agent {
 
     pub fn last_step(&self) -> &Option<StepResult> {
         &self.last_step
+    }
+
+    pub fn config(&self) -> &AgentConfig {
+        &self.config
     }
 
     pub fn system_prompt(&self) -> String {
@@ -186,7 +235,7 @@ impl Agent {
                         return Err(eyre!("no tool calls but give tool call reason").into());
                     }
 
-                    let calls = self.tools.agent_invoke_many(calls).await;
+                    let calls = self.invoke_tool_calls(calls).await;
                     let mut out = vec![];
                     for (call, tool_out) in calls.into_iter() {
                         if let Some(tool_out) = tool_out {
@@ -240,6 +289,20 @@ impl Agent {
         self.context.extend(extra_messages);
         self.last_step = Some(step_result.clone());
         Ok(step_result)
+    }
+
+    async fn invoke_tool_calls(
+        &self,
+        calls: Vec<GeneralToolCall>,
+    ) -> Vec<(
+        GeneralToolCall,
+        Option<Result<ChatCompletionRequestMessage, LLMYError>>,
+    )> {
+        if self.config.sequential_tool_call {
+            self.tools.agent_invoke_many_sequential(calls).await
+        } else {
+            self.tools.agent_invoke_many(calls).await
+        }
     }
 
     pub async fn step_with_user(
@@ -306,16 +369,22 @@ impl Agent {
 
         let mut compact_agent = match &self.memory {
             Some(memory) => {
-                Self::with_memory(
+                Self::with_memory_config(
                     compact_system_prompt,
                     ToolBox::new(),
                     compact_cache_key,
                     &memory.context,
                     &memory.criteria,
+                    self.config.clone(),
                 )
                 .await
             }
-            None => Self::new(compact_system_prompt, ToolBox::new(), compact_cache_key),
+            None => Self::new_with_config(
+                compact_system_prompt,
+                ToolBox::new(),
+                compact_cache_key,
+                self.config.clone(),
+            ),
         };
 
         let step_result = compact_agent
@@ -444,12 +513,25 @@ fn render_memory_entry(memory: &AgentMemoryContent) -> String {
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
 
     #[derive(Debug, Clone)]
     struct ZebraTool;
 
     #[derive(Debug, Clone)]
     struct AlphaTool;
+
+    #[derive(Debug, Clone)]
+    struct SlowRecordingTool {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct FastRecordingTool {
+        events: Arc<Mutex<Vec<String>>>,
+    }
 
     impl Tool for ZebraTool {
         type ARGUMENTS = ();
@@ -469,6 +551,88 @@ mod tests {
         async fn invoke(&self, _arguments: Self::ARGUMENTS) -> Result<String, LLMYError> {
             Ok("ok".to_string())
         }
+    }
+
+    impl Tool for SlowRecordingTool {
+        type ARGUMENTS = ();
+        const NAME: &str = "slow_recording_tool";
+        const DESCRIPTION: Option<&str> = Some("test tool");
+
+        async fn invoke(&self, _arguments: Self::ARGUMENTS) -> Result<String, LLMYError> {
+            self.events.lock().await.push("slow_start".to_string());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.events.lock().await.push("slow_end".to_string());
+            Ok("slow".to_string())
+        }
+    }
+
+    impl Tool for FastRecordingTool {
+        type ARGUMENTS = ();
+        const NAME: &str = "fast_recording_tool";
+        const DESCRIPTION: Option<&str> = Some("test tool");
+
+        async fn invoke(&self, _arguments: Self::ARGUMENTS) -> Result<String, LLMYError> {
+            self.events.lock().await.push("fast".to_string());
+            Ok("fast".to_string())
+        }
+    }
+
+    fn tool_call(tool_name: &str, tool_id: &str) -> GeneralToolCall {
+        GeneralToolCall {
+            tool_id: tool_id.to_string(),
+            tool_name: tool_name.to_string(),
+            tool_args: "null".to_string(),
+        }
+    }
+
+    #[test]
+    fn agent_config_defaults_to_parallel_tool_calls() {
+        assert!(!AgentConfig::default().sequential_tool_call);
+
+        let agent = Agent::new(
+            "base system prompt".to_string(),
+            ToolBox::new(),
+            "cache".to_string(),
+        );
+
+        assert_eq!(agent.config(), &AgentConfig::default());
+    }
+
+    #[tokio::test]
+    async fn configured_agent_invokes_tool_calls_sequentially() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolBox::new();
+        tools.add_tool(SlowRecordingTool {
+            events: events.clone(),
+        });
+        tools.add_tool(FastRecordingTool {
+            events: events.clone(),
+        });
+        let agent = Agent::new_with_config(
+            "base system prompt".to_string(),
+            tools,
+            "cache".to_string(),
+            AgentConfig {
+                sequential_tool_call: true,
+            },
+        );
+
+        let results = agent
+            .invoke_tool_calls(vec![
+                tool_call("slow_recording_tool", "slow"),
+                tool_call("fast_recording_tool", "fast"),
+            ])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            events.lock().await.clone(),
+            vec![
+                "slow_start".to_string(),
+                "slow_end".to_string(),
+                "fast".to_string()
+            ]
+        );
     }
 
     #[test]
