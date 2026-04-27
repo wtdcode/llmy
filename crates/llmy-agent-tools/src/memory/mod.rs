@@ -940,6 +940,8 @@ impl ListMemoriesTool {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchMemoryArgs {
     pub query: String,
+    pub memories_per_page: Option<usize>,
+    pub page_index: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -947,7 +949,7 @@ pub struct SearchMemoryArgs {
     arguments = SearchMemoryArgs,
     invoke = search_memory,
     name = "search_memory",
-    description = "Search the shared agent memory context semantically using embeddings. `query` should describe the concept or scenario you want to find. The search considers `title`, `related_context`, `trigger_scenario`, and summarized `content`, weighting title matches most heavily. The result contains only matching memory titles, one title per line, so the caller can fetch full details later through `read_memory`.",
+    description = "Search the shared agent memory context semantically using embeddings. `query` should describe the concept or scenario you want to find. `memories_per_page` and `page_index` are optional pagination controls; when omitted, the tool returns the first 10 memories (`memories_per_page` = 10, `page_index` = 0). The search considers `title`, `related_context`, `trigger_scenario`, and summarized `content`, weighting title matches most heavily. The result contains only matching memory titles, one title per line, so the caller can fetch full details later through `read_memory`.",
 )]
 pub struct SearchMemoryTool {
     pub context: AgentMemoryContext,
@@ -959,7 +961,21 @@ impl SearchMemoryTool {
     }
 
     pub async fn search_memory(&self, args: SearchMemoryArgs) -> Result<String, LLMYError> {
-        Ok(self.context.search_memory(&args.query).await?.join("\n"))
+        let memories_per_page = args.memories_per_page.unwrap_or(10);
+        if memories_per_page == 0 {
+            return Ok("memories_per_page must be greater than 0".to_string());
+        }
+
+        let page_index = args.page_index.unwrap_or(0);
+        let titles = self.context.search_memory(&args.query).await?;
+        let start = page_index.saturating_mul(memories_per_page);
+
+        if start >= titles.len() {
+            return Ok(String::new());
+        }
+
+        let end = (start + memories_per_page).min(titles.len());
+        Ok(titles[start..end].join("\n"))
     }
 }
 
@@ -1326,6 +1342,8 @@ mod tests {
         let titles = searcher
             .search_memory(SearchMemoryArgs {
                 query: "tokio async runtime".to_string(),
+                memories_per_page: None,
+                page_index: None,
             })
             .await
             .unwrap()
@@ -1390,6 +1408,8 @@ mod tests {
         searcher
             .search_memory(SearchMemoryArgs {
                 query: "tokio runtime".to_string(),
+                memories_per_page: None,
+                page_index: None,
             })
             .await
             .unwrap();
@@ -1473,6 +1493,74 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn search_memory_tool_paginates_ranked_titles() {
+        let mut memory = AgentMemory::default();
+        for index in 0..12 {
+            let title = format!("memory {index:02}");
+            memory.short_term.insert(
+                title.clone(),
+                AgentMemoryContent {
+                    title,
+                    related_context: "same context".to_string(),
+                    trigger_scenario: "same trigger".to_string(),
+                    content: "same content".to_string(),
+                    raw_content: None,
+                },
+            );
+        }
+
+        let context = AgentMemoryContext::new_with_search_weights(
+            memory,
+            shared_model().await,
+            AgentMemorySearchWeights {
+                title: 0.0,
+                related_context: 0.0,
+                trigger_scenario: 0.0,
+                content: 0.0,
+                content_top_k: 3,
+            },
+        );
+        let searcher = SearchMemoryTool::new(context);
+
+        let default_page = searcher
+            .search_memory(SearchMemoryArgs {
+                query: "anything".to_string(),
+                memories_per_page: None,
+                page_index: None,
+            })
+            .await
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let second_page = searcher
+            .search_memory(SearchMemoryArgs {
+                query: "anything".to_string(),
+                memories_per_page: Some(5),
+                page_index: Some(1),
+            })
+            .await
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(default_page.len(), 10);
+        assert_eq!(default_page.first().map(String::as_str), Some("memory 00"));
+        assert_eq!(default_page.last().map(String::as_str), Some("memory 09"));
+        assert_eq!(
+            second_page,
+            vec![
+                "memory 05".to_string(),
+                "memory 06".to_string(),
+                "memory 07".to_string(),
+                "memory 08".to_string(),
+                "memory 09".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn write_memory_rejects_overlong_searchable_fields() {
         let context = new_context().await;
         let writer = WriteMemoryTool::new(context.clone());
@@ -1519,6 +1607,8 @@ mod tests {
         searcher
             .search_memory(SearchMemoryArgs {
                 query: "rust async".to_string(),
+                memories_per_page: None,
+                page_index: None,
             })
             .await
             .unwrap();
