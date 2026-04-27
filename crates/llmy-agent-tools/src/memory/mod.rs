@@ -120,7 +120,7 @@ pub struct AgentMemory {
 
 pub struct AgentMemoryContextInner {
     pub memory: RwLock<AgentMemory>,
-    pub embed: SimilarityModel,
+    pub embed: Option<SimilarityModel>,
     search_weights: AgentMemorySearchWeights,
     search_embed_cache: RwLock<BTreeMap<String, CachedMemoryEmbeddings>>,
 }
@@ -148,6 +148,17 @@ impl AgentMemoryContext {
         Self::new_with_search_weights(memory, embed, AgentMemorySearchWeights::default())
     }
 
+    pub fn new_without_search(memory: AgentMemory) -> Self {
+        Self {
+            inner: Arc::new(AgentMemoryContextInner {
+                memory: RwLock::new(memory),
+                embed: None,
+                search_weights: AgentMemorySearchWeights::default(),
+                search_embed_cache: RwLock::new(BTreeMap::new()),
+            }),
+        }
+    }
+
     pub fn new_with_search_weights(
         memory: AgentMemory,
         embed: SimilarityModel,
@@ -156,11 +167,15 @@ impl AgentMemoryContext {
         Self {
             inner: Arc::new(AgentMemoryContextInner {
                 memory: RwLock::new(memory),
-                embed,
+                embed: Some(embed),
                 search_weights,
                 search_embed_cache: RwLock::new(BTreeMap::new()),
             }),
         }
+    }
+
+    pub fn search_enabled(&self) -> bool {
+        self.embed.is_some()
     }
 
     pub fn tool_box(&self) -> ToolBox {
@@ -168,7 +183,9 @@ impl AgentMemoryContext {
         tools.add_tool(ListMemoriesTool::new(self.clone()));
         tools.add_tool(ReadMemoryTool::new(self.clone()));
         tools.add_tool(ReadMemoryRawTool::new(self.clone()));
-        tools.add_tool(SearchMemoryTool::new(self.clone()));
+        if self.search_enabled() {
+            tools.add_tool(SearchMemoryTool::new(self.clone()));
+        }
         tools.add_tool(DeleteMemoryTool::new(self.clone()));
         tools.add_tool(WriteMemoryTool::new(self.clone()));
         tools.add_tool(UpdateMemoryTool::new(self.clone()));
@@ -345,6 +362,10 @@ impl AgentMemoryContext {
     }
 
     pub async fn search_memory(&self, query: &str) -> Result<Vec<String>, LLMYError> {
+        let Some(embed) = self.embed.as_ref() else {
+            return Err(eyre!("memory search is disabled for this context").into());
+        };
+
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -358,8 +379,7 @@ impl AgentMemoryContext {
             return Ok(Vec::new());
         }
 
-        let query_embedding = self
-            .embed
+        let query_embedding = embed
             .batch_embed(vec![query.to_string()])
             .await?
             .into_iter()
@@ -392,7 +412,11 @@ impl AgentMemoryContext {
         &self,
         fields: [(&'static str, Option<&str>); N],
     ) -> Option<MemoryFieldLengthViolation> {
-        let max_tokens = self.embed.max_input_tokens();
+        let Some(embed) = self.embed.as_ref() else {
+            return None;
+        };
+
+        let max_tokens = embed.max_input_tokens();
 
         for (field_name, value) in fields {
             let Some(value) = value else {
@@ -403,7 +427,7 @@ impl AgentMemoryContext {
                 continue;
             }
 
-            let token_count = match self.embed.count_tokens(value.to_string()).await {
+            let token_count = match embed.count_tokens(value.to_string()).await {
                 Ok(token_count) => token_count,
                 Err(error) => {
                     tracing::warn!(
@@ -431,6 +455,10 @@ impl AgentMemoryContext {
         &self,
         entries: &[SearchableMemoryEntry],
     ) -> Result<Vec<CachedMemoryEmbeddings>, LLMYError> {
+        let Some(embed) = self.embed.as_ref() else {
+            return Err(eyre!("memory search is disabled for this context").into());
+        };
+
         let missing_entries = {
             let cache = self.search_embed_cache.read().await;
             entries
@@ -467,11 +495,7 @@ impl AgentMemoryContext {
                     entry.trigger_scenario.clone(),
                 );
 
-                for content_chunk in self
-                    .embed
-                    .chunk_to_input_tokens(entry.content.clone())
-                    .await?
-                {
+                for content_chunk in embed.chunk_to_input_tokens(entry.content.clone()).await? {
                     queue_search_embedding(
                         &mut pending_fields,
                         &mut pending_inputs,
@@ -485,7 +509,7 @@ impl AgentMemoryContext {
             let embeddings = if pending_inputs.is_empty() {
                 Vec::new()
             } else {
-                self.embed.batch_embed(pending_inputs).await?
+                embed.batch_embed(pending_inputs).await?
             };
 
             let mut assembled = BTreeMap::<String, CachedMemoryEmbeddings>::new();
@@ -1015,6 +1039,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn memory_context_without_search_omits_search_tool() {
+        let context = AgentMemoryContext::new_without_search(AgentMemory::default());
+        let tools = context.tool_box();
+
+        assert!(!context.search_enabled());
+        assert!(!tools.has_tool(&"search_memory".to_string()));
+        assert!(tools.has_tool(&"write_memory".to_string()));
+        assert!(tools.has_tool(&"read_memory".to_string()));
+
+        let writer = WriteMemoryTool::new(context.clone());
+        let write_result = writer
+            .write_memory(WriteMemoryArgs {
+                title: "tokio runtime ".repeat(1000),
+                related_context: "systems".to_string(),
+                trigger_scenario: "debugging".to_string(),
+                content: "notes".to_string(),
+                raw_content: None,
+                is_long_term: false,
+            })
+            .await
+            .unwrap();
+        assert!(write_result.contains("Stored memory"));
+
+        let error = context
+            .search_memory("anything")
+            .await
+            .expect_err("search should be disabled");
+        assert!(error.to_string().contains("memory search is disabled"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn weighted_content_similarity_averages_top_k_scores() {
         let model = shared_model().await;
         let embeddings = model
@@ -1261,6 +1316,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn update_memory_invalidates_cached_search_embedding() {
+        let context = new_context().await;
+        let writer = WriteMemoryTool::new(context.clone());
+        let searcher = SearchMemoryTool::new(context.clone());
+        let updater = UpdateMemoryTool::new(context.clone());
+
+        writer
+            .write_memory(WriteMemoryArgs {
+                title: "Rust async notes".to_string(),
+                related_context: "tokio".to_string(),
+                trigger_scenario: "services".to_string(),
+                content: "initial notes".to_string(),
+                raw_content: None,
+                is_long_term: false,
+            })
+            .await
+            .unwrap();
+
+        searcher
+            .search_memory(SearchMemoryArgs {
+                query: "rust async".to_string(),
+                memories_per_page: None,
+                page_index: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            context
+                .search_embed_cache
+                .read()
+                .await
+                .contains_key("Rust async notes")
+        );
+
+        updater
+            .update_memory(UpdateMemoryArgs {
+                title: "Rust async notes".to_string(),
+                related_context: None,
+                trigger_scenario: None,
+                content: Some("updated notes".to_string()),
+                raw_content: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            !context
+                .search_embed_cache
+                .read()
+                .await
+                .contains_key("Rust async notes")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn list_memories_returns_titles_only_by_page() {
         let context = new_context().await;
         let writer = WriteMemoryTool::new(context.clone());
@@ -1391,7 +1501,13 @@ mod tests {
         let context = new_context().await;
         let writer = WriteMemoryTool::new(context.clone());
         let searcher = SearchMemoryTool::new(context.clone());
-        let content = "tokio runtime async rust ".repeat(context.embed.max_input_tokens());
+        let content = "tokio runtime async rust ".repeat(
+            context
+                .embed
+                .as_ref()
+                .expect("expected search embedding model")
+                .max_input_tokens(),
+        );
 
         writer
             .write_memory(WriteMemoryArgs {
@@ -1564,7 +1680,11 @@ mod tests {
     async fn write_memory_rejects_overlong_searchable_fields() {
         let context = new_context().await;
         let writer = WriteMemoryTool::new(context.clone());
-        let max_tokens = context.embed.max_input_tokens();
+        let max_tokens = context
+            .embed
+            .as_ref()
+            .expect("expected search embedding model")
+            .max_input_tokens();
         let overlong_title = "tokio runtime ".repeat(max_tokens);
 
         let result = writer
