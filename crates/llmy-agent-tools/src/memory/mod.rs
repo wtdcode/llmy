@@ -23,6 +23,7 @@ pub struct AgentMemorySearchWeights {
     pub related_context: f64,
     pub trigger_scenario: f64,
     pub content: f64,
+    pub content_top_k: usize,
 }
 
 impl Default for AgentMemorySearchWeights {
@@ -32,6 +33,7 @@ impl Default for AgentMemorySearchWeights {
             related_context: 0.2,
             trigger_scenario: 0.2,
             content: 0.1,
+            content_top_k: 3,
         }
     }
 }
@@ -41,7 +43,7 @@ struct CachedMemoryEmbeddings {
     title: Option<Embeding>,
     related_context: Option<Embeding>,
     trigger_scenario: Option<Embeding>,
-    content: Option<Embeding>,
+    content: Vec<Embeding>,
 }
 
 #[derive(Clone, Debug)]
@@ -465,17 +467,19 @@ impl AgentMemoryContext {
                     entry.trigger_scenario.clone(),
                 );
 
-                let truncated_content = self
+                for content_chunk in self
                     .embed
-                    .truncate_to_input_tokens(entry.content.clone())
-                    .await?;
-                queue_search_embedding(
-                    &mut pending_fields,
-                    &mut pending_inputs,
-                    &entry.title,
-                    SearchField::Content,
-                    truncated_content,
-                );
+                    .chunk_to_input_tokens(entry.content.clone())
+                    .await?
+                {
+                    queue_search_embedding(
+                        &mut pending_fields,
+                        &mut pending_inputs,
+                        &entry.title,
+                        SearchField::Content,
+                        content_chunk,
+                    );
+                }
             }
 
             let embeddings = if pending_inputs.is_empty() {
@@ -491,7 +495,7 @@ impl AgentMemoryContext {
                     SearchField::Title => cache_entry.title = Some(embedding),
                     SearchField::RelatedContext => cache_entry.related_context = Some(embedding),
                     SearchField::TriggerScenario => cache_entry.trigger_scenario = Some(embedding),
-                    SearchField::Content => cache_entry.content = Some(embedding),
+                    SearchField::Content => cache_entry.content.push(embedding),
                 }
             }
 
@@ -644,10 +648,11 @@ fn weighted_similarity(
         query_embedding,
         cached_embeddings.trigger_scenario.as_ref(),
         weights.trigger_scenario,
-    ) + weighted_field_similarity(
+    ) + weighted_content_similarity(
         query_embedding,
-        cached_embeddings.content.as_ref(),
+        &cached_embeddings.content,
         weights.content,
+        weights.content_top_k,
     )
 }
 
@@ -665,6 +670,25 @@ fn weighted_field_similarity(
     };
 
     query_embedding.cosine_similarity(target).unwrap_or(0.0) * weight
+}
+
+fn weighted_content_similarity(
+    query_embedding: &Embeding,
+    targets: &[Embeding],
+    weight: f64,
+    top_k: usize,
+) -> f64 {
+    if weight <= 0.0 || top_k == 0 || targets.is_empty() {
+        return 0.0;
+    }
+
+    let mut similarities = query_embedding.calculate_similarity(targets);
+    similarities.sort_by(|left, right| right.partial_cmp(left).unwrap_or(Ordering::Equal));
+
+    let top_scores = similarities.into_iter().take(top_k).collect::<Vec<_>>();
+    let top_score_sum = top_scores.iter().sum::<f64>();
+
+    top_score_sum / top_scores.len() as f64 * weight
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -967,6 +991,31 @@ mod tests {
 
     async fn new_context() -> AgentMemoryContext {
         AgentMemoryContext::new(AgentMemory::default(), shared_model().await)
+    }
+
+    #[test]
+    fn memory_search_weights_default_content_top_k_is_three() {
+        assert_eq!(AgentMemorySearchWeights::default().content_top_k, 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn weighted_content_similarity_averages_top_k_scores() {
+        let model = shared_model().await;
+        let embeddings = model
+            .batch_embed(vec![
+                "tokio runtime".to_string(),
+                "tokio runtime".to_string(),
+                "banana bread recipe".to_string(),
+            ])
+            .await
+            .expect("failed to compute test embeddings");
+        let query_embedding = embeddings[0].clone();
+        let targets = embeddings[1..].to_vec();
+
+        let top_one_score = weighted_content_similarity(&query_embedding, &targets, 1.0, 1);
+        let top_two_score = weighted_content_similarity(&query_embedding, &targets, 1.0, 2);
+
+        assert!(top_one_score > top_two_score);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1316,6 +1365,110 @@ mod tests {
                 "Banana bread related context".to_string(),
                 "Rust async notes".to_string()
             ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn search_memory_caches_content_as_chunks() {
+        let context = new_context().await;
+        let writer = WriteMemoryTool::new(context.clone());
+        let searcher = SearchMemoryTool::new(context.clone());
+        let content = "tokio runtime async rust ".repeat(context.embed.max_input_tokens());
+
+        writer
+            .write_memory(WriteMemoryArgs {
+                title: "chunked content".to_string(),
+                related_context: "systems".to_string(),
+                trigger_scenario: "debugging".to_string(),
+                content,
+                raw_content: None,
+                is_long_term: false,
+            })
+            .await
+            .unwrap();
+
+        searcher
+            .search_memory(SearchMemoryArgs {
+                query: "tokio runtime".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let cache = searcher.context.search_embed_cache.read().await;
+        let cached = cache
+            .get("chunked content")
+            .expect("expected cached memory embeddings");
+        assert!(cached.title.is_some());
+        assert!(cached.related_context.is_some());
+        assert!(cached.trigger_scenario.is_some());
+        assert!(cached.content.len() > 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn search_memory_content_top_k_zero_disables_content_score() {
+        let mut memory = AgentMemory::default();
+        memory.short_term.insert(
+            "a unrelated".to_string(),
+            AgentMemoryContent {
+                title: "a unrelated".to_string(),
+                related_context: "irrelevant".to_string(),
+                trigger_scenario: "irrelevant".to_string(),
+                content: "banana bread recipe".to_string(),
+                raw_content: None,
+            },
+        );
+        memory.short_term.insert(
+            "z exact".to_string(),
+            AgentMemoryContent {
+                title: "z exact".to_string(),
+                related_context: "irrelevant".to_string(),
+                trigger_scenario: "irrelevant".to_string(),
+                content: "tokio runtime".to_string(),
+                raw_content: None,
+            },
+        );
+
+        let weights_without_content = AgentMemorySearchWeights {
+            title: 0.0,
+            related_context: 0.0,
+            trigger_scenario: 0.0,
+            content: 1.0,
+            content_top_k: 0,
+        };
+        let context_without_content = AgentMemoryContext::new_with_search_weights(
+            memory.clone(),
+            shared_model().await,
+            weights_without_content,
+        );
+        let titles_without_content = context_without_content
+            .search_memory("tokio runtime")
+            .await
+            .unwrap();
+
+        let weights_with_content = AgentMemorySearchWeights {
+            title: 0.0,
+            related_context: 0.0,
+            trigger_scenario: 0.0,
+            content: 1.0,
+            content_top_k: 1,
+        };
+        let context_with_content = AgentMemoryContext::new_with_search_weights(
+            memory,
+            shared_model().await,
+            weights_with_content,
+        );
+        let titles_with_content = context_with_content
+            .search_memory("tokio runtime")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            titles_without_content.first().map(String::as_str),
+            Some("a unrelated")
+        );
+        assert_eq!(
+            titles_with_content.first().map(String::as_str),
+            Some("z exact")
         );
     }
 

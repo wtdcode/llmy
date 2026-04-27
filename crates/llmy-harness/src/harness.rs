@@ -1,6 +1,7 @@
 use async_openai::types::chat::{
     ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
+    ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, FinishReason,
 };
 use color_eyre::eyre::eyre;
@@ -185,19 +186,40 @@ impl Agent {
                         return Err(eyre!("no tool calls but give tool call reason").into());
                     }
 
-                    for call in &calls {
-                        if !self.tools.has_tool(&call.tool_name) {
-                            return Err(LLMYError::NonExistingToolCall(call.clone()));
+                    let calls = self.tools.agent_invoke_many(calls).await;
+                    let mut out = vec![];
+                    for (call, tool_out) in calls.into_iter() {
+                        if let Some(tool_out) = tool_out {
+                            match tool_out {
+                                Ok(tool_out) => {
+                                    out.push(tool_out);
+                                }
+                                Err(LLMYError::IncorrectToolCall(_, _, e)) => {
+                                    tracing::warn!(
+                                        "Incorrect tool call detected for {}, schema is {:?}, we will ask LLM to retry.",
+                                        call,
+                                        &e
+                                    );
+                                    out.push(ChatCompletionRequestToolMessage {
+                                        content: ChatCompletionRequestToolMessageContent::Text(format!("Tool call to {} does not conform to schema {:?}", call, e)),
+                                        tool_call_id: call.tool_id.clone()
+                                    }.into());
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        } else {
+                            tracing::warn!("Tool call {} is not defined", call);
+                            out.push(
+                                ChatCompletionRequestToolMessage {
+                                    content: ChatCompletionRequestToolMessageContent::Text(
+                                        format!("The tool of {} is not defined", call),
+                                    ),
+                                    tool_call_id: call.tool_id.clone(),
+                                }
+                                .into(),
+                            );
                         }
                     }
-
-                    let out = self
-                        .tools
-                        .agent_invoke_many(calls)
-                        .await?
-                        .into_iter()
-                        .map(|v| v.1)
-                        .collect();
                     (StepResult::Toolcalled(choice.message.content.clone()), out)
                 }
                 FinishReason::ContentFilter => {

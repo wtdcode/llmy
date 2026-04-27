@@ -157,6 +157,41 @@ impl SimilarityModelInner {
 
         Ok(text[..best].to_string())
     }
+
+    pub fn chunk_to_token_limit(
+        &self,
+        text: &str,
+        token_limit: usize,
+    ) -> Result<Vec<String>, LLMYError> {
+        if text.trim().is_empty() || token_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let model = self
+            .embedding
+            .lock()
+            .map_err(|_| eyre!("local embedding model lock was poisoned"))?;
+        let mut tokenizer = model.tokenizer.clone();
+        tokenizer
+            .with_truncation(None)
+            .map_err(|error| eyre!("failed to disable embedding tokenizer truncation: {error}"))?;
+
+        let encoding = tokenizer
+            .encode(text, false)
+            .map_err(|error| eyre!("failed to tokenize embedding input: {error}"))?;
+        let offsets = encoding.get_offsets();
+
+        if offsets.len() <= token_limit {
+            return Ok(vec![text.to_string()]);
+        }
+
+        let chunks = offsets
+            .chunks(token_limit)
+            .filter_map(|chunk_offsets| chunk_from_offsets(text, chunk_offsets))
+            .collect::<Vec<_>>();
+
+        Ok(chunks)
+    }
 }
 
 #[derive(Clone)]
@@ -236,6 +271,14 @@ impl SimilarityModel {
             .expect("truncate input paniced")
     }
 
+    pub async fn chunk_to_input_tokens(&self, text: String) -> Result<Vec<String>, LLMYError> {
+        let inner = self.inner.clone();
+        let token_limit = self.max_input_tokens();
+        tokio::task::spawn_blocking(move || inner.chunk_to_token_limit(&text, token_limit))
+            .await
+            .expect("chunk input paniced")
+    }
+
     pub async fn batch_similarity(
         &self,
         query: String,
@@ -309,6 +352,32 @@ impl SimilarityModel {
 
         Ok(scores)
     }
+}
+
+fn chunk_from_offsets(text: &str, offsets: &[(usize, usize)]) -> Option<String> {
+    let start = offsets
+        .iter()
+        .find_map(|(start, end)| (end > start).then_some(*start))?;
+    let end = offsets
+        .iter()
+        .rev()
+        .find_map(|(start, end)| (end > start).then_some(*end))?;
+
+    let start = char_boundary_after(text, start);
+    let end = char_boundary_before(text, end);
+    if start >= end {
+        return None;
+    }
+
+    let chunk = text[start..end].trim();
+    (!chunk.is_empty()).then(|| chunk.to_string())
+}
+
+fn char_boundary_after(text: &str, byte_offset: usize) -> usize {
+    let position = byte_offset.min(text.len());
+    (position..=text.len())
+        .find(|&index| text.is_char_boundary(index))
+        .unwrap_or(text.len())
 }
 
 fn char_boundary_before(text: &str, byte_offset: usize) -> usize {
@@ -417,6 +486,26 @@ mod tests {
 
         assert!(truncated.len() < text.len());
         assert!(token_count <= model.max_input_tokens());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chunk_to_input_tokens_splits_long_text_without_overlong_chunks() {
+        let model = shared_model().await;
+        let text = "tokio runtime async rust ".repeat(model.max_input_tokens());
+
+        let chunks = model
+            .chunk_to_input_tokens(text)
+            .await
+            .expect("failed to chunk text");
+
+        assert!(chunks.len() > 1);
+        for chunk in chunks {
+            let token_count = model
+                .count_tokens(chunk)
+                .await
+                .expect("failed to count chunk tokens");
+            assert!(token_count <= model.max_input_tokens());
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

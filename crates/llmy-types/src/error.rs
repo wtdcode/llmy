@@ -31,8 +31,6 @@ pub enum LLMYError {
     Billing(f64, f64),
     #[error("incorrect tool call for tool {0} with args {1} given schema {2:?}")]
     IncorrectToolCall(String, String, schemars::Schema),
-    #[error("nonexisting tool call {0}")]
-    NonExistingToolCall(GeneralToolCall),
     #[error("toolcall {0} has nested error: {1}")]
     ToolCallError(GeneralToolCall, Box<LLMYError>),
     #[error("response filtered: {0}")]
