@@ -34,11 +34,11 @@ macro_rules! make_openai_args {
             #[arg(long, env = concat!($prefix,"LLM_DEBUG"))]
             pub llm_debug: Option<PathBuf>,
 
-            #[arg(long, env = concat!($prefix, "LLM_TEMPERATURE"), default_value_t = 0.8)]
-            pub llm_temperature: f32,
+            #[arg(long, env = concat!($prefix, "LLM_TEMPERATURE"))]
+            pub llm_temperature: Option<f32>,
 
-            #[arg(long, env = concat!($prefix, "LLM_PRESENCE_PENALTY"), default_value_t = 0.0)]
-            pub llm_presence_penalty: f32,
+            #[arg(long, env = concat!($prefix, "LLM_PRESENCE_PENALTY"))]
+            pub llm_presence_penalty: Option<f32>,
 
             #[arg(long, env = concat!($prefix, "LLM_PROMPT_TIMEOUT"), default_value_t = 20 * 60)]
             pub llm_prompt_timeout: u64,
@@ -46,8 +46,8 @@ macro_rules! make_openai_args {
             #[arg(long, env = concat!($prefix, "LLM_RETRY"), default_value_t = 5)]
             pub llm_retry: u64,
 
-            #[arg(long, env = concat!($prefix, "LLM_MAX_COMPLETION_TOKENS"), default_value_t = 16384)]
-            pub llm_max_completion_tokens: u32,
+            #[arg(long, env = concat!($prefix, "LLM_MAX_COMPLETION_TOKENS"))]
+            pub llm_max_completion_tokens: Option<u32>,
 
             #[arg(long, env = concat!($prefix, "LLM_TOOL_CHOINCE"))]
             pub llm_tool_choice: Option<LLMToolChoice>,
@@ -59,6 +59,9 @@ macro_rules! make_openai_args {
                 value_parser = clap::builder::BoolishValueParser::new()
             )]
             pub llm_stream: bool,
+
+            #[arg(long, env = concat!($prefix, "LLM_TOP_P"))]
+            pub top_p: Option<f32>,
 
             #[arg(
                 long,
@@ -77,6 +80,7 @@ macro_rules! make_openai_args {
                     llm_max_completion_tokens: self.llm_max_completion_tokens,
                     llm_tool_choice: self.llm_tool_choice.clone(),
                     llm_stream: self.llm_stream,
+                    top_p: self.top_p,
                     reasoning_effort: self.reasoning_effort.clone()
                 }
             }

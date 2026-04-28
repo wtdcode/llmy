@@ -256,4 +256,14 @@ mod tests {
         assert_eq!(model.max_input(), 272000);
         assert_eq!(model.max_output(), 128000);
     }
+
+    #[test]
+    fn test_mimo_model_config() {
+        let model = get_model("mimo/mimo-v2.5-pro").expect("known model");
+
+        assert_eq!(model.encoding(), Some(Encoding::O200kBase));
+        assert_eq!(model.max_input_tokens, 917504);
+        assert_eq!(model.max_tokens, 131072);
+        assert_eq!(model.pricing.expect("mimo pricing").input, 1e-06);
+    }
 }

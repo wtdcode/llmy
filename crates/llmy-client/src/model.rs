@@ -6,13 +6,22 @@ pub use llmy_tokenizer::{ModelConfig, ModelPricing, ModelTokens};
 
 #[derive(Debug, Clone)]
 pub struct OpenAIModel {
-    model_id: String,
+    model_id: String, // TODO: Have enum?
     pub config: ModelConfig,
 }
 
 impl OpenAIModel {
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    pub fn is_mimo(&self) -> bool {
+        self.model_id.starts_with("mimo/")
+            || self
+                .model_id
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name.starts_with("mimo-"))
     }
 
     /// Per-token USD pricing. Returns zero pricing if unavailable.

@@ -17,25 +17,72 @@ use async_openai::{
         ChatChoice, ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
         ChatCompletionRequestUserMessageArgs, ChatCompletionResponseMessage,
-        ChatCompletionResponseStream, ChatCompletionStreamOptions, ChatCompletionTools,
-        CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason,
-        FunctionCall, Role,
+        ChatCompletionResponseStream, ChatCompletionStreamOptions, ChatCompletionToolChoiceOption,
+        ChatCompletionTools, CompletionUsage, CreateChatCompletionRequest,
+        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        CreateChatCompletionStreamResponse, FinishReason, FunctionCall, Role, ToolChoiceOptions,
     },
 };
 use color_eyre::eyre::eyre;
 use llmy_types::error::LLMYError;
+use serde::{Serialize, Serializer};
+use serde_json::{Map, Value};
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 
 use crate::debug;
-use crate::{billing::ModelBilling, settings::LLMSettings};
+use crate::{
+    billing::ModelBilling,
+    settings::{LLMSettings, Reasoning},
+};
 
 #[derive(Clone, Debug, Default)]
 struct ToolCallAcc {
     id: String,
     name: String,
     arguments: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExtensibleChatCompletionRequest {
+    request: CreateChatCompletionRequest,
+    extra: Map<String, Value>,
+}
+
+impl ExtensibleChatCompletionRequest {
+    fn new(request: CreateChatCompletionRequest) -> Self {
+        Self {
+            request,
+            extra: Map::new(),
+        }
+    }
+
+    fn base(&self) -> &CreateChatCompletionRequest {
+        &self.request
+    }
+
+    fn base_mut(&mut self) -> &mut CreateChatCompletionRequest {
+        &mut self.request
+    }
+
+    fn insert_extra(&mut self, key: impl Into<String>, value: Value) {
+        self.extra.insert(key.into(), value);
+    }
+}
+
+impl Serialize for ExtensibleChatCompletionRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut value = serde_json::to_value(&self.request).map_err(serde::ser::Error::custom)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| serde::ser::Error::custom("chat completion request is not an object"))?;
+
+        for (key, value) in &self.extra {
+            object.insert(key.clone(), value.clone());
+        }
+
+        value.serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +133,16 @@ impl LLMClient {
         }
     }
 
+    async fn create_chat_extensible(
+        &self,
+        req: &ExtensibleChatCompletionRequest,
+    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        match self {
+            Self::Azure(cl) => cl.chat().create_byot(req).await,
+            Self::OpenAI(cl) => cl.chat().create_byot(req).await,
+        }
+    }
+
     pub async fn create_chat_stream(
         &self,
         req: CreateChatCompletionRequest,
@@ -93,6 +150,16 @@ impl LLMClient {
         match self {
             Self::Azure(cl) => cl.chat().create_stream(req).await,
             Self::OpenAI(cl) => cl.chat().create_stream(req).await,
+        }
+    }
+
+    async fn create_chat_stream_extensible(
+        &self,
+        req: &ExtensibleChatCompletionRequest,
+    ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        match self {
+            Self::Azure(cl) => cl.chat().create_stream_byot(req).await,
+            Self::OpenAI(cl) => cl.chat().create_stream_byot(req).await,
         }
     }
 }
@@ -222,11 +289,26 @@ impl LLMInner {
         timeout: Option<Duration>,
         retry: Option<u64>,
     ) -> Result<CreateChatCompletionResponse, LLMYError> {
+        let req = ExtensibleChatCompletionRequest::new(req.clone());
+        self.complete_extensible_once_with_retry(&req, debug_prefix, timeout, retry)
+            .await
+    }
+
+    async fn complete_extensible_once_with_retry(
+        &self,
+        req: &ExtensibleChatCompletionRequest,
+        debug_prefix: Option<&str>,
+        timeout: Option<Duration>,
+        retry: Option<u64>,
+    ) -> Result<CreateChatCompletionResponse, LLMYError> {
         let retry = retry.unwrap_or(u64::MAX);
 
         let mut last = None;
         for idx in 0..retry {
-            match self.complete(req.clone(), debug_prefix, timeout).await {
+            match self
+                .complete_extensible(req.clone(), debug_prefix, timeout)
+                .await
+            {
                 Ok(r) => return Ok(r),
                 Err(e) => {
                     tracing::warn!("Having an error {} during {} retry", e, idx);
@@ -244,6 +326,17 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
     ) -> Result<CreateChatCompletionResponse, LLMYError> {
+        let req = ExtensibleChatCompletionRequest::new(req);
+        self.complete_extensible(req, debug_prefix, timeout_overwrite)
+            .await
+    }
+
+    async fn complete_extensible(
+        &self,
+        req: ExtensibleChatCompletionRequest,
+        debug_prefix: Option<&str>,
+        timeout_overwrite: Option<Duration>,
+    ) -> Result<CreateChatCompletionResponse, LLMYError> {
         let use_stream = self.default_settings.llm_stream;
         let debug_prefix = if let Some(debug_prefix) = debug_prefix {
             debug_prefix.to_string()
@@ -253,13 +346,13 @@ impl LLMInner {
         let debug_fp = self.on_llm_debug(&debug_prefix);
 
         if let Some(debug_fp) = debug_fp.as_ref()
-            && let Err(e) = debug::save_llm_user(debug_fp, &req).await
+            && let Err(e) = debug::save_llm_user(debug_fp, req.base(), &req).await
         {
             tracing::warn!("Fail to save user due to {}", e);
         }
 
         let estimated_tokens = {
-            let text = debug::extract_raw_text(&req);
+            let text = debug::extract_raw_text(req.base());
             tracing::trace!("Text is {:?}", text);
             self.model.config.count_tokens(&text)
         };
@@ -274,7 +367,10 @@ impl LLMInner {
             if use_stream {
                 self.complete_streaming(req).await
             } else {
-                self.client.create_chat(req).await.map_err(|e| e.into())
+                self.client
+                    .create_chat_extensible(&req)
+                    .await
+                    .map_err(|e| e.into())
             }
         };
 
@@ -386,16 +482,18 @@ impl LLMInner {
     #[allow(deprecated)]
     async fn complete_streaming(
         &self,
-        mut req: CreateChatCompletionRequest,
+        mut req: ExtensibleChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, LLMYError> {
-        if req.stream_options.is_none() {
-            req.stream_options = Some(ChatCompletionStreamOptions {
+        req.base_mut().stream = Some(true);
+
+        if req.base().stream_options.is_none() {
+            req.base_mut().stream_options = Some(ChatCompletionStreamOptions {
                 include_usage: Some(true),
                 include_obfuscation: None,
             });
         }
 
-        let mut stream = self.client.create_chat_stream(req).await?;
+        let mut stream = self.client.create_chat_stream_extensible(&req).await?;
 
         let mut id: Option<String> = None;
         let mut created: Option<u32> = None;
@@ -551,25 +649,48 @@ impl LLMInner {
             req.tools(tools);
         }
 
-        if let Some(tc) = settings.llm_tool_choice {
+        if let Some(tc) = settings.llm_tool_choice.clone() {
             req.tool_choice(tc);
+        } else if self.model.is_mimo() {
+            // This ensures mimo to generate tool calls correctly, only god knows why
+            req.tool_choice(ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::Auto,
+            ));
         }
 
-        if let Some(effort) = settings.reasoning_effort {
+        if let Some(effort) = settings.reasoning_effort.clone()
+            && !self.model.is_mimo()
+        {
             req.reasoning_effort(effort.0);
         }
 
         if let Some(cache_key) = cache_key {
             req.prompt_cache_key(cache_key.to_string());
         }
+        if let Some(temperature) = settings.llm_temperature {
+            req.temperature(temperature);
+        }
+
+        if let Some(presence_penalty) = settings.llm_presence_penalty {
+            req.presence_penalty(presence_penalty);
+        }
+
+        if let Some(max_completion_tokens) = settings.llm_max_completion_tokens {
+            req.max_completion_tokens(max_completion_tokens);
+        }
+
+        if let Some(top_p) = settings.top_p {
+            req.top_p(top_p);
+        }
+
         let req = req
             .messages(messages)
             .model(self.model.to_string())
-            .temperature(settings.llm_temperature)
-            .presence_penalty(settings.llm_presence_penalty)
-            .max_completion_tokens(settings.llm_max_completion_tokens)
             .build()?;
-        self.complete_once_with_retry(&req, debug_prefix, Some(timeout), Some(retry))
+        let mut req = ExtensibleChatCompletionRequest::new(req);
+        apply_provider_request_extensions(&self.model, &settings, &mut req);
+
+        self.complete_extensible_once_with_retry(&req, debug_prefix, Some(timeout), Some(retry))
             .await
     }
 
@@ -596,5 +717,96 @@ impl LLMInner {
             None,
         )
         .await
+    }
+}
+
+fn apply_provider_request_extensions(
+    model: &OpenAIModel,
+    settings: &LLMSettings,
+    req: &mut ExtensibleChatCompletionRequest,
+) {
+    if model.is_mimo()
+        && settings
+            .reasoning_effort
+            .as_ref()
+            .is_some_and(Reasoning::is_none)
+    {
+        req.insert_extra(
+            "thinking",
+            serde_json::json!({
+                "type": "disabled"
+            }),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::{LLMToolChoice, Reasoning};
+    use async_openai::types::chat::ReasoningEffort;
+    use std::str::FromStr;
+
+    fn test_settings(reasoning_effort: Option<Reasoning>) -> LLMSettings {
+        LLMSettings {
+            llm_temperature: None,
+            llm_presence_penalty: None,
+            llm_prompt_timeout: 0,
+            llm_retry: 1,
+            llm_max_completion_tokens: None,
+            llm_tool_choice: None::<LLMToolChoice>,
+            llm_stream: false,
+            top_p: None,
+            reasoning_effort,
+        }
+    }
+
+    #[test]
+    fn extensible_chat_completion_request_flattens_extra_fields() {
+        let user = ChatCompletionRequestUserMessageArgs::default()
+            .content("hello")
+            .build()
+            .unwrap();
+        let request = CreateChatCompletionRequestArgs::default()
+            .messages(vec![user.into()])
+            .model("mimo-v2.5-pro")
+            .build()
+            .unwrap();
+        let mut request = ExtensibleChatCompletionRequest::new(request);
+
+        request.insert_extra(
+            "thinking",
+            serde_json::json!({
+                "type": "disabled"
+            }),
+        );
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["model"], "mimo-v2.5-pro");
+        assert_eq!(value["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn mimo_reasoning_none_adds_thinking_disabled() {
+        let user = ChatCompletionRequestUserMessageArgs::default()
+            .content("hello")
+            .build()
+            .unwrap();
+        let request = CreateChatCompletionRequestArgs::default()
+            .messages(vec![user.into()])
+            .model("mimo-v2.5-pro")
+            .build()
+            .unwrap();
+        let mut request = ExtensibleChatCompletionRequest::new(request);
+        let model = OpenAIModel::from_str("mimo-v2.5-pro").unwrap();
+
+        apply_provider_request_extensions(
+            &model,
+            &test_settings(Some(Reasoning(ReasoningEffort::None))),
+            &mut request,
+        );
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["thinking"]["type"], "disabled");
     }
 }

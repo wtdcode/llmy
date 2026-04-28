@@ -187,9 +187,10 @@ pub(crate) async fn rewrite_json<T: Serialize + Debug>(
     Ok(())
 }
 
-pub(crate) async fn save_llm_user(
+pub(crate) async fn save_llm_user<T: Serialize + Debug>(
     fpath: &PathBuf,
     user_msg: &CreateChatCompletionRequest,
+    raw_request: &T,
 ) -> Result<(), LLMYError> {
     let mut fp = tokio::fs::OpenOptions::new()
         .create(true)
@@ -240,7 +241,7 @@ pub(crate) async fn save_llm_user(
         .await?;
     fp.flush().await?;
 
-    rewrite_json(fpath, user_msg).await?;
+    rewrite_json(fpath, raw_request).await?;
 
     Ok(())
 }

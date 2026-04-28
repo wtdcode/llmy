@@ -193,8 +193,10 @@ Every setting (temperature, timeout, retries, max tokens, reasoning effort, tool
 | Flag | Env var | Default |
 |------|---------|---------|
 | `--model` | `OPENAI_API_MODEL` | `o1` |
-| `--llm-temperature` | `LLM_TEMPERATURE` | `0.8` |
-| `--llm-max-completion-tokens` | `LLM_MAX_COMPLETION_TOKENS` | `16384` |
+| `--llm-temperature` | `LLM_TEMPERATURE` | — |
+| `--llm-presence-penalty` | `LLM_PRESENCE_PENALTY` | — |
+| `--llm-max-completion-tokens` | `LLM_MAX_COMPLETION_TOKENS` | — |
+| `--top-p` | `LLM_TOP_P` | — |
 | `--llm-retry` | `LLM_RETRY` | `5` |
 | `--llm-prompt-timeout` | `LLM_PROMPT_TIMEOUT` | `1200` (s) |
 | `--llm-stream` | `LLM_STREAM` | `false` |

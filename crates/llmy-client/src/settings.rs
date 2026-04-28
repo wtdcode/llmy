@@ -65,6 +65,12 @@ impl From<LLMToolChoice> for ChatCompletionToolChoiceOption {
 #[derive(Debug, Clone)]
 pub struct Reasoning(pub ReasoningEffort);
 
+impl Reasoning {
+    pub fn is_none(&self) -> bool {
+        matches!(self.0, ReasoningEffort::None)
+    }
+}
+
 impl FromStr for Reasoning {
     type Err = color_eyre::Report;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -82,13 +88,14 @@ impl FromStr for Reasoning {
 
 #[derive(Clone, Debug)]
 pub struct LLMSettings {
-    pub llm_temperature: f32,
-    pub llm_presence_penalty: f32,
+    pub llm_temperature: Option<f32>,
+    pub llm_presence_penalty: Option<f32>,
     pub llm_prompt_timeout: u64,
     pub llm_retry: u64,
-    pub llm_max_completion_tokens: u32,
+    pub llm_max_completion_tokens: Option<u32>,
     pub llm_tool_choice: Option<LLMToolChoice>,
     pub llm_stream: bool,
+    pub top_p: Option<f32>,
     pub reasoning_effort: Option<Reasoning>,
 }
 

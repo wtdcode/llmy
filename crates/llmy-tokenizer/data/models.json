@@ -1,4 +1,238 @@
 {
+  "mimo/mimo-v2.5-pro": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2.5 Pro",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 1e-06,
+      "output": 3e-06,
+      "input_cache_read": 2e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 917504
+  },
+  "mimo/mimo-v2.5": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2.5",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 4e-07,
+      "output": 2e-06,
+      "input_cache_read": 8e-08,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 917504
+  },
+  "mimo/mimo-v2.5-tts": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2.5 TTS",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 0,
+      "output": 0,
+      "input_cache_read": 0,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 8192
+  },
+  "mimo/mimo-v2.5-tts-voicedesign": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2.5 TTS VoiceDesign",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 0,
+      "output": 0,
+      "input_cache_read": 0,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 8192
+  },
+  "mimo/mimo-v2.5-tts-voiceclone": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2.5 TTS VoiceClone",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 0,
+      "output": 0,
+      "input_cache_read": 0,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 8192
+  },
+  "mimo/mimo-v2-pro": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2 Pro",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 1e-06,
+      "output": 3e-06,
+      "input_cache_read": 2e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 917504
+  },
+  "mimo/mimo-v2-omni": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2 Omni",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 4e-07,
+      "output": 2e-06,
+      "input_cache_read": 8e-08,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 131072
+  },
+  "mimo/mimo-v2-tts": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2 TTS",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 0,
+      "output": 0,
+      "input_cache_read": 0,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 8192
+  },
+  "mimo/mimo-v2-flash": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2 Flash",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 1e-07,
+      "output": 3e-07,
+      "input_cache_read": 1e-08,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 196608
+  },
   "anthropic/claude-3-haiku": {
     "encoding": "claude",
     "tokens": {

@@ -10,7 +10,7 @@ repository.workspace = true
 
 [dependencies]
 serde = {workspace = true, features = ["derive"]}
-async-openai = {workspace = true, features = ["completions", "completion-types", "chat-completion", "chat-completion-types"]}
+async-openai = {workspace = true, features = ["completions", "completion-types", "chat-completion", "chat-completion-types", "byot"]}
 color-eyre.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
