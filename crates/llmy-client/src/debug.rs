@@ -187,11 +187,10 @@ pub(crate) async fn rewrite_json<T: Serialize + Debug>(
     Ok(())
 }
 
-pub(crate) async fn save_llm_user<T: Serialize + Debug>(
-    fpath: &PathBuf,
-    user_msg: &CreateChatCompletionRequest,
-    raw_request: &T,
-) -> Result<(), LLMYError> {
+pub(crate) async fn save_llm_user<T>(fpath: &PathBuf, request: &T) -> Result<(), LLMYError>
+where
+    T: Serialize + Debug + std::ops::Deref<Target = CreateChatCompletionRequest>,
+{
     let mut fp = tokio::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -199,13 +198,13 @@ pub(crate) async fn save_llm_user<T: Serialize + Debug>(
         .open(&fpath)
         .await?;
     fp.write_all(b"=====================\n<Request>\n").await?;
-    for it in user_msg.messages.iter() {
+    for it in request.messages.iter() {
         let msg = completion_to_string(it);
         fp.write_all(msg.as_bytes()).await?;
     }
 
     let mut tools = vec![];
-    for tool in user_msg
+    for tool in request
         .tools
         .as_ref()
         .map(|t| t.iter())
@@ -241,14 +240,14 @@ pub(crate) async fn save_llm_user<T: Serialize + Debug>(
         .await?;
     fp.flush().await?;
 
-    rewrite_json(fpath, raw_request).await?;
+    rewrite_json(fpath, request).await?;
 
     Ok(())
 }
 
 pub(crate) async fn save_llm_resp(
     fpath: &PathBuf,
-    resp: &CreateChatCompletionResponse,
+    resp: &(impl Serialize + Debug + std::ops::Deref<Target = CreateChatCompletionResponse>),
 ) -> Result<(), LLMYError> {
     let mut fp = tokio::fs::OpenOptions::new()
         .create(false)

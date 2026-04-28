@@ -10,6 +10,7 @@ use llmy_agent_tools::memory::{
     AgentMemory, AgentMemoryContent, AgentMemoryContext, UpdateMemoryTool, WriteMemoryTool,
 };
 use llmy_client::debug::completion_to_string;
+use llmy_client::model::OpenAIModel;
 use llmy_client::{client::LLM, model::ModelConfig, settings::LLMSettings};
 use llmy_types::error::GeneralToolCall;
 
@@ -18,7 +19,7 @@ use crate::{
     prompt::{
         render_compact_system_prompt, render_compact_user_prompt, render_compacted_context_message,
     },
-    utils::{chat_choice_to_assistant, chat_choice_to_toolcalls},
+    utils::{chat_choice_to_assistant_with_content, chat_choice_to_toolcalls},
 };
 
 #[derive(Clone)]
@@ -30,13 +31,25 @@ struct AgentMemoryRuntime {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentConfig {
     pub sequential_tool_call: bool,
+    pub allow_empty_tool_calls: bool,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             sequential_tool_call: false,
+            allow_empty_tool_calls: false,
         }
+    }
+}
+
+impl AgentConfig {
+    pub fn from_model(&self, model: &OpenAIModel) -> Self {
+        let mut config = self.clone();
+        if model.is_mimo() {
+            config.allow_empty_tool_calls = true;
+        }
+        config
     }
 }
 
@@ -191,6 +204,8 @@ impl Agent {
         debug_prefix: Option<&str>,
         settings: Option<LLMSettings>,
     ) -> Result<StepResult, LLMYError> {
+        let config = self.config.from_model(&llm.model);
+
         let current_context = self.context.clone();
         let messages = self.conversation_context();
         let tools = (self.tools.len() != 0).then(|| self.tools.openai_objects());
@@ -225,63 +240,73 @@ impl Agent {
             .finish_reason
             .ok_or_else(|| eyre!("no finish reason?!"))?;
 
-        let assistant = chat_choice_to_assistant(&choice)?;
+        let mut assistant_content = choice.message.content.clone();
 
         let (step_result, extra_messages): (StepResult, Vec<ChatCompletionRequestMessage>) =
             match reason {
                 FinishReason::ToolCalls | FinishReason::FunctionCall => {
                     let calls = chat_choice_to_toolcalls(&choice);
-                    if calls.is_empty() {
-                        return Err(eyre!("no tool calls but give tool call reason").into());
-                    }
-
-                    let calls = self.invoke_tool_calls(calls).await;
                     let mut out = vec![];
-                    for (call, tool_out) in calls.into_iter() {
-                        if let Some(tool_out) = tool_out {
-                            match tool_out {
-                                Ok(tool_out) => {
-                                    out.push(tool_out);
-                                }
-                                Err(LLMYError::IncorrectToolCall(_, _, e)) => {
-                                    tracing::warn!(
-                                        "Incorrect tool call detected for {}, schema is {:?}, we will ask LLM to retry.",
-                                        call,
-                                        &e
-                                    );
-                                    out.push(ChatCompletionRequestToolMessage {
-                                        content: ChatCompletionRequestToolMessageContent::Text(format!("Tool call to {} does not conform to schema {:?}", call, e)),
-                                        tool_call_id: call.tool_id.clone()
-                                    }.into());
-                                }
-                                Err(e) => return Err(e),
-                            }
+                    if calls.is_empty() {
+                        if config.allow_empty_tool_calls {
+                            tracing::warn!("no tool calls but give tool call reason");
+                            assistant_content = Some("Your previous tool call format is incorrect, please stick to json format and retry. Nothing is executed for your tool call request.".to_string());
                         } else {
-                            tracing::warn!("Tool call {} is not defined", call);
-                            out.push(
-                                ChatCompletionRequestToolMessage {
-                                    content: ChatCompletionRequestToolMessageContent::Text(
-                                        format!("The tool of {} is not defined", call),
-                                    ),
-                                    tool_call_id: call.tool_id.clone(),
+                            return Err(eyre!("no tool calls but give tool call reason").into());
+                        }
+                    } else {
+                        let calls = self.invoke_tool_calls(calls, &config).await;
+
+                        for (call, tool_out) in calls.into_iter() {
+                            if let Some(tool_out) = tool_out {
+                                match tool_out {
+                                    Ok(tool_out) => {
+                                        out.push(tool_out);
+                                    }
+                                    Err(LLMYError::IncorrectToolCall(_, _, e)) => {
+                                        tracing::warn!(
+                                            "Incorrect tool call detected for {}, schema is {:?}, we will ask LLM to retry.",
+                                            call,
+                                            &e
+                                        );
+                                        out.push(ChatCompletionRequestToolMessage {
+                                            content: ChatCompletionRequestToolMessageContent::Text(format!("Tool call to {} does not conform to schema {:?}", call, e)),
+                                            tool_call_id: call.tool_id.clone()
+                                        }.into());
+                                    }
+                                    Err(e) => return Err(e),
                                 }
-                                .into(),
-                            );
+                            } else {
+                                tracing::warn!("Tool call {} is not defined", call);
+                                out.push(
+                                    ChatCompletionRequestToolMessage {
+                                        content: ChatCompletionRequestToolMessageContent::Text(
+                                            format!("The tool of {} is not defined", call),
+                                        ),
+                                        tool_call_id: call.tool_id.clone(),
+                                    }
+                                    .into(),
+                                );
+                            }
                         }
                     }
-                    (StepResult::Toolcalled(choice.message.content.clone()), out)
+
+                    (StepResult::Toolcalled(assistant_content.clone()), out)
                 }
                 FinishReason::ContentFilter => {
+                    tracing::warn!("Our response is filtered?! {:?}", &resp);
                     return Err(LLMYError::Filtered(
-                        choice.message.content.unwrap_or_default(),
+                        choice.message.content.clone().unwrap_or_default(),
                     ));
                 }
                 FinishReason::Stop => (
-                    StepResult::Stop(choice.message.content.unwrap_or_default()),
+                    StepResult::Stop(choice.message.content.clone().unwrap_or_default()),
                     vec![],
                 ),
                 FinishReason::Length => return Err(LLMYError::OutputLength),
             };
+
+        let assistant = chat_choice_to_assistant_with_content(&choice, assistant_content)?;
 
         self.checkpoints
             .push((self.last_step().clone(), current_context));
@@ -294,11 +319,12 @@ impl Agent {
     async fn invoke_tool_calls(
         &self,
         calls: Vec<GeneralToolCall>,
+        config: &AgentConfig,
     ) -> Vec<(
         GeneralToolCall,
         Option<Result<ChatCompletionRequestMessage, LLMYError>>,
     )> {
-        if self.config.sequential_tool_call {
+        if config.sequential_tool_call {
             self.tools.agent_invoke_many_sequential(calls).await
         } else {
             self.tools.agent_invoke_many(calls).await
@@ -608,20 +634,25 @@ mod tests {
         tools.add_tool(FastRecordingTool {
             events: events.clone(),
         });
+        let config = AgentConfig {
+            sequential_tool_call: true,
+            allow_empty_tool_calls: false,
+        };
         let agent = Agent::new_with_config(
             "base system prompt".to_string(),
             tools,
             "cache".to_string(),
-            AgentConfig {
-                sequential_tool_call: true,
-            },
+            config.clone(),
         );
 
         let results = agent
-            .invoke_tool_calls(vec![
-                tool_call("slow_recording_tool", "slow"),
-                tool_call("fast_recording_tool", "fast"),
-            ])
+            .invoke_tool_calls(
+                vec![
+                    tool_call("slow_recording_tool", "slow"),
+                    tool_call("fast_recording_tool", "fast"),
+                ],
+                &config,
+            )
             .await;
 
         assert_eq!(results.len(), 2);

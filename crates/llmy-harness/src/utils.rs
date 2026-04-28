@@ -8,9 +8,18 @@ use llmy_types::error::GeneralToolCall;
 pub fn chat_choice_to_assistant(
     choice: &ChatChoice,
 ) -> Result<ChatCompletionRequestAssistantMessage, LLMYError> {
+    chat_choice_to_assistant_with_content(choice, choice.message.content.clone())
+}
+
+pub fn chat_choice_to_assistant_with_content(
+    choice: &ChatChoice,
+    content: Option<String>,
+) -> Result<ChatCompletionRequestAssistantMessage, LLMYError> {
     let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
 
-    if let Some(content) = &choice.message.content {
+    if let Some(content) = content {
+        builder.content(content);
+    } else if let Some(content) = choice.message.content.as_ref() {
         builder.content(content.clone());
     }
     if let Some(tool_calls) = &choice.message.tool_calls {
@@ -57,4 +66,57 @@ pub fn chat_choice_to_toolcalls(choice: &ChatChoice) -> Vec<GeneralToolCall> {
     }
 
     calls
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::chat::{
+        ChatCompletionRequestAssistantMessageContent, ChatCompletionResponseMessage, Role,
+    };
+
+    fn choice_with_content(content: &str) -> ChatChoice {
+        ChatChoice {
+            index: 0,
+            message: ChatCompletionResponseMessage {
+                content: Some(content.to_string()),
+                refusal: None,
+                tool_calls: None,
+                annotations: None,
+                role: Role::Assistant,
+                function_call: None,
+                audio: None,
+            },
+            finish_reason: None,
+            logprobs: None,
+        }
+    }
+
+    #[test]
+    fn chat_choice_to_assistant_preserves_choice_content() {
+        let assistant = chat_choice_to_assistant(&choice_with_content("original")).unwrap();
+
+        match assistant.content.unwrap() {
+            ChatCompletionRequestAssistantMessageContent::Text(content) => {
+                assert_eq!(content, "original")
+            }
+            content => panic!("expected text content, got {content:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_choice_to_assistant_accepts_content_override() {
+        let assistant = chat_choice_to_assistant_with_content(
+            &choice_with_content("malformed tool call"),
+            Some("retry with valid json".to_string()),
+        )
+        .unwrap();
+
+        match assistant.content.unwrap() {
+            ChatCompletionRequestAssistantMessageContent::Text(content) => {
+                assert_eq!(content, "retry with valid json")
+            }
+            content => panic!("expected text content, got {content:?}"),
+        }
+    }
 }

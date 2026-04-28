@@ -1,5 +1,5 @@
 use std::{
-    ops::Deref,
+    ops::{Deref, DerefMut},
     path::PathBuf,
     sync::{
         Arc,
@@ -25,7 +25,7 @@ use async_openai::{
 };
 use color_eyre::eyre::eyre;
 use llmy_types::error::LLMYError;
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
@@ -70,6 +70,20 @@ impl ExtensibleChatCompletionRequest {
     }
 }
 
+impl Deref for ExtensibleChatCompletionRequest {
+    type Target = CreateChatCompletionRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
+impl DerefMut for ExtensibleChatCompletionRequest {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.request
+    }
+}
+
 impl Serialize for ExtensibleChatCompletionRequest {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut value = serde_json::to_value(&self.request).map_err(serde::ser::Error::custom)?;
@@ -82,6 +96,93 @@ impl Serialize for ExtensibleChatCompletionRequest {
         }
 
         value.serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensibleChatCompletionResponse {
+    response: CreateChatCompletionResponse,
+    extra: Map<String, Value>,
+}
+
+impl ExtensibleChatCompletionResponse {
+    pub fn new(response: CreateChatCompletionResponse) -> Self {
+        Self {
+            response,
+            extra: Map::new(),
+        }
+    }
+
+    pub fn base(&self) -> &CreateChatCompletionResponse {
+        &self.response
+    }
+
+    pub fn base_mut(&mut self) -> &mut CreateChatCompletionResponse {
+        &mut self.response
+    }
+
+    pub fn into_base(self) -> CreateChatCompletionResponse {
+        self.response
+    }
+
+    pub fn extra(&self) -> &Map<String, Value> {
+        &self.extra
+    }
+
+    pub fn extra_mut(&mut self) -> &mut Map<String, Value> {
+        &mut self.extra
+    }
+}
+
+impl Deref for ExtensibleChatCompletionResponse {
+    type Target = CreateChatCompletionResponse;
+
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
+
+impl DerefMut for ExtensibleChatCompletionResponse {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.response
+    }
+}
+
+impl Serialize for ExtensibleChatCompletionResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut value = serde_json::to_value(&self.response).map_err(serde::ser::Error::custom)?;
+        let object = value.as_object_mut().ok_or_else(|| {
+            serde::ser::Error::custom("chat completion response is not an object")
+        })?;
+
+        for (key, value) in &self.extra {
+            object.insert(key.clone(), value.clone());
+        }
+
+        value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtensibleChatCompletionResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut extra = Map::<String, Value>::deserialize(deserializer)?;
+        let response = CreateChatCompletionResponse::deserialize(Value::Object(extra.clone()))
+            .map_err(serde::de::Error::custom)?;
+
+        for key in [
+            "id",
+            "choices",
+            "created",
+            "model",
+            "service_tier",
+            "system_fingerprint",
+            "object",
+            "usage",
+        ] {
+            extra.remove(key);
+        }
+
+        Ok(Self { response, extra })
     }
 }
 
@@ -136,7 +237,7 @@ impl LLMClient {
     async fn create_chat_extensible(
         &self,
         req: &ExtensibleChatCompletionRequest,
-    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+    ) -> Result<ExtensibleChatCompletionResponse, OpenAIError> {
         match self {
             Self::Azure(cl) => cl.chat().create_byot(req).await,
             Self::OpenAI(cl) => cl.chat().create_byot(req).await,
@@ -264,7 +365,7 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
-    ) -> Result<CreateChatCompletionResponse, LLMYError> {
+    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
         let sys = ChatCompletionRequestSystemMessageArgs::default()
             .content(sys_msg)
             .build()?;
@@ -288,7 +389,7 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         timeout: Option<Duration>,
         retry: Option<u64>,
-    ) -> Result<CreateChatCompletionResponse, LLMYError> {
+    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
         let req = ExtensibleChatCompletionRequest::new(req.clone());
         self.complete_extensible_once_with_retry(&req, debug_prefix, timeout, retry)
             .await
@@ -300,7 +401,7 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         timeout: Option<Duration>,
         retry: Option<u64>,
-    ) -> Result<CreateChatCompletionResponse, LLMYError> {
+    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
         let retry = retry.unwrap_or(u64::MAX);
 
         let mut last = None;
@@ -325,7 +426,7 @@ impl LLMInner {
         req: CreateChatCompletionRequest,
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
-    ) -> Result<CreateChatCompletionResponse, LLMYError> {
+    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
         let req = ExtensibleChatCompletionRequest::new(req);
         self.complete_extensible(req, debug_prefix, timeout_overwrite)
             .await
@@ -336,7 +437,7 @@ impl LLMInner {
         req: ExtensibleChatCompletionRequest,
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
-    ) -> Result<CreateChatCompletionResponse, LLMYError> {
+    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
         let use_stream = self.default_settings.llm_stream;
         let debug_prefix = if let Some(debug_prefix) = debug_prefix {
             debug_prefix.to_string()
@@ -346,7 +447,7 @@ impl LLMInner {
         let debug_fp = self.on_llm_debug(&debug_prefix);
 
         if let Some(debug_fp) = debug_fp.as_ref()
-            && let Err(e) = debug::save_llm_user(debug_fp, req.base(), &req).await
+            && let Err(e) = debug::save_llm_user(debug_fp, &req).await
         {
             tracing::warn!("Fail to save user due to {}", e);
         }
@@ -483,7 +584,7 @@ impl LLMInner {
     async fn complete_streaming(
         &self,
         mut req: ExtensibleChatCompletionRequest,
-    ) -> Result<CreateChatCompletionResponse, LLMYError> {
+    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
         req.base_mut().stream = Some(true);
 
         if req.base().stream_options.is_none() {
@@ -619,16 +720,18 @@ impl LLMInner {
             });
         }
 
-        Ok(CreateChatCompletionResponse {
-            id: id.unwrap_or_else(|| "stream".to_string()),
-            choices,
-            created: created.unwrap_or(0),
-            model: model.unwrap_or_else(|| self.model.to_string()),
-            service_tier,
-            system_fingerprint,
-            object: "chat.completion".to_string(),
-            usage,
-        })
+        Ok(ExtensibleChatCompletionResponse::new(
+            CreateChatCompletionResponse {
+                id: id.unwrap_or_else(|| "stream".to_string()),
+                choices,
+                created: created.unwrap_or(0),
+                model: model.unwrap_or_else(|| self.model.to_string()),
+                service_tier,
+                system_fingerprint,
+                object: "chat.completion".to_string(),
+                usage,
+            },
+        ))
     }
 
     pub async fn prompt_messages_once(
@@ -638,7 +741,7 @@ impl LLMInner {
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
         tools: Option<Vec<ChatCompletionTools>>,
-    ) -> Result<CreateChatCompletionResponse, LLMYError> {
+    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
         let settings = settings.unwrap_or_else(|| self.default_settings.clone());
         let timeout = settings.timeout();
         let retry = settings.llm_retry;
@@ -701,7 +804,7 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
-    ) -> Result<CreateChatCompletionResponse, LLMYError> {
+    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
         let sys = ChatCompletionRequestSystemMessageArgs::default()
             .content(sys_msg)
             .build()?;
@@ -784,6 +887,27 @@ mod tests {
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["model"], "mimo-v2.5-pro");
         assert_eq!(value["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn extensible_chat_completion_response_preserves_extra_fields() {
+        let response: ExtensibleChatCompletionResponse =
+            serde_json::from_value(serde_json::json!({
+                "id": "chatcmpl-test",
+                "choices": [],
+                "created": 1,
+                "model": "mimo-v2.5-pro",
+                "object": "chat.completion",
+                "provider_trace_id": "trace-123"
+            }))
+            .unwrap();
+
+        assert_eq!(response.id, "chatcmpl-test");
+        assert_eq!(response.extra()["provider_trace_id"], "trace-123");
+
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["model"], "mimo-v2.5-pro");
+        assert_eq!(value["provider_trace_id"], "trace-123");
     }
 
     #[test]
