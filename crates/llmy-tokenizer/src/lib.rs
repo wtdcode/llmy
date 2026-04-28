@@ -266,4 +266,14 @@ mod tests {
         assert_eq!(model.max_tokens, 131072);
         assert_eq!(model.pricing.expect("mimo pricing").input, 1e-06);
     }
+
+    #[test]
+    fn test_deepseek_v4_model_config() {
+        let model = get_model("deepseek/deepseek-v4-flash").expect("known model");
+
+        assert_eq!(model.encoding(), Some(Encoding::O200kBase));
+        assert_eq!(model.max_input_tokens, 655360);
+        assert_eq!(model.max_tokens, 393216);
+        assert_eq!(model.pricing.expect("deepseek pricing").input, 1.4e-07);
+    }
 }

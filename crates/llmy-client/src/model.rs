@@ -99,12 +99,18 @@ impl FromStr for OpenAIModel {
                 }
             };
 
+            if let Some((model_id, mut config)) = find_registered_model(name.trim()) {
+                config.pricing = Some(pricing);
+                return Ok(Self { model_id, config });
+            }
+
+            let name = name.trim().to_string();
             return Ok(Self {
-                model_id: name.to_string(),
+                model_id: name.clone(),
                 config: ModelConfig {
                     encoding: "o200k_base".to_string(),
                     tokens: ModelTokens::default(),
-                    name: name.to_string(),
+                    name,
                     max_input_tokens: 0,
                     max_tokens: 0,
                     pricing: Some(pricing),
@@ -113,18 +119,12 @@ impl FromStr for OpenAIModel {
         }
 
         // Case-insensitive match against registry model short names
-        for (id, config) in llmy_tokenizer::models() {
-            let short = id.rsplit('/').next().unwrap_or(id);
-            if id == &s || short.eq_ignore_ascii_case(s) || config.name.eq_ignore_ascii_case(s) {
-                return Ok(Self {
-                    model_id: id.to_string(),
-                    config: config.clone(),
-                });
-            }
+        if let Some((model_id, config)) = find_registered_model(s) {
+            return Ok(Self { model_id, config });
         }
 
         // Unknown model, zero pricing
-        tracing::info!("No valid model detected, assume not billed");
+        tracing::info!("No valid model detected for {}, assume not billed", s);
         Ok(Self {
             model_id: s.to_string(),
             config: ModelConfig {
@@ -136,5 +136,51 @@ impl FromStr for OpenAIModel {
                 pricing: None,
             },
         })
+    }
+}
+
+fn find_registered_model(name: &str) -> Option<(String, ModelConfig)> {
+    for (id, config) in llmy_tokenizer::models() {
+        let short = id.rsplit('/').next().unwrap_or(id);
+        if id == &name || short.eq_ignore_ascii_case(name) || config.name.eq_ignore_ascii_case(name)
+        {
+            return Some((id.to_string(), config.clone()));
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(left: f64, right: f64) {
+        assert!((left - right).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn custom_pricing_reuses_registered_model_limits() {
+        let model = OpenAIModel::from_str("DeepSeek V4 Flash,0.5,1.5,0.1").unwrap();
+        let pricing = model.pricing();
+
+        assert_eq!(model.model_id(), "deepseek/deepseek-v4-flash");
+        assert_eq!(model.config.max_input_tokens, 655360);
+        assert_eq!(model.config.max_tokens, 393216);
+        assert_close(pricing.input, 5e-07);
+        assert_close(pricing.output, 1.5e-06);
+        assert_close(pricing.input_cache_read.unwrap(), 1e-07);
+    }
+
+    #[test]
+    fn custom_pricing_still_accepts_unknown_models() {
+        let model = OpenAIModel::from_str("custom-model,2,4").unwrap();
+        let pricing = model.pricing();
+
+        assert_eq!(model.model_id(), "custom-model");
+        assert_eq!(model.config.max_input_tokens, 0);
+        assert_eq!(model.config.max_tokens, 0);
+        assert_close(pricing.input, 2e-06);
+        assert_close(pricing.output, 4e-06);
     }
 }
