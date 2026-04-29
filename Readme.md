@@ -11,7 +11,7 @@ The example below builds a basic agent that can read files, list directories, an
 ```toml
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-llmy = "0.6"
+llmy = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -132,7 +132,7 @@ Add the dependency (the root crate re-exports everything):
 
 ```toml
 [dependencies]
-llmy = "0.6"
+llmy = "0.7"
 ```
 
 ### 1. Clap integration — up to 3 LLM slots
@@ -334,15 +334,15 @@ You can depend on either the focused crate pair:
 ```toml
 [dependencies]
 llmy-agent = "0.5"
-llmy-agent-derive = "0.5"
+llmy-agent-derive = "0.7"
 ```
 
 or the root crate plus the derive crate:
 
 ```toml
 [dependencies]
-llmy = "0.6"
-llmy-agent-derive = "0.5"
+llmy = "0.7"
+llmy-agent-derive = "0.7"
 ```
 
 The trait contract is:
