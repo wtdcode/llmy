@@ -1,5 +1,5 @@
 use async_openai::types::chat::{
-    ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
+    ChatChoice, ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
     ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, FinishReason,
@@ -11,7 +11,11 @@ use llmy_agent_tools::memory::{
 };
 use llmy_client::debug::completion_to_string;
 use llmy_client::model::OpenAIModel;
-use llmy_client::{client::LLM, model::ModelConfig, settings::LLMSettings};
+use llmy_client::{
+    client::{LLM, RawExtensibleChatRequestMessage},
+    model::ModelConfig,
+    settings::LLMSettings,
+};
 use llmy_types::error::GeneralToolCall;
 
 use crate::{
@@ -59,8 +63,8 @@ pub struct Agent {
     base_system_prompt: String,
     system_prompt: String,
     tools: ToolBox,
-    context: Vec<ChatCompletionRequestMessage>,
-    checkpoints: Vec<(Option<StepResult>, Vec<ChatCompletionRequestMessage>)>,
+    context: Vec<RawExtensibleChatRequestMessage>,
+    checkpoints: Vec<(Option<StepResult>, Vec<RawExtensibleChatRequestMessage>)>,
     last_step: Option<StepResult>,
     cache_key: String,
     memory: Option<AgentMemoryRuntime>,
@@ -143,16 +147,18 @@ impl Agent {
         })
     }
 
-    pub fn conversation_context(&self) -> Vec<ChatCompletionRequestMessage> {
-        std::iter::once(Self::system_message(self.system_prompt.clone()))
-            .chain(self.context.clone())
-            .collect()
+    pub fn conversation_context(&self) -> Vec<RawExtensibleChatRequestMessage> {
+        std::iter::once(RawExtensibleChatRequestMessage::new(Self::system_message(
+            self.system_prompt.clone(),
+        )))
+        .chain(self.context.clone())
+        .collect()
     }
 
     pub fn render_context(&self) -> String {
         self.conversation_context()
             .iter()
-            .map(completion_to_string)
+            .map(|m| completion_to_string(&m.inner))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -190,11 +196,11 @@ impl Agent {
     }
 
     pub fn push_user_message(&mut self, user_prompt: String) {
-        self.context.push(ChatCompletionRequestMessage::User(
-            ChatCompletionRequestUserMessage {
+        self.context.push(RawExtensibleChatRequestMessage::new(
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Text(user_prompt),
                 name: None,
-            },
+            }),
         ));
     }
 
@@ -209,14 +215,13 @@ impl Agent {
         let current_context = self.context.clone();
         let messages = self.conversation_context();
         let tools = (self.tools.len() != 0).then(|| self.tools.openai_objects());
+        let cache_key = (!self.cache_key.is_empty()).then_some(self.cache_key.as_str());
+        let settings = settings.unwrap_or_else(|| llm.default_settings.clone());
+        let timeout = settings.timeout();
+        let retry = settings.llm_retry;
+        let req = llm.build_chat_request(messages, cache_key, &settings, tools)?;
         let mut resp = llm
-            .prompt_messages_once(
-                messages,
-                debug_prefix,
-                (!self.cache_key.is_empty()).then_some(self.cache_key.as_str()),
-                settings,
-                tools,
-            )
+            .complete_extensible_once_with_retry(&req, debug_prefix, Some(timeout), Some(retry))
             .await?;
 
         if resp.choices.is_empty() {
@@ -231,6 +236,8 @@ impl Agent {
         }
 
         let choice = resp.choices.pop().unwrap();
+        let propagated_reasoning = propagated_reasoning_content(&llm.model, &choice);
+        let choice: ChatChoice = choice.into();
 
         if let Some(refused) = choice.message.refusal {
             return Err(LLMYError::Filtered(refused));
@@ -310,8 +317,16 @@ impl Agent {
 
         self.checkpoints
             .push((self.last_step().clone(), current_context));
-        self.context.push(assistant.into());
-        self.context.extend(extra_messages);
+        let mut assistant_message = RawExtensibleChatRequestMessage::new(assistant.into());
+        if let Some(reasoning_content) = propagated_reasoning {
+            assistant_message.insert_extra_string("reasoning_content", reasoning_content);
+        }
+        self.context.push(assistant_message);
+        self.context.extend(
+            extra_messages
+                .into_iter()
+                .map(RawExtensibleChatRequestMessage::new),
+        );
         self.last_step = Some(step_result.clone());
         Ok(step_result)
     }
@@ -463,7 +478,7 @@ impl Agent {
     }
 
     fn did_write_memory(&self) -> bool {
-        self.context.iter().any(|message| match message {
+        self.context.iter().any(|message| match &message.inner {
             ChatCompletionRequestMessage::Assistant(assistant) => {
                 assistant.tool_calls.as_ref().is_some_and(|tool_calls| {
                     tool_calls.iter().any(|tool_call| match tool_call {
@@ -479,6 +494,20 @@ impl Agent {
             _ => false,
         })
     }
+}
+
+fn propagated_reasoning_content(
+    model: &OpenAIModel,
+    choice: &llmy_client::client::RawExtensibleChatChoice,
+) -> Option<String> {
+    if !model.is_mimo() {
+        return None;
+    }
+
+    choice
+        .reasoning_content()
+        .filter(|reasoning_content| !reasoning_content.trim().is_empty())
+        .map(|reasoning_content| reasoning_content.to_string())
 }
 
 fn is_memory_write_tool(tool_name: &str) -> bool {
@@ -786,6 +815,63 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_content_extra_returns_empty_for_non_mimo() {
+        let model = OpenAIModel::from_str("o1").unwrap();
+        let choice: llmy_client::client::RawExtensibleChatChoice =
+            serde_json::from_value(serde_json::json!({
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "ok",
+                    "reasoning_content": "thinking out loud"
+                },
+                "finish_reason": "stop"
+            }))
+            .unwrap();
+
+        assert_eq!(propagated_reasoning_content(&model, &choice), None);
+    }
+
+    #[test]
+    fn reasoning_content_extra_carries_reasoning_for_mimo() {
+        let model = OpenAIModel::from_str("mimo-v2.5-pro").unwrap();
+        let choice: llmy_client::client::RawExtensibleChatChoice =
+            serde_json::from_value(serde_json::json!({
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "call the tool",
+                    "reasoning_content": "I need the tool."
+                },
+                "finish_reason": "tool_calls"
+            }))
+            .unwrap();
+
+        assert_eq!(
+            propagated_reasoning_content(&model, &choice),
+            Some("I need the tool.".to_string())
+        );
+    }
+
+    #[test]
+    fn reasoning_content_extra_skips_blank_reasoning_for_mimo() {
+        let model = OpenAIModel::from_str("mimo-v2.5-pro").unwrap();
+        let choice: llmy_client::client::RawExtensibleChatChoice =
+            serde_json::from_value(serde_json::json!({
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "ok",
+                    "reasoning_content": "   "
+                },
+                "finish_reason": "stop"
+            }))
+            .unwrap();
+
+        assert_eq!(propagated_reasoning_content(&model, &choice), None);
+    }
+
+    #[test]
     fn normalize_compact_summary_flattens_whitespace() {
         let normalized =
             normalize_compact_summary("current task\n\nfix compaction   path\tand preserve memory");
@@ -810,7 +896,7 @@ mod tests {
             .await;
 
         assert_eq!(compacted.context.len(), 1);
-        match &compacted.context[0] {
+        match &compacted.context[0].inner {
             ChatCompletionRequestMessage::User(user) => {
                 assert_eq!(
                     user.content,

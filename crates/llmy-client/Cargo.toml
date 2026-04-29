@@ -17,6 +17,7 @@ serde_json.workspace = true
 itertools.workspace = true
 tokio = {workspace = true, features = ["fs"]}
 tokio-stream.workspace = true
+regex.workspace = true
 
 llmy-tokenizer.workspace = true
 llmy-types.workspace = true

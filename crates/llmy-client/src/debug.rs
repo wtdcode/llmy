@@ -18,8 +18,11 @@ use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionResponseMessage, ChatCompletionTools, CreateChatCompletionResponse,
+    ChatCompletionResponseMessage, ChatCompletionTools,
 };
+
+use crate::req::RawExtensibleChatCompletionRequest;
+use crate::resp::RawExtensibleChatCompletionResponse;
 
 pub fn completion_to_role(msg: &ChatCompletionRequestMessage) -> &'static str {
     match msg {
@@ -187,10 +190,10 @@ pub(crate) async fn rewrite_json<T: Serialize + Debug>(
     Ok(())
 }
 
-pub(crate) async fn save_llm_user<T>(fpath: &PathBuf, request: &T) -> Result<(), LLMYError>
-where
-    T: Serialize + Debug + std::ops::Deref<Target = CreateChatCompletionRequest>,
-{
+pub(crate) async fn save_llm_user(
+    fpath: &PathBuf,
+    request: &RawExtensibleChatCompletionRequest,
+) -> Result<(), LLMYError> {
     let mut fp = tokio::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -245,9 +248,14 @@ where
     Ok(())
 }
 
+pub(crate) fn extract_raw_text_with_other(request: &RawExtensibleChatCompletionRequest) -> String {
+    let request = request.to_chat_completion_request();
+    extract_raw_text(&request)
+}
+
 pub(crate) async fn save_llm_resp(
     fpath: &PathBuf,
-    resp: &(impl Serialize + Debug + std::ops::Deref<Target = CreateChatCompletionResponse>),
+    resp: &RawExtensibleChatCompletionResponse,
 ) -> Result<(), LLMYError> {
     let mut fp = tokio::fs::OpenOptions::new()
         .create(false)

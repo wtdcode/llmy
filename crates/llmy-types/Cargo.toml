@@ -14,3 +14,8 @@ color-eyre.workspace = true
 async-openai.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+similar-asserts = "2"
+rand = "0.10"

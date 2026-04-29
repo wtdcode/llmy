@@ -16,11 +16,10 @@ pub fn chat_choice_to_assistant_with_content(
     content: Option<String>,
 ) -> Result<ChatCompletionRequestAssistantMessage, LLMYError> {
     let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
+    let content = content.or_else(|| choice.message.content.clone());
 
     if let Some(content) = content {
         builder.content(content);
-    } else if let Some(content) = choice.message.content.as_ref() {
-        builder.content(content.clone());
     }
     if let Some(tool_calls) = &choice.message.tool_calls {
         builder.tool_calls(tool_calls.clone());
@@ -75,6 +74,7 @@ mod tests {
         ChatCompletionRequestAssistantMessageContent, ChatCompletionResponseMessage, Role,
     };
 
+    #[allow(deprecated)]
     fn choice_with_content(content: &str) -> ChatChoice {
         ChatChoice {
             index: 0,

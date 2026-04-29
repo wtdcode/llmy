@@ -1,8 +1,8 @@
 use std::{
-    ops::{Deref, DerefMut},
+    ops::Deref,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, RwLock as StdRwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -25,12 +25,13 @@ use async_openai::{
 };
 use color_eyre::eyre::eyre;
 use llmy_types::error::LLMYError;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::{Map, Value};
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 
 use crate::debug;
+pub use crate::filter::{MiMoContentFilter, NoFilter, OpenAIContentFilter};
+pub use crate::req::{RawExtensibleChatCompletionRequest, RawExtensibleChatRequestMessage};
+pub use crate::resp::{RawExtensibleChatChoice, RawExtensibleChatCompletionResponse};
 use crate::{
     billing::ModelBilling,
     settings::{LLMSettings, Reasoning},
@@ -41,149 +42,6 @@ struct ToolCallAcc {
     id: String,
     name: String,
     arguments: String,
-}
-
-#[derive(Debug, Clone)]
-struct ExtensibleChatCompletionRequest {
-    request: CreateChatCompletionRequest,
-    extra: Map<String, Value>,
-}
-
-impl ExtensibleChatCompletionRequest {
-    fn new(request: CreateChatCompletionRequest) -> Self {
-        Self {
-            request,
-            extra: Map::new(),
-        }
-    }
-
-    fn base(&self) -> &CreateChatCompletionRequest {
-        &self.request
-    }
-
-    fn base_mut(&mut self) -> &mut CreateChatCompletionRequest {
-        &mut self.request
-    }
-
-    fn insert_extra(&mut self, key: impl Into<String>, value: Value) {
-        self.extra.insert(key.into(), value);
-    }
-}
-
-impl Deref for ExtensibleChatCompletionRequest {
-    type Target = CreateChatCompletionRequest;
-
-    fn deref(&self) -> &Self::Target {
-        &self.request
-    }
-}
-
-impl DerefMut for ExtensibleChatCompletionRequest {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.request
-    }
-}
-
-impl Serialize for ExtensibleChatCompletionRequest {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut value = serde_json::to_value(&self.request).map_err(serde::ser::Error::custom)?;
-        let object = value
-            .as_object_mut()
-            .ok_or_else(|| serde::ser::Error::custom("chat completion request is not an object"))?;
-
-        for (key, value) in &self.extra {
-            object.insert(key.clone(), value.clone());
-        }
-
-        value.serialize(serializer)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ExtensibleChatCompletionResponse {
-    response: CreateChatCompletionResponse,
-    extra: Map<String, Value>,
-}
-
-impl ExtensibleChatCompletionResponse {
-    pub fn new(response: CreateChatCompletionResponse) -> Self {
-        Self {
-            response,
-            extra: Map::new(),
-        }
-    }
-
-    pub fn base(&self) -> &CreateChatCompletionResponse {
-        &self.response
-    }
-
-    pub fn base_mut(&mut self) -> &mut CreateChatCompletionResponse {
-        &mut self.response
-    }
-
-    pub fn into_base(self) -> CreateChatCompletionResponse {
-        self.response
-    }
-
-    pub fn extra(&self) -> &Map<String, Value> {
-        &self.extra
-    }
-
-    pub fn extra_mut(&mut self) -> &mut Map<String, Value> {
-        &mut self.extra
-    }
-}
-
-impl Deref for ExtensibleChatCompletionResponse {
-    type Target = CreateChatCompletionResponse;
-
-    fn deref(&self) -> &Self::Target {
-        &self.response
-    }
-}
-
-impl DerefMut for ExtensibleChatCompletionResponse {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.response
-    }
-}
-
-impl Serialize for ExtensibleChatCompletionResponse {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut value = serde_json::to_value(&self.response).map_err(serde::ser::Error::custom)?;
-        let object = value.as_object_mut().ok_or_else(|| {
-            serde::ser::Error::custom("chat completion response is not an object")
-        })?;
-
-        for (key, value) in &self.extra {
-            object.insert(key.clone(), value.clone());
-        }
-
-        value.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for ExtensibleChatCompletionResponse {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut extra = Map::<String, Value>::deserialize(deserializer)?;
-        let response = CreateChatCompletionResponse::deserialize(Value::Object(extra.clone()))
-            .map_err(serde::de::Error::custom)?;
-
-        for key in [
-            "id",
-            "choices",
-            "created",
-            "model",
-            "service_tier",
-            "system_fingerprint",
-            "object",
-            "usage",
-        ] {
-            extra.remove(key);
-        }
-
-        Ok(Self { response, extra })
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -234,10 +92,10 @@ impl LLMClient {
         }
     }
 
-    async fn create_chat_extensible(
+    pub async fn create_chat_extensible(
         &self,
-        req: &ExtensibleChatCompletionRequest,
-    ) -> Result<ExtensibleChatCompletionResponse, OpenAIError> {
+        req: &RawExtensibleChatCompletionRequest,
+    ) -> Result<RawExtensibleChatCompletionResponse, OpenAIError> {
         match self {
             Self::Azure(cl) => cl.chat().create_byot(req).await,
             Self::OpenAI(cl) => cl.chat().create_byot(req).await,
@@ -254,9 +112,9 @@ impl LLMClient {
         }
     }
 
-    async fn create_chat_stream_extensible(
+    pub async fn create_chat_stream_extensible(
         &self,
-        req: &ExtensibleChatCompletionRequest,
+        req: &RawExtensibleChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         match self {
             Self::Azure(cl) => cl.chat().create_stream_byot(req).await,
@@ -311,6 +169,12 @@ impl LLM {
             None
         };
 
+        let content_filter: Box<dyn OpenAIContentFilter> = if model.is_mimo() {
+            Box::new(MiMoContentFilter::default())
+        } else {
+            Box::new(NoFilter)
+        };
+
         LLM {
             llm: Arc::new(LLMInner {
                 client: LLMClient::new(config),
@@ -319,6 +183,7 @@ impl LLM {
                 llm_debug: debug_path,
                 llm_debug_index: AtomicU64::new(0),
                 default_settings: settings,
+                content_filter: StdRwLock::new(content_filter),
             }),
         }
     }
@@ -340,11 +205,31 @@ pub struct LLMInner {
     pub llm_debug: Option<PathBuf>,
     pub llm_debug_index: AtomicU64,
     pub default_settings: LLMSettings,
+    content_filter: StdRwLock<Box<dyn OpenAIContentFilter>>,
 }
 
 impl LLMInner {
     pub async fn billing_snapshot(&self) -> ModelBilling {
         self.billing.read().await.clone()
+    }
+
+    /// Replace the content filter applied to every request and response. Defaults to
+    /// `MiMoContentFilter` for mimo models, `NoFilter` otherwise.
+    pub fn set_content_filter(&self, filter: Box<dyn OpenAIContentFilter>) {
+        *self
+            .content_filter
+            .write()
+            .expect("content_filter poisoned") = filter;
+    }
+
+    fn apply_filter_input(&self, req: &mut RawExtensibleChatCompletionRequest) {
+        let guard = self.content_filter.read().expect("content_filter poisoned");
+        guard.filter_input(req);
+    }
+
+    fn apply_filter_output(&self, resp: &mut RawExtensibleChatCompletionResponse) {
+        let guard = self.content_filter.read().expect("content_filter poisoned");
+        guard.filter_output(resp);
     }
 
     fn on_llm_debug(&self, debug_prefix: &str) -> Option<PathBuf> {
@@ -365,7 +250,7 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
-    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
         let sys = ChatCompletionRequestSystemMessageArgs::default()
             .content(sys_msg)
             .build()?;
@@ -389,19 +274,19 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         timeout: Option<Duration>,
         retry: Option<u64>,
-    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
-        let req = ExtensibleChatCompletionRequest::new(req.clone());
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        let req = RawExtensibleChatCompletionRequest::from(req.clone());
         self.complete_extensible_once_with_retry(&req, debug_prefix, timeout, retry)
             .await
     }
 
-    async fn complete_extensible_once_with_retry(
+    pub async fn complete_extensible_once_with_retry(
         &self,
-        req: &ExtensibleChatCompletionRequest,
+        req: &RawExtensibleChatCompletionRequest,
         debug_prefix: Option<&str>,
         timeout: Option<Duration>,
         retry: Option<u64>,
-    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
         let retry = retry.unwrap_or(u64::MAX);
 
         let mut last = None;
@@ -426,18 +311,20 @@ impl LLMInner {
         req: CreateChatCompletionRequest,
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
-    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
-        let req = ExtensibleChatCompletionRequest::new(req);
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        let req = RawExtensibleChatCompletionRequest::from(req);
         self.complete_extensible(req, debug_prefix, timeout_overwrite)
             .await
     }
 
-    async fn complete_extensible(
+    pub async fn complete_extensible(
         &self,
-        req: ExtensibleChatCompletionRequest,
+        mut req: RawExtensibleChatCompletionRequest,
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
-    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        self.apply_filter_input(&mut req);
+
         let use_stream = self.default_settings.llm_stream;
         let debug_prefix = if let Some(debug_prefix) = debug_prefix {
             debug_prefix.to_string()
@@ -453,7 +340,7 @@ impl LLMInner {
         }
 
         let estimated_tokens = {
-            let text = debug::extract_raw_text(req.base());
+            let text = debug::extract_raw_text_with_other(&req);
             tracing::trace!("Text is {:?}", text);
             self.model.config.count_tokens(&text)
         };
@@ -489,7 +376,7 @@ impl LLMInner {
                 })
         };
 
-        let resp = match resp {
+        let mut resp = match resp {
             Ok(resp) => resp,
             Err(e) => {
                 if let Some(debug_fp) = debug_fp.as_ref() {
@@ -503,6 +390,7 @@ impl LLMInner {
                 return Err(e);
             }
         };
+        self.apply_filter_output(&mut resp);
         if let Some(debug_fp) = debug_fp.as_ref()
             && let Err(e) = debug::save_llm_resp(debug_fp, &resp).await
         {
@@ -583,12 +471,12 @@ impl LLMInner {
     #[allow(deprecated)]
     async fn complete_streaming(
         &self,
-        mut req: ExtensibleChatCompletionRequest,
-    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
-        req.base_mut().stream = Some(true);
+        mut req: RawExtensibleChatCompletionRequest,
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        req.stream = Some(true);
 
-        if req.base().stream_options.is_none() {
-            req.base_mut().stream_options = Some(ChatCompletionStreamOptions {
+        if req.stream_options.is_none() {
+            req.stream_options = Some(ChatCompletionStreamOptions {
                 include_usage: Some(true),
                 include_obfuscation: None,
             });
@@ -720,7 +608,7 @@ impl LLMInner {
             });
         }
 
-        Ok(ExtensibleChatCompletionResponse::new(
+        Ok(RawExtensibleChatCompletionResponse::new(
             CreateChatCompletionResponse {
                 id: id.unwrap_or_else(|| "stream".to_string()),
                 choices,
@@ -734,18 +622,16 @@ impl LLMInner {
         ))
     }
 
-    pub async fn prompt_messages_once(
+    /// Build an extensible chat request with this model's settings, tools, and provider quirks
+    /// applied. Per-message extras (e.g. mimo `reasoning_content`) are preserved from the
+    /// supplied wrapped messages.
+    pub fn build_chat_request(
         &self,
-        messages: Vec<ChatCompletionRequestMessage>,
-        debug_prefix: Option<&str>,
+        messages: Vec<RawExtensibleChatRequestMessage>,
         cache_key: Option<&str>,
-        settings: Option<LLMSettings>,
+        settings: &LLMSettings,
         tools: Option<Vec<ChatCompletionTools>>,
-    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
-        let settings = settings.unwrap_or_else(|| self.default_settings.clone());
-        let timeout = settings.timeout();
-        let retry = settings.llm_retry;
-
+    ) -> Result<RawExtensibleChatCompletionRequest, LLMYError> {
         let mut req = CreateChatCompletionRequestArgs::default();
 
         if let Some(tools) = tools {
@@ -786,13 +672,34 @@ impl LLMInner {
             req.top_p(top_p);
         }
 
-        let req = req
-            .messages(messages)
+        let raw_messages: Vec<ChatCompletionRequestMessage> =
+            messages.iter().map(|m| m.inner.clone()).collect();
+        let raw_req = req
+            .messages(raw_messages)
             .model(self.model.to_string())
             .build()?;
-        let mut req = ExtensibleChatCompletionRequest::new(req);
-        apply_provider_request_extensions(&self.model, &settings, &mut req);
+        let mut req = RawExtensibleChatCompletionRequest::from(raw_req);
+        req.messages = messages;
+        apply_provider_request_extensions(&self.model, settings, &mut req);
+        Ok(req)
+    }
 
+    pub async fn prompt_messages_once(
+        &self,
+        messages: Vec<ChatCompletionRequestMessage>,
+        debug_prefix: Option<&str>,
+        cache_key: Option<&str>,
+        settings: Option<LLMSettings>,
+        tools: Option<Vec<ChatCompletionTools>>,
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        let settings = settings.unwrap_or_else(|| self.default_settings.clone());
+        let timeout = settings.timeout();
+        let retry = settings.llm_retry;
+        let wrapped = messages
+            .into_iter()
+            .map(RawExtensibleChatRequestMessage::new)
+            .collect();
+        let req = self.build_chat_request(wrapped, cache_key, &settings, tools)?;
         self.complete_extensible_once_with_retry(&req, debug_prefix, Some(timeout), Some(retry))
             .await
     }
@@ -804,7 +711,7 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
-    ) -> Result<ExtensibleChatCompletionResponse, LLMYError> {
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
         let sys = ChatCompletionRequestSystemMessageArgs::default()
             .content(sys_msg)
             .build()?;
@@ -826,7 +733,7 @@ impl LLMInner {
 fn apply_provider_request_extensions(
     model: &OpenAIModel,
     settings: &LLMSettings,
-    req: &mut ExtensibleChatCompletionRequest,
+    req: &mut RawExtensibleChatCompletionRequest,
 ) {
     if model.is_mimo()
         && settings
@@ -834,8 +741,8 @@ fn apply_provider_request_extensions(
             .as_ref()
             .is_some_and(Reasoning::is_none)
     {
-        req.insert_extra(
-            "thinking",
+        req.other.insert(
+            "thinking".to_string(),
             serde_json::json!({
                 "type": "disabled"
             }),
@@ -875,10 +782,10 @@ mod tests {
             .model("mimo-v2.5-pro")
             .build()
             .unwrap();
-        let mut request = ExtensibleChatCompletionRequest::new(request);
+        let mut request = RawExtensibleChatCompletionRequest::from(request);
 
-        request.insert_extra(
-            "thinking",
+        request.other.insert(
+            "thinking".to_string(),
             serde_json::json!({
                 "type": "disabled"
             }),
@@ -890,11 +797,63 @@ mod tests {
     }
 
     #[test]
+    fn extensible_chat_completion_request_flattens_message_extra_fields() {
+        let user = ChatCompletionRequestUserMessageArgs::default()
+            .content("hello")
+            .build()
+            .unwrap();
+        let request = CreateChatCompletionRequestArgs::default()
+            .messages(vec![user.into()])
+            .model("mimo-v2.5-pro")
+            .build()
+            .unwrap();
+        let mut request = RawExtensibleChatCompletionRequest::from(request);
+        request.messages[0].insert_extra_string("reasoning_content", "I need the tool.");
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["messages"][0]["content"], "hello");
+        assert_eq!(
+            value["messages"][0]["reasoning_content"],
+            "I need the tool."
+        );
+    }
+
+    #[test]
+    fn extensible_chat_completion_request_serializes_inner_changes() {
+        let user = ChatCompletionRequestUserMessageArgs::default()
+            .content("hello")
+            .build()
+            .unwrap();
+        let request = CreateChatCompletionRequestArgs::default()
+            .messages(vec![user.into()])
+            .model("mimo-v2.5-pro")
+            .build()
+            .unwrap();
+        let mut request = RawExtensibleChatCompletionRequest::from(request);
+
+        request.stream = Some(true);
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["stream"], true);
+    }
+
+    #[test]
     fn extensible_chat_completion_response_preserves_extra_fields() {
-        let response: ExtensibleChatCompletionResponse =
+        let response: RawExtensibleChatCompletionResponse =
             serde_json::from_value(serde_json::json!({
                 "id": "chatcmpl-test",
-                "choices": [],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "call the tool",
+                            "reasoning_content": "I need the tool."
+                        },
+                        "finish_reason": "tool_calls",
+                        "provider_choice_id": "choice-123"
+                    }
+                ],
                 "created": 1,
                 "model": "mimo-v2.5-pro",
                 "object": "chat.completion",
@@ -904,9 +863,45 @@ mod tests {
 
         assert_eq!(response.id, "chatcmpl-test");
         assert_eq!(response.extra()["provider_trace_id"], "trace-123");
+        assert_eq!(
+            response.choices[0].extra()["provider_choice_id"],
+            "choice-123"
+        );
+        assert_eq!(
+            response.choices[0].reasoning_content(),
+            Some("I need the tool.")
+        );
 
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["model"], "mimo-v2.5-pro");
+        assert_eq!(value["provider_trace_id"], "trace-123");
+        assert_eq!(
+            value["choices"][0]["message"]["reasoning_content"],
+            "I need the tool."
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn extensible_chat_completion_response_serializes_base_mut_changes() {
+        let mut response = RawExtensibleChatCompletionResponse::new(CreateChatCompletionResponse {
+            id: "chatcmpl-test".to_string(),
+            choices: Vec::new(),
+            created: 1,
+            model: "old-model".to_string(),
+            service_tier: None,
+            system_fingerprint: None,
+            object: "chat.completion".to_string(),
+            usage: None,
+        });
+        response.model = "new-model".to_string();
+        response.extra_mut().insert(
+            "provider_trace_id".to_string(),
+            serde_json::json!("trace-123"),
+        );
+
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["model"], "new-model");
         assert_eq!(value["provider_trace_id"], "trace-123");
     }
 
@@ -921,7 +916,7 @@ mod tests {
             .model("mimo-v2.5-pro")
             .build()
             .unwrap();
-        let mut request = ExtensibleChatCompletionRequest::new(request);
+        let mut request = RawExtensibleChatCompletionRequest::from(request);
         let model = OpenAIModel::from_str("mimo-v2.5-pro").unwrap();
 
         apply_provider_request_extensions(
