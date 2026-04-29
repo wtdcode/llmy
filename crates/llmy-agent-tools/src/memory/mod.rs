@@ -174,6 +174,23 @@ impl AgentMemoryContext {
         }
     }
 
+    pub async fn derive_with_long_term(&self) -> Self {
+        let ltm = self.memory.read().await.long_term.clone();
+        let cache = self.search_embed_cache.read().await.clone();
+        let memory = AgentMemoryContextInner {
+            memory: RwLock::new(AgentMemory {
+                long_term: ltm,
+                short_term: BTreeMap::new(),
+            }),
+            embed: self.embed.clone(),
+            search_embed_cache: RwLock::new(cache),
+            search_weights: self.search_weights.clone(),
+        };
+        Self {
+            inner: Arc::new(memory),
+        }
+    }
+
     pub fn search_enabled(&self) -> bool {
         self.embed.is_some()
     }
