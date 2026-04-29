@@ -25,6 +25,7 @@ use async_openai::{
 };
 use color_eyre::eyre::eyre;
 use llmy_types::error::LLMYError;
+use serde::de::DeserializeOwned;
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 
@@ -266,6 +267,32 @@ impl LLMInner {
             None,
         )
         .await
+    }
+
+    // Note only consider the `content` of the first choice
+    pub async fn prompt_json_with_retry<T: DeserializeOwned>(
+        &self,
+        sys_msg: &str,
+        user_msg: &str,
+        debug_prefix: Option<&str>,
+        cache_key: Option<&str>,
+        settings: Option<LLMSettings>,
+    ) -> Result<Option<T>, LLMYError> {
+        let msg = self
+            .prompt_once_with_retry(sys_msg, user_msg, debug_prefix, cache_key, settings)
+            .await?;
+        Ok(msg
+            .choices
+            .first()
+            .map(|v| {
+                v.inner
+                    .message
+                    .content
+                    .as_ref()
+                    .map(|k| serde_json::from_str::<T>(&k))
+            })
+            .flatten()
+            .transpose()?)
     }
 
     pub async fn complete_once_with_retry(
