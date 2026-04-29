@@ -236,7 +236,7 @@ impl Agent {
         }
 
         let choice = resp.choices.pop().unwrap();
-        let propagated_reasoning = propagated_reasoning_content(&llm.model, &choice);
+        let propagated_reasoning = propagated_reasoning_content(&choice);
         let choice: ChatChoice = choice.into();
 
         if let Some(refused) = choice.message.refusal {
@@ -497,13 +497,8 @@ impl Agent {
 }
 
 fn propagated_reasoning_content(
-    model: &OpenAIModel,
     choice: &llmy_client::client::RawExtensibleChatChoice,
 ) -> Option<String> {
-    if !model.is_mimo() {
-        return None;
-    }
-
     choice
         .reasoning_content()
         .filter(|reasoning_content| !reasoning_content.trim().is_empty())
@@ -815,26 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_content_extra_returns_empty_for_non_mimo() {
-        let model = OpenAIModel::from_str("o1").unwrap();
-        let choice: llmy_client::client::RawExtensibleChatChoice =
-            serde_json::from_value(serde_json::json!({
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "ok",
-                    "reasoning_content": "thinking out loud"
-                },
-                "finish_reason": "stop"
-            }))
-            .unwrap();
-
-        assert_eq!(propagated_reasoning_content(&model, &choice), None);
-    }
-
-    #[test]
     fn reasoning_content_extra_carries_reasoning_for_mimo() {
-        let model = OpenAIModel::from_str("mimo-v2.5-pro").unwrap();
         let choice: llmy_client::client::RawExtensibleChatChoice =
             serde_json::from_value(serde_json::json!({
                 "index": 0,
@@ -848,7 +824,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            propagated_reasoning_content(&model, &choice),
+            propagated_reasoning_content(&choice),
             Some("I need the tool.".to_string())
         );
     }
@@ -868,7 +844,7 @@ mod tests {
             }))
             .unwrap();
 
-        assert_eq!(propagated_reasoning_content(&model, &choice), None);
+        assert_eq!(propagated_reasoning_content(&choice), None);
     }
 
     #[test]
