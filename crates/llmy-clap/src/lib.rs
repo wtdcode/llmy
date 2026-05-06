@@ -28,8 +28,8 @@ macro_rules! make_openai_args {
             #[arg(long, default_value_t = 10.0, env = concat!($prefix,"OPENAI_BILLING_CAP"))]
             pub biling_cap: f64,
 
-            #[arg(long, env = concat!($prefix,"OPENAI_API_MODEL"), default_value = "o1")]
-            pub model: OpenAIModel,
+            #[arg(long, env = concat!($prefix,"OPENAI_API_MODEL"))]
+            pub model: Option<OpenAIModel>,
 
             #[arg(long, env = concat!($prefix,"LLM_DEBUG"))]
             pub llm_debug: Option<PathBuf>,
@@ -92,7 +92,7 @@ macro_rules! make_openai_args {
                         self.openai_key.clone().unwrap_or_default().as_str(),
                         self.azure_deployment
                             .as_ref()
-                            .unwrap_or(&self.model.to_string())
+                            .unwrap_or(&self.model.as_ref().expect("LLM model id not given").to_string())
                             .as_str(),
                         &self.azure_api_version
                     )
@@ -101,11 +101,21 @@ macro_rules! make_openai_args {
                 }
             }
 
-            pub fn to_llm(self) -> LLM {
+
+            fn llm_new_inner(&self, model: OpenAIModel) -> LLM {
                 let config = self.to_config();
-                let model = self.model.clone();
                 let debug_path = self.llm_debug.clone();
                 LLM::new(config, model, self.biling_cap, self.settings(), Some($prefix.to_string()), debug_path)
+            }
+
+            pub fn may_llm(self) -> Option<LLM> {
+                let model = self.model.clone()?;
+                Some(self.llm_new_inner(model))
+            }
+
+            pub fn to_llm(self) -> LLM {
+                let model = self.model.clone().expect("LLM model not given");
+                self.llm_new_inner(model)
             }
         }
     };
