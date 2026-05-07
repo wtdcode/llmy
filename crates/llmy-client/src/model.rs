@@ -24,6 +24,10 @@ impl OpenAIModel {
                 .is_some_and(|name| name.starts_with("mimo-"))
     }
 
+    pub fn is_google(&self) -> bool {
+        self.model_id.starts_with("google/")
+    }
+
     /// Per-token USD pricing. Returns zero pricing if unavailable.
     pub fn pricing(&self) -> ModelPricing {
         self.config.pricing.unwrap_or(ModelPricing {

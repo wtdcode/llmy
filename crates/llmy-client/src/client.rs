@@ -30,7 +30,7 @@ use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 
 use crate::debug;
-pub use crate::filter::{MiMoContentFilter, NoFilter, OpenAIContentFilter};
+pub use crate::filter::{GoogleContentFilter, MiMoContentFilter, NoFilter, OpenAIContentFilter};
 pub use crate::req::{RawExtensibleChatCompletionRequest, RawExtensibleChatRequestMessage};
 pub use crate::resp::{RawExtensibleChatChoice, RawExtensibleChatCompletionResponse};
 use crate::{
@@ -172,6 +172,8 @@ impl LLM {
 
         let content_filter: Box<dyn OpenAIContentFilter> = if model.is_mimo() {
             Box::new(MiMoContentFilter::default())
+        } else if model.is_google() {
+            Box::new(GoogleContentFilter)
         } else {
             Box::new(NoFilter)
         };
@@ -215,7 +217,8 @@ impl LLMInner {
     }
 
     /// Replace the content filter applied to every request and response. Defaults to
-    /// `MiMoContentFilter` for mimo models, `NoFilter` otherwise.
+    /// `MiMoContentFilter` for mimo models, `GoogleContentFilter` for google models,
+    /// `NoFilter` otherwise.
     pub fn set_content_filter(&self, filter: Box<dyn OpenAIContentFilter>) {
         *self
             .content_filter
