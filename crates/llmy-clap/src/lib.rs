@@ -1,6 +1,6 @@
 use clap::Args;
 use llmy_client::{client::*, model::OpenAIModel, settings::*};
-use std::path::PathBuf;
+use llmy_types::error::LLMYError;
 
 macro_rules! make_openai_args {
     ($struct_name:ident, $prefix:literal) => {
@@ -31,8 +31,12 @@ macro_rules! make_openai_args {
             #[arg(long, env = concat!($prefix,"OPENAI_API_MODEL"))]
             pub model: Option<OpenAIModel>,
 
+            /// Where to dump LLM interaction logs. A directory path enables the
+            /// folder backend (one xml/json pair per request); a value starting
+            /// with `sqlite3://` or ending in `sqlite3` enables the SQLite
+            /// backend.
             #[arg(long, env = concat!($prefix,"LLM_DEBUG"))]
-            pub llm_debug: Option<PathBuf>,
+            pub llm_debug: Option<String>,
 
             #[arg(long, env = concat!($prefix, "LLM_TEMPERATURE"))]
             pub llm_temperature: Option<f32>,
@@ -102,20 +106,30 @@ macro_rules! make_openai_args {
             }
 
 
-            fn llm_new_inner(&self, model: OpenAIModel) -> LLM {
+            async fn llm_new_inner(&self, model: OpenAIModel) -> Result<LLM, LLMYError> {
                 let config = self.to_config();
-                let debug_path = self.llm_debug.clone();
-                LLM::new(config, model, self.biling_cap, self.settings(), Some($prefix.to_string()), debug_path)
+                let debug_target = self.llm_debug.clone();
+                LLM::new_async(
+                    config,
+                    model,
+                    self.biling_cap,
+                    self.settings(),
+                    Some($prefix.to_string()),
+                    debug_target,
+                )
+                .await
             }
 
-            pub fn may_llm(self) -> Option<LLM> {
-                let model = self.model.clone()?;
-                Some(self.llm_new_inner(model))
+            pub async fn may_llm(self) -> Result<Option<LLM>, LLMYError> {
+                let Some(model) = self.model.clone() else { return Ok(None); };
+                Ok(Some(self.llm_new_inner(model).await?))
             }
 
-            pub fn to_llm(self) -> LLM {
+            pub async fn to_llm(self) -> LLM {
                 let model = self.model.clone().expect("LLM model not given");
                 self.llm_new_inner(model)
+                    .await
+                    .expect("Failed to construct LLM")
             }
         }
     };

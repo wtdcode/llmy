@@ -52,7 +52,7 @@ pub struct ChatArgs {
 
 pub async fn run_chat(args: ChatArgs) -> color_eyre::Result<()> {
     let settings = args.openai.settings();
-    let llm: LLM = args.openai.clone().to_llm();
+    let llm = args.openai.clone().to_llm().await;
     let system = args
         .system
         .as_deref()

@@ -1,10 +1,6 @@
 use std::{
     ops::Deref,
-    path::PathBuf,
-    sync::{
-        Arc, RwLock as StdRwLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, RwLock as StdRwLock},
     time::Duration,
 };
 
@@ -29,7 +25,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 
-use crate::debug;
+use crate::debug::{self, DebugBackend, DebugRowContext, DebugUsage};
 pub use crate::filter::{GoogleContentFilter, MiMoContentFilter, NoFilter, OpenAIContentFilter};
 pub use crate::req::{RawExtensibleChatCompletionRequest, RawExtensibleChatRequestMessage};
 pub use crate::resp::{RawExtensibleChatChoice, RawExtensibleChatCompletionResponse};
@@ -47,7 +43,10 @@ struct ToolCallAcc {
 
 #[derive(Debug, Clone)]
 pub enum SupportedConfig {
-    Azure(AzureConfig),
+    Azure {
+        config: AzureConfig,
+        deployment_id: String,
+    },
     OpenAI(OpenAIConfig),
 }
 
@@ -58,7 +57,10 @@ impl SupportedConfig {
             .with_api_key(key)
             .with_deployment_id(deployment)
             .with_api_version(api_version);
-        Self::Azure(cfg)
+        Self::Azure {
+            config: cfg,
+            deployment_id: deployment.to_string(),
+        }
     }
 
     pub fn new(endpoint: &str, key: &str) -> Self {
@@ -66,6 +68,30 @@ impl SupportedConfig {
             .with_api_base(endpoint)
             .with_api_key(key);
         Self::OpenAI(cfg)
+    }
+
+    pub fn endpoint_kind(&self) -> &'static str {
+        match self {
+            Self::Azure { .. } => "azure",
+            Self::OpenAI(_) => "openai",
+        }
+    }
+
+    /// The HTTP base URL the underlying client will hit. For Azure this is
+    /// the resource endpoint; for OpenAI it's the configured `api_base`.
+    pub fn endpoint_url(&self) -> &str {
+        use async_openai::config::Config;
+        match self {
+            Self::Azure { config, .. } => config.api_base(),
+            Self::OpenAI(cfg) => cfg.api_base(),
+        }
+    }
+
+    pub fn azure_deployment(&self) -> Option<&str> {
+        match self {
+            Self::Azure { deployment_id, .. } => Some(deployment_id),
+            Self::OpenAI(_) => None,
+        }
     }
 }
 
@@ -78,7 +104,7 @@ pub enum LLMClient {
 impl LLMClient {
     pub fn new(config: SupportedConfig) -> Self {
         match config {
-            SupportedConfig::Azure(cfg) => Self::Azure(Client::with_config(cfg)),
+            SupportedConfig::Azure { config, .. } => Self::Azure(Client::with_config(config)),
             SupportedConfig::OpenAI(cfg) => Self::OpenAI(Client::with_config(cfg)),
         }
     }
@@ -130,45 +156,20 @@ pub struct LLM {
 }
 
 impl LLM {
+    /// Build an LLM with a pre-constructed debug backend (or `None` to disable).
+    /// Use this directly when you already own a [`DebugBackend`]; otherwise see
+    /// [`LLM::new_async`] which dispatches on `LLM_DEBUG`-style strings.
     pub fn new(
         config: SupportedConfig,
         model: OpenAIModel,
         cap: f64,
         settings: LLMSettings,
-        debug_prefix: Option<String>,
-        debug_foler: Option<PathBuf>,
+        debug_backend: Option<DebugBackend>,
     ) -> Self {
         let billing = RwLock::new(ModelBilling::new(cap));
 
-        let debug_path = if let Some(dbg) = debug_foler.as_ref() {
-            let pid = std::process::id();
-
-            let mut cnt = 0u64;
-            let debug_path;
-            loop {
-                let prefix = if let Some(debug_prefix) = &debug_prefix {
-                    if debug_prefix.is_empty() {
-                        "main".to_string()
-                    } else {
-                        debug_prefix.to_lowercase()
-                    }
-                } else {
-                    "main".to_string()
-                };
-                let test_path = dbg.join(format!("{}-{}-{}", pid, cnt, prefix));
-                if !test_path.exists() {
-                    std::fs::create_dir_all(&test_path).expect("Fail to create llm debug path?");
-                    debug_path = Some(test_path);
-                    tracing::debug!("The path to save LLM interactions is {:?}", &debug_path);
-                    break;
-                } else {
-                    cnt += 1;
-                }
-            }
-            debug_path
-        } else {
-            None
-        };
+        let endpoint = config.endpoint_url().to_string();
+        let azure_deployment = config.azure_deployment().map(|s| s.to_string());
 
         let content_filter: Box<dyn OpenAIContentFilter> = if model.is_mimo() {
             Box::new(MiMoContentFilter::default())
@@ -178,17 +179,56 @@ impl LLM {
             Box::new(NoFilter)
         };
 
+        match debug_backend.as_ref() {
+            Some(DebugBackend::Folder(folder)) => {
+                tracing::info!(
+                    "LLM debug enabled: folder backend at {}",
+                    folder.folder().display()
+                );
+            }
+            Some(DebugBackend::Sqlite3(db)) => {
+                tracing::info!(
+                    "LLM debug enabled: sqlite3 backend at {} (client_id={:?})",
+                    db.path(),
+                    db.client_id()
+                );
+            }
+            None => {}
+        }
+
         LLM {
             llm: Arc::new(LLMInner {
                 client: LLMClient::new(config),
                 model,
                 billing,
-                llm_debug: debug_path,
-                llm_debug_index: AtomicU64::new(0),
+                debug_backend,
+                endpoint,
+                azure_deployment,
+                cap,
                 default_settings: settings,
                 content_filter: StdRwLock::new(content_filter),
             }),
         }
+    }
+
+    /// Convenience constructor that dispatches `LLM_DEBUG`-style strings to a
+    /// concrete [`DebugBackend`]. An empty / `None` `debug_target` disables
+    /// debug entirely.
+    pub async fn new_async(
+        config: SupportedConfig,
+        model: OpenAIModel,
+        cap: f64,
+        settings: LLMSettings,
+        debug_prefix: Option<String>,
+        debug_target: Option<String>,
+    ) -> Result<Self, LLMYError> {
+        let backend = match debug_target {
+            Some(s) if !s.is_empty() => {
+                Some(DebugBackend::from_env_string(&s, debug_prefix.as_deref()).await?)
+            }
+            _ => None,
+        };
+        Ok(Self::new(config, model, cap, settings, backend))
     }
 }
 
@@ -205,8 +245,10 @@ pub struct LLMInner {
     pub client: LLMClient,
     pub model: OpenAIModel,
     pub billing: RwLock<ModelBilling>,
-    pub llm_debug: Option<PathBuf>,
-    pub llm_debug_index: AtomicU64,
+    pub debug_backend: Option<DebugBackend>,
+    pub endpoint: String,
+    pub azure_deployment: Option<String>,
+    pub cap: f64,
     pub default_settings: LLMSettings,
     content_filter: StdRwLock<Box<dyn OpenAIContentFilter>>,
 }
@@ -236,13 +278,13 @@ impl LLMInner {
         guard.filter_output(resp);
     }
 
-    fn on_llm_debug(&self, debug_prefix: &str) -> Option<PathBuf> {
-        if let Some(output_folder) = self.llm_debug.as_ref() {
-            let idx = self.llm_debug_index.fetch_add(1, Ordering::SeqCst);
-            let fpath = output_folder.join(format!("{}-{:0>12}.xml", debug_prefix, idx));
-            Some(fpath)
-        } else {
-            None
+    fn debug_row_context<'a>(&'a self, cache_key: Option<&'a str>) -> DebugRowContext<'a> {
+        DebugRowContext {
+            model_name: self.model.model_id(),
+            endpoint: &self.endpoint,
+            azure_deployment: self.azure_deployment.as_deref(),
+            cache_key,
+            cap_usd: self.cap,
         }
     }
 
@@ -361,13 +403,14 @@ impl LLMInner {
         } else {
             "llm".to_string()
         };
-        let debug_fp = self.on_llm_debug(&debug_prefix);
 
-        if let Some(debug_fp) = debug_fp.as_ref()
-            && let Err(e) = debug::save_llm_user(debug_fp, &req).await
-        {
-            tracing::warn!("Fail to save user due to {}", e);
-        }
+        let dbg_handle = if let Some(backend) = self.debug_backend.as_ref() {
+            let cache_key = req.prompt_cache_key.clone();
+            let ctx = self.debug_row_context(cache_key.as_deref());
+            backend.start(&debug_prefix, ctx, &req).await
+        } else {
+            None
+        };
 
         let estimated_tokens = {
             let text = debug::extract_raw_text_with_other(&req);
@@ -383,7 +426,7 @@ impl LLMInner {
         let now = std::time::SystemTime::now();
         let llm_fut = async {
             if use_stream {
-                self.complete_streaming(req).await
+                self.complete_streaming(&mut req).await
             } else {
                 self.client
                     .create_chat_extensible(&req)
@@ -409,22 +452,18 @@ impl LLMInner {
         let mut resp = match resp {
             Ok(resp) => resp,
             Err(e) => {
-                if let Some(debug_fp) = debug_fp.as_ref() {
+                if let (Some(backend), Some(handle)) =
+                    (self.debug_backend.as_ref(), dbg_handle.as_ref())
+                {
                     let err = format!("{:?}", e);
-                    if let Err(je) =
-                        debug::rewrite_json(debug_fp, &serde_json::json!({ "error": err })).await
-                    {
-                        tracing::warn!("can not save error: {} due to json error {}", err, je);
-                    }
+                    backend.record_error(handle, &err).await;
                 }
                 return Err(e);
             }
         };
         self.apply_filter_output(&mut resp);
-        if let Some(debug_fp) = debug_fp.as_ref()
-            && let Err(e) = debug::save_llm_resp(debug_fp, &resp).await
-        {
-            tracing::warn!("Fail to save resp due to {}", e);
+        if let (Some(backend), Some(handle)) = (self.debug_backend.as_ref(), dbg_handle.as_ref()) {
+            backend.record_response(handle, &req, &resp).await;
         }
 
         let output_tokens = if let Some(usage) = &resp.usage {
@@ -435,30 +474,31 @@ impl LLMInner {
                 .as_ref()
                 .and_then(|v| v.cached_tokens)
                 .unwrap_or_default();
-            let input = usage.prompt_tokens - cached;
-            billing.input_tokens(&self.model, input as _, cached as _)?;
+            let input_without_cached = usage.prompt_tokens - cached;
+            billing.input_tokens(&self.model, input_without_cached as _, cached as _)?;
             let reasoning = usage
                 .completion_tokens_details
                 .as_ref()
                 .and_then(|v| v.reasoning_tokens)
                 .unwrap_or_default() as u64;
+            let output_without_reasoning = usage.completion_tokens as u64 - reasoning;
 
-            billing.output_tokens(
-                &self.model,
-                usage.completion_tokens as u64 - reasoning,
-                reasoning,
-            )?;
+            billing.output_tokens(&self.model, output_without_reasoning, reasoning)?;
 
-            if let Some(debug_fp) = debug_fp.as_ref() {
+            if let (Some(backend), Some(handle)) =
+                (self.debug_backend.as_ref(), dbg_handle.as_ref())
+            {
                 let billing_clone = billing.clone();
                 drop(billing);
-                if let Err(e) = debug::rewrite_json(debug_fp, &billing_clone).await {
-                    tracing::warn!(
-                        "can not write {} to debug file due to {}",
-                        &billing_clone,
-                        e
-                    );
-                }
+                let usage_for_debug = DebugUsage {
+                    input_without_cached_tokens: input_without_cached as u64,
+                    cached_tokens: cached as u64,
+                    output_without_reasoning_tokens: output_without_reasoning,
+                    reasoning_tokens: reasoning,
+                };
+                backend
+                    .record_billing(handle, &billing_clone, &usage_for_debug)
+                    .await;
             }
             if let Some(est) = estimated_tokens {
                 let actual = usage.prompt_tokens as f64;
@@ -501,7 +541,7 @@ impl LLMInner {
     #[allow(deprecated)]
     async fn complete_streaming(
         &self,
-        mut req: RawExtensibleChatCompletionRequest,
+        req: &mut RawExtensibleChatCompletionRequest,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
         req.stream = Some(true);
 
@@ -512,7 +552,7 @@ impl LLMInner {
             });
         }
 
-        let mut stream = self.client.create_chat_stream_extensible(&req).await?;
+        let mut stream = self.client.create_chat_stream_extensible(&*req).await?;
 
         let mut id: Option<String> = None;
         let mut created: Option<u32> = None;

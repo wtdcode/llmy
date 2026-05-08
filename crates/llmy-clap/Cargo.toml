@@ -11,3 +11,4 @@ repository.workspace = true
 [dependencies]
 clap = {workspace = true, features = ["derive", "env"]}
 llmy-client.workspace = true
+llmy-types.workspace = true

@@ -4,7 +4,10 @@ use clap::{Parser, Subcommand};
 
 mod commands;
 
-use commands::{ChatArgs, TokenizerArgs, run_chat, run_models, run_tokenizer};
+use commands::{
+    ChatArgs, DumpClientArgs, DumpReqArgs, ListReqArgs, TokenizerArgs, run_chat, run_dump_client,
+    run_dump_req, run_list_req, run_models, run_tokenizer,
+};
 
 #[derive(Parser)]
 #[command(name = "llmy", about = "All-in-one LLM utilities.")]
@@ -21,6 +24,12 @@ enum Commands {
     Tokenizer(TokenizerArgs),
     /// List all supported models with pricing info
     Models,
+    /// List recorded LLM debug requests from a sqlite3 LLM_DEBUG database
+    ListReq(ListReqArgs),
+    /// Dump a single LLM debug request from a sqlite3 LLM_DEBUG database
+    DumpReq(DumpReqArgs),
+    /// Dump every request of one client into XML conversations + raw JSONL
+    DumpClient(DumpClientArgs),
 }
 
 async fn main_entry() -> color_eyre::Result<()> {
@@ -29,6 +38,9 @@ async fn main_entry() -> color_eyre::Result<()> {
         Commands::Chat(args) => run_chat(args).await,
         Commands::Tokenizer(args) => run_tokenizer(args),
         Commands::Models => run_models(),
+        Commands::ListReq(args) => run_list_req(args).await,
+        Commands::DumpReq(args) => run_dump_req(args).await,
+        Commands::DumpClient(args) => run_dump_client(args).await,
     }
 }
 

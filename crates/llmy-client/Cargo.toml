@@ -15,9 +15,14 @@ color-eyre.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 itertools.workspace = true
-tokio = {workspace = true, features = ["fs"]}
+tokio = {workspace = true, features = ["fs", "sync"]}
 tokio-stream.workspace = true
 regex.workspace = true
+sqlx.workspace = true
 
 llmy-tokenizer.workspace = true
 llmy-types.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = {workspace = true, features = ["macros", "rt-multi-thread"]}

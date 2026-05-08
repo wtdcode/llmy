@@ -11,7 +11,7 @@ The example below builds a basic agent that can read files, list directories, an
 ```toml
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-llmy = "0.7"
+llmy = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -37,7 +37,7 @@ struct Cli {
 async fn main() -> Result<(), llmy::LLMYError> {
     let cli = Cli::parse();
     let settings = cli.llm.settings();
-    let llm = cli.llm.to_llm();
+    let llm = cli.llm.to_llm().await;
 
     let mut tools = ToolBox::new();
     tools.add_tool(ReadFileTool::new(cli.root.clone()));
@@ -110,6 +110,24 @@ llmy tokenizer --encoding cl100k_base --input my_prompt.txt --verbose
 # 4
 ```
 
+### `llmy list-req` / `llmy dump-req` — inspect a SQLite `LLM_DEBUG` run
+
+Browse the requests stored when `LLM_DEBUG` points at a SQLite database (see [Detailed debug logging](#2-detailed-debug-logging-llm_debug)).
+
+```bash
+# All requests of the latest client, with header
+LLM_DEBUG=./run.sqlite3 llmy list-req
+
+# Filter by client id and/or cache key
+llmy list-req --db ./run.sqlite3 --client-id 2 --cache-key chat
+
+# Show one request (human view: metadata + conversation)
+llmy dump-req --db ./run.sqlite3 --req-id 17
+
+# Same row as a single JSON object (LLMDebugRow)
+llmy dump-req --req-id 17 --json
+```
+
 ### `llmy models` — list supported models
 
 ```
@@ -132,7 +150,7 @@ Add the dependency (the root crate re-exports everything):
 
 ```toml
 [dependencies]
-llmy = "0.7"
+llmy = "0.8"
 ```
 
 ### 1. Clap integration — up to 3 LLM slots
@@ -158,7 +176,7 @@ async fn main() {
     let cli = Cli::parse();
 
     // One-liner: clap args → ready-to-use async LLM client
-    let llm = cli.llm.to_llm();
+    let llm = cli.llm.to_llm().await;
 
     let resp = llm
         .prompt_once_with_retry(
@@ -208,7 +226,12 @@ The second and third slots use the prefixes `OPT_` and `OPT_OPT_` for their env-
 
 ### 2. Detailed debug logging (`LLM_DEBUG`)
 
-Point `LLM_DEBUG` at a directory and every LLM round-trip is saved as an XML-like `.xml` (not strict XML — just an easy-to-skim tagged format) **and** a raw `.json` — perfect for post-mortem debugging or dataset building.
+`LLM_DEBUG` accepts two backends, picked by the value's shape:
+
+- **Folder** (any other path): one `.xml` + `.json` pair per round-trip, written under a per-process subfolder.
+- **SQLite** (value starting with `sqlite3://` or ending in `sqlite3`): every request is a row in a long-lived database, queryable via the bundled CLI (`llmy list-req` / `llmy dump-req`) or any sqlite client.
+
+#### Folder backend
 
 ```bash
 LLM_DEBUG=./debug_logs OPENAI_API_KEY=sk-... cargo run
@@ -255,6 +278,29 @@ Async Rust lets you write concurrent code ...
 
 The `.json` companion contains the full serialised `CreateChatCompletionRequest` / `CreateChatCompletionResponse` objects for programmatic analysis.
 
+#### SQLite backend
+
+```bash
+LLM_DEBUG=./run.sqlite3 OPENAI_API_KEY=sk-... cargo run
+# or
+LLM_DEBUG=sqlite3:///abs/path/to/run.sqlite3 ...
+```
+
+On startup a row is inserted into a `client` table and every request lands in `llm_debug` (model, endpoint URL, azure deployment, cache key, raw request/response JSON, per-request token counts, running USD spend, full conversation, timestamp). Inspect a run with the CLI:
+
+```bash
+# Most recent client only, optionally filtered by cache key
+llmy list-req --cache-key chat
+# id  client  ts                    model    endpoint                    deployment  cache_key  input  cached  output  reasoning  usage_usd  resp
+# 1   3       2026-05-08 19:39:23   gpt-4o   https://api.openai.com/v1/  -           chat       142    0       38      0          0.001020   ok
+
+# Drill into a single row (--json dumps the full LLMDebugRow struct)
+llmy dump-req --req-id 1
+llmy dump-req --req-id 1 --json
+```
+
+You can also embed the read API directly: `Sqlite3DebugDB::open_existing(url)` + `list_filtered` / `get_row` return strongly-typed `LLMDebugRow` values.
+
 ---
 
 ### 3. Built-in billing with automatic budget enforcement
@@ -273,8 +319,7 @@ let llm = LLM::new(
     model,
     5.0, // budget cap in USD
     settings,
-    None,
-    None,
+    None, // Option<DebugBackend>; see LLM::new_async for LLM_DEBUG-style strings
 );
 
 match llm.prompt_once("system", "user", None, None, None).await {
@@ -333,16 +378,16 @@ You can depend on either the focused crate pair:
 
 ```toml
 [dependencies]
-llmy-agent = "0.5"
-llmy-agent-derive = "0.7"
+llmy-agent = "0.8"
+llmy-agent-derive = "0.8"
 ```
 
 or the root crate plus the derive crate:
 
 ```toml
 [dependencies]
-llmy = "0.7"
-llmy-agent-derive = "0.7"
+llmy = "0.8"
+llmy-agent-derive = "0.8"
 ```
 
 The trait contract is:
