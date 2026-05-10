@@ -56,12 +56,16 @@ fn main() {
             .install()
             .expect("init no color color_eyre");
     }
-    if let Ok(dot_file) = std::env::var("DOT") {
-        dotenvy::from_path_override(dot_file).expect("can not read dotenvy");
-    } else {
-        // Allows failure and never override existing environment variables
-        let _ = dotenvy::dotenv();
+    let direnv_exists = std::env::var("DIRENV_DIR").is_ok();
+    if !direnv_exists {
+        if let Ok(dot_file) = std::env::var("DOT") {
+            dotenvy::from_path_override(dot_file).expect("can not read dotenvy");
+        } else {
+            // Allows failure and do not override
+            let _ = dotenvy::dotenv();
+        }
     }
+
     let sub = tracing_subscriber::FmtSubscriber::builder()
         .with_env_filter(
             tracing_subscriber::EnvFilter::builder()

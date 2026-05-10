@@ -2038,7 +2038,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llmy"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "async-openai",
  "llmy-agent",
@@ -2053,7 +2053,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-agent"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "async-openai",
  "dyn-clone",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-agent-derive"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "heck",
  "proc-macro-crate",
@@ -2079,7 +2079,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-agent-derive-test"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "llmy",
  "llmy-agent",
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-agent-tools"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "color-eyre",
  "const_format",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-clap"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "clap",
  "llmy-client",
@@ -2119,7 +2119,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-cli"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "async-openai",
  "chrono",
@@ -2142,7 +2142,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-client"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "async-openai",
  "color-eyre",
@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-harness"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "async-openai",
  "color-eyre",
@@ -2177,7 +2177,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-tokenizer"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-types"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "async-openai",
  "color-eyre",
