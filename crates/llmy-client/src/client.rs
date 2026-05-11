@@ -9,21 +9,25 @@ use async_openai::{
     Client,
     config::{AzureConfig, OpenAIConfig},
     error::OpenAIError,
-    types::chat::{
-        ChatChoice, ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionResponseMessage,
-        ChatCompletionResponseStream, ChatCompletionStreamOptions, ChatCompletionToolChoiceOption,
-        ChatCompletionTools, CompletionUsage, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-        CreateChatCompletionStreamResponse, FinishReason, FunctionCall, Role, ToolChoiceOptions,
-    },
 };
 use color_eyre::eyre::eyre;
 use llmy_types::error::LLMYError;
+use llmy_types::other::WithOtherFields;
 use serde::de::DeserializeOwned;
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
+
+use crate::req::{
+    ChatCompletionMessageToolCallRaw, ChatCompletionMessageToolCalls,
+    ChatCompletionMessageToolCallsRaw, ChatCompletionRequestMessageRaw,
+    ChatCompletionRequestSystemMessageRaw, ChatCompletionRequestUserMessageRaw,
+    ChatCompletionStreamOptionsRaw, ChatCompletionToolChoiceOptionRaw, ChatCompletionTools,
+    CreateChatCompletionRequestRaw, FunctionCallRaw, Role, ToolChoiceOptions,
+};
+use crate::resp::{
+    ChatChoice, ChatChoiceRaw, ChatCompletionResponseMessageRaw, CompletionUsage,
+    CreateChatCompletionResponseRaw, CreateChatCompletionStreamResponse, FinishReason,
+};
 
 use crate::debug::{self, DebugBackend, DebugRowContext, DebugUsage};
 pub use crate::filter::{GoogleContentFilter, MiMoContentFilter, NoFilter, OpenAIContentFilter};
@@ -101,21 +105,19 @@ pub enum LLMClient {
     OpenAI(Client<OpenAIConfig>),
 }
 
+/// SSE stream of [`CreateChatCompletionStreamResponse`] chunks until the
+/// upstream server emits `[DONE]`. Mirrors `async_openai`'s
+/// `ChatCompletionResponseStream` shape using our own response type so we
+/// don't lose unknown fields per chunk.
+pub type ChatCompletionResponseStream = std::pin::Pin<
+    Box<dyn futures::Stream<Item = Result<CreateChatCompletionStreamResponse, OpenAIError>> + Send>,
+>;
+
 impl LLMClient {
     pub fn new(config: SupportedConfig) -> Self {
         match config {
             SupportedConfig::Azure { config, .. } => Self::Azure(Client::with_config(config)),
             SupportedConfig::OpenAI(cfg) => Self::OpenAI(Client::with_config(cfg)),
-        }
-    }
-
-    pub async fn create_chat(
-        &self,
-        req: CreateChatCompletionRequest,
-    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        match self {
-            Self::Azure(cl) => cl.chat().create(req).await,
-            Self::OpenAI(cl) => cl.chat().create(req).await,
         }
     }
 
@@ -126,16 +128,6 @@ impl LLMClient {
         match self {
             Self::Azure(cl) => cl.chat().create_byot(req).await,
             Self::OpenAI(cl) => cl.chat().create_byot(req).await,
-        }
-    }
-
-    pub async fn create_chat_stream(
-        &self,
-        req: CreateChatCompletionRequest,
-    ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        match self {
-            Self::Azure(cl) => cl.chat().create_stream(req).await,
-            Self::OpenAI(cl) => cl.chat().create_stream(req).await,
         }
     }
 
@@ -278,12 +270,12 @@ impl LLMInner {
         guard.filter_output(resp);
     }
 
-    fn debug_row_context<'a>(&'a self, cache_key: Option<&'a str>) -> DebugRowContext<'a> {
+    fn debug_row_context(&self, cache_key: Option<&str>) -> DebugRowContext {
         DebugRowContext {
-            model_name: self.model.model_id(),
-            endpoint: &self.endpoint,
-            azure_deployment: self.azure_deployment.as_deref(),
-            cache_key,
+            model_name: self.model.model_id_str().to_string(),
+            endpoint: self.endpoint.clone(),
+            azure_deployment: self.azure_deployment.clone(),
+            cache_key: cache_key.map(|s| s.to_string()),
             cap_usd: self.cap,
         }
     }
@@ -297,15 +289,13 @@ impl LLMInner {
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
-        let sys = ChatCompletionRequestSystemMessageArgs::default()
-            .content(sys_msg)
-            .build()?;
-
-        let user = ChatCompletionRequestUserMessageArgs::default()
-            .content(user_msg)
-            .build()?;
+        let sys = ChatCompletionRequestSystemMessageRaw::new_text(sys_msg);
+        let user = ChatCompletionRequestUserMessageRaw::new_text(user_msg);
         self.prompt_messages_once(
-            vec![sys.into(), user.into()],
+            vec![
+                ChatCompletionRequestMessageRaw::System(sys),
+                ChatCompletionRequestMessageRaw::User(user),
+            ],
             debug_prefix,
             cache_key,
             settings,
@@ -342,12 +332,12 @@ impl LLMInner {
 
     pub async fn complete_once_with_retry(
         &self,
-        req: &CreateChatCompletionRequest,
+        req: &CreateChatCompletionRequestRaw,
         debug_prefix: Option<&str>,
         timeout: Option<Duration>,
         retry: Option<u64>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
-        let req = RawExtensibleChatCompletionRequest::from(req.clone());
+        let req = RawExtensibleChatCompletionRequest::new(req.clone());
         self.complete_extensible_once_with_retry(&req, debug_prefix, timeout, retry)
             .await
     }
@@ -380,11 +370,11 @@ impl LLMInner {
 
     pub async fn complete(
         &self,
-        req: CreateChatCompletionRequest,
+        req: CreateChatCompletionRequestRaw,
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
-        let req = RawExtensibleChatCompletionRequest::from(req);
+        let req = RawExtensibleChatCompletionRequest::new(req);
         self.complete_extensible(req, debug_prefix, timeout_overwrite)
             .await
     }
@@ -546,10 +536,10 @@ impl LLMInner {
         req.stream = Some(true);
 
         if req.stream_options.is_none() {
-            req.stream_options = Some(ChatCompletionStreamOptions {
+            req.stream_options = Some(WithOtherFields::new(ChatCompletionStreamOptionsRaw {
                 include_usage: Some(true),
                 include_obfuscation: None,
-            });
+            }));
         }
 
         let mut stream = self.client.create_chat_stream_extensible(&*req).await?;
@@ -567,29 +557,37 @@ impl LLMInner {
 
         while let Some(item) = stream.next().await {
             let chunk: CreateChatCompletionStreamResponse = item?;
+            // Take ownership of the inner raw chunk so we can move fields out of `WithOtherFields`.
+            let chunk = chunk.inner;
             if id.is_none() {
                 id = Some(chunk.id.clone());
             }
             created = Some(chunk.created);
             model = Some(chunk.model.clone());
             service_tier = chunk.service_tier.clone();
-            system_fingerprint = chunk.system_fingerprint.clone();
+            #[allow(deprecated)]
+            {
+                system_fingerprint = chunk.system_fingerprint.clone();
+            }
             if let Some(u) = chunk.usage.clone() {
                 usage = Some(u);
             }
 
             for ch in chunk.choices.into_iter() {
+                let ch = ch.inner;
                 let idx = ch.index as usize;
                 if contents.len() <= idx {
                     contents.resize_with(idx + 1, String::new);
                     finish_reasons.resize_with(idx + 1, || None);
                     tool_calls.resize_with(idx + 1, Vec::new);
                 }
-                if let Some(delta) = ch.delta.content {
-                    contents[idx].push_str(&delta);
+                let delta = ch.delta.inner;
+                if let Some(content) = delta.content {
+                    contents[idx].push_str(&content);
                 }
-                if let Some(tcs) = ch.delta.tool_calls {
+                if let Some(tcs) = delta.tool_calls {
                     for tc in tcs.into_iter() {
+                        let tc = tc.inner;
                         let tc_idx = tc.index as usize;
                         if tool_calls[idx].len() <= tc_idx {
                             tool_calls[idx].resize_with(tc_idx + 1, ToolCallAcc::default);
@@ -599,6 +597,7 @@ impl LLMInner {
                             acc.id = id;
                         }
                         if let Some(func) = tc.function {
+                            let func = func.inner;
                             if let Some(name) = func.name {
                                 acc.name = name;
                             }
@@ -614,82 +613,89 @@ impl LLMInner {
             }
         }
 
-        let mut choices = Vec::new();
+        let mut choices: Vec<ChatChoice> = Vec::new();
         for (idx, content) in contents.into_iter().enumerate() {
             let finish_reason = finish_reasons.get(idx).cloned().unwrap_or(None);
-            let built_tool_calls = tool_calls
+            let built_tool_calls: Vec<ChatCompletionMessageToolCalls> = tool_calls
                 .get(idx)
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|t| !t.name.trim().is_empty() || !t.arguments.trim().is_empty())
                 .map(|t| {
-                    ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                    let raw = ChatCompletionMessageToolCallRaw {
                         id: if t.id.trim().is_empty() {
                             format!("toolcall-{}", idx)
                         } else {
                             t.id
                         },
-                        function: FunctionCall {
+                        function: WithOtherFields::new(FunctionCallRaw {
                             name: t.name,
                             arguments: t.arguments,
-                        },
-                    })
+                        }),
+                    };
+                    WithOtherFields::new(ChatCompletionMessageToolCallsRaw::Function(
+                        WithOtherFields::new(raw),
+                    ))
                 })
-                .collect::<Vec<_>>();
+                .collect();
             let tool_calls_opt = if built_tool_calls.is_empty() {
                 None
             } else {
                 Some(built_tool_calls)
             };
-            choices.push(ChatChoice {
-                index: idx as u32,
-                message: ChatCompletionResponseMessage {
-                    content: if content.is_empty() {
-                        None
-                    } else {
-                        Some(content)
-                    },
-                    refusal: None,
-                    tool_calls: tool_calls_opt,
-                    annotations: None,
-                    role: Role::Assistant,
-                    function_call: None,
-                    audio: None,
+            #[allow(deprecated)]
+            let message = WithOtherFields::new(ChatCompletionResponseMessageRaw {
+                content: if content.is_empty() {
+                    None
+                } else {
+                    Some(content)
                 },
+                refusal: None,
+                tool_calls: tool_calls_opt,
+                annotations: None,
+                role: Role::Assistant,
+                function_call: None,
+                audio: None,
+            });
+            choices.push(WithOtherFields::new(ChatChoiceRaw {
+                index: idx as u32,
+                message,
                 finish_reason,
                 logprobs: None,
-            });
+            }));
         }
         if choices.is_empty() {
-            choices.push(ChatChoice {
+            #[allow(deprecated)]
+            let message = WithOtherFields::new(ChatCompletionResponseMessageRaw {
+                content: Some(String::new()),
+                refusal: None,
+                tool_calls: None,
+                annotations: None,
+                role: Role::Assistant,
+                function_call: None,
+                audio: None,
+            });
+            choices.push(WithOtherFields::new(ChatChoiceRaw {
                 index: 0,
-                message: ChatCompletionResponseMessage {
-                    content: Some(String::new()),
-                    refusal: None,
-                    tool_calls: None,
-                    annotations: None,
-                    role: Role::Assistant,
-                    function_call: None,
-                    audio: None,
-                },
+                message,
                 finish_reason: None,
                 logprobs: None,
-            });
+            }));
         }
 
-        Ok(RawExtensibleChatCompletionResponse::new(
-            CreateChatCompletionResponse {
-                id: id.unwrap_or_else(|| "stream".to_string()),
-                choices,
-                created: created.unwrap_or(0),
-                model: model.unwrap_or_else(|| self.model.to_string()),
-                service_tier,
-                system_fingerprint,
-                object: "chat.completion".to_string(),
-                usage,
-            },
-        ))
+        #[allow(deprecated)]
+        let resp_raw = CreateChatCompletionResponseRaw {
+            id: id.unwrap_or_else(|| "stream".to_string()),
+            choices,
+            created: created.unwrap_or(0),
+            model: model.unwrap_or_else(|| self.model.api_model_name().to_string()),
+            service_tier,
+            system_fingerprint,
+            object: "chat.completion".to_string(),
+            usage,
+        };
+        Ok(RawExtensibleChatCompletionResponse::new(resp_raw))
     }
 
     /// Build an extensible chat request with this model's settings, tools, and provider quirks
@@ -702,61 +708,54 @@ impl LLMInner {
         settings: &LLMSettings,
         tools: Option<Vec<ChatCompletionTools>>,
     ) -> Result<RawExtensibleChatCompletionRequest, LLMYError> {
-        let mut req = CreateChatCompletionRequestArgs::default();
+        let mut raw = CreateChatCompletionRequestRaw::default();
+        raw.model = self.model.api_model_name().to_string();
 
         if let Some(tools) = tools {
-            req.tools(tools);
+            raw.tools = Some(tools);
         }
 
         if let Some(tc) = settings.llm_tool_choice.clone() {
-            req.tool_choice(tc);
+            raw.tool_choice = Some(tc.0);
         } else if self.model.is_mimo() {
-            // This ensures mimo to generate tool calls correctly, only god knows why
-            req.tool_choice(ChatCompletionToolChoiceOption::Mode(
-                ToolChoiceOptions::Auto,
+            // This ensures mimo generates tool calls correctly, only god knows why.
+            raw.tool_choice = Some(WithOtherFields::new(
+                ChatCompletionToolChoiceOptionRaw::Mode(ToolChoiceOptions::Auto),
             ));
         }
 
         if let Some(effort) = settings.reasoning_effort.clone()
             && !self.model.is_mimo()
         {
-            req.reasoning_effort(effort.0);
+            raw.reasoning_effort = Some(effort.0);
         }
 
         if let Some(cache_key) = cache_key {
-            req.prompt_cache_key(cache_key.to_string());
+            raw.prompt_cache_key = Some(cache_key.to_string());
         }
         if let Some(temperature) = settings.llm_temperature {
-            req.temperature(temperature);
+            raw.temperature = Some(temperature);
         }
-
         if let Some(presence_penalty) = settings.llm_presence_penalty {
-            req.presence_penalty(presence_penalty);
+            raw.presence_penalty = Some(presence_penalty);
         }
-
         if let Some(max_completion_tokens) = settings.llm_max_completion_tokens {
-            req.max_completion_tokens(max_completion_tokens);
+            raw.max_completion_tokens = Some(max_completion_tokens);
         }
-
         if let Some(top_p) = settings.top_p {
-            req.top_p(top_p);
+            raw.top_p = Some(top_p);
         }
 
-        let raw_messages: Vec<ChatCompletionRequestMessage> =
-            messages.iter().map(|m| m.inner.clone()).collect();
-        let raw_req = req
-            .messages(raw_messages)
-            .model(self.model.to_string())
-            .build()?;
-        let mut req = RawExtensibleChatCompletionRequest::from(raw_req);
-        req.messages = messages;
+        // Use the extensible message wrappers directly so per-message extras survive.
+        raw.messages = messages.iter().map(|m| m.0.clone()).collect();
+        let mut req = RawExtensibleChatCompletionRequest::new(raw);
         apply_provider_request_extensions(&self.model, settings, &mut req);
         Ok(req)
     }
 
     pub async fn prompt_messages_once(
         &self,
-        messages: Vec<ChatCompletionRequestMessage>,
+        messages: Vec<ChatCompletionRequestMessageRaw>,
         debug_prefix: Option<&str>,
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
@@ -782,15 +781,13 @@ impl LLMInner {
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
-        let sys = ChatCompletionRequestSystemMessageArgs::default()
-            .content(sys_msg)
-            .build()?;
-
-        let user = ChatCompletionRequestUserMessageArgs::default()
-            .content(user_msg)
-            .build()?;
+        let sys = ChatCompletionRequestSystemMessageRaw::new_text(sys_msg);
+        let user = ChatCompletionRequestUserMessageRaw::new_text(user_msg);
         self.prompt_messages_once(
-            vec![sys.into(), user.into()],
+            vec![
+                ChatCompletionRequestMessageRaw::System(sys),
+                ChatCompletionRequestMessageRaw::User(user),
+            ],
             debug_prefix,
             cache_key,
             settings,
@@ -811,7 +808,7 @@ fn apply_provider_request_extensions(
             .as_ref()
             .is_some_and(Reasoning::is_none)
     {
-        req.other.insert(
+        req.extra_mut().insert(
             "thinking".to_string(),
             serde_json::json!({
                 "type": "disabled"
@@ -823,8 +820,8 @@ fn apply_provider_request_extensions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::req::ReasoningEffort;
     use crate::settings::{LLMToolChoice, Reasoning};
-    use async_openai::types::chat::ReasoningEffort;
     use std::str::FromStr;
 
     fn test_settings(reasoning_effort: Option<Reasoning>) -> LLMSettings {
@@ -841,20 +838,21 @@ mod tests {
         }
     }
 
+    fn user_request(content: &str) -> RawExtensibleChatCompletionRequest {
+        let user = ChatCompletionRequestMessageRaw::User(
+            ChatCompletionRequestUserMessageRaw::new_text(content),
+        );
+        let mut raw = CreateChatCompletionRequestRaw::default();
+        raw.model = "mimo-v2.5-pro".to_string();
+        raw.messages = vec![WithOtherFields::new(user)];
+        RawExtensibleChatCompletionRequest::new(raw)
+    }
+
     #[test]
     fn extensible_chat_completion_request_flattens_extra_fields() {
-        let user = ChatCompletionRequestUserMessageArgs::default()
-            .content("hello")
-            .build()
-            .unwrap();
-        let request = CreateChatCompletionRequestArgs::default()
-            .messages(vec![user.into()])
-            .model("mimo-v2.5-pro")
-            .build()
-            .unwrap();
-        let mut request = RawExtensibleChatCompletionRequest::from(request);
+        let mut request = user_request("hello");
 
-        request.other.insert(
+        request.extra_mut().insert(
             "thinking".to_string(),
             serde_json::json!({
                 "type": "disabled"
@@ -868,17 +866,11 @@ mod tests {
 
     #[test]
     fn extensible_chat_completion_request_flattens_message_extra_fields() {
-        let user = ChatCompletionRequestUserMessageArgs::default()
-            .content("hello")
-            .build()
-            .unwrap();
-        let request = CreateChatCompletionRequestArgs::default()
-            .messages(vec![user.into()])
-            .model("mimo-v2.5-pro")
-            .build()
-            .unwrap();
-        let mut request = RawExtensibleChatCompletionRequest::from(request);
-        request.messages[0].insert_extra_string("reasoning_content", "I need the tool.");
+        let mut request = user_request("hello");
+        // mutate the wrapped message via Deref→WithOtherFields
+        request.messages[0]
+            .other
+            .insert("reasoning_content".to_string(), "I need the tool.".into());
 
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["messages"][0]["content"], "hello");
@@ -890,17 +882,7 @@ mod tests {
 
     #[test]
     fn extensible_chat_completion_request_serializes_inner_changes() {
-        let user = ChatCompletionRequestUserMessageArgs::default()
-            .content("hello")
-            .build()
-            .unwrap();
-        let request = CreateChatCompletionRequestArgs::default()
-            .messages(vec![user.into()])
-            .model("mimo-v2.5-pro")
-            .build()
-            .unwrap();
-        let mut request = RawExtensibleChatCompletionRequest::from(request);
-
+        let mut request = user_request("hello");
         request.stream = Some(true);
 
         let value = serde_json::to_value(&request).unwrap();
@@ -934,11 +916,16 @@ mod tests {
         assert_eq!(response.id, "chatcmpl-test");
         assert_eq!(response.extra()["provider_trace_id"], "trace-123");
         assert_eq!(
-            response.choices[0].extra()["provider_choice_id"],
+            response.choices[0].other["provider_choice_id"],
             "choice-123"
         );
         assert_eq!(
-            response.choices[0].reasoning_content(),
+            response.choices[0]
+                .inner
+                .message
+                .other
+                .get("reasoning_content")
+                .and_then(|v| v.as_str()),
             Some("I need the tool.")
         );
 
@@ -954,7 +941,7 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn extensible_chat_completion_response_serializes_base_mut_changes() {
-        let mut response = RawExtensibleChatCompletionResponse::new(CreateChatCompletionResponse {
+        let raw = CreateChatCompletionResponseRaw {
             id: "chatcmpl-test".to_string(),
             choices: Vec::new(),
             created: 1,
@@ -963,7 +950,8 @@ mod tests {
             system_fingerprint: None,
             object: "chat.completion".to_string(),
             usage: None,
-        });
+        };
+        let mut response = RawExtensibleChatCompletionResponse::new(raw);
         response.model = "new-model".to_string();
         response.extra_mut().insert(
             "provider_trace_id".to_string(),
@@ -977,16 +965,7 @@ mod tests {
 
     #[test]
     fn mimo_reasoning_none_adds_thinking_disabled() {
-        let user = ChatCompletionRequestUserMessageArgs::default()
-            .content("hello")
-            .build()
-            .unwrap();
-        let request = CreateChatCompletionRequestArgs::default()
-            .messages(vec![user.into()])
-            .model("mimo-v2.5-pro")
-            .build()
-            .unwrap();
-        let mut request = RawExtensibleChatCompletionRequest::from(request);
+        let mut request = user_request("hello");
         let model = OpenAIModel::from_str("mimo-v2.5-pro").unwrap();
 
         apply_provider_request_extensions(
@@ -997,5 +976,83 @@ mod tests {
 
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["thinking"]["type"], "disabled");
+    }
+
+    /// Locks the Gemini `thought_signature` round-trip. Gemini's OpenAI-compat
+    /// endpoint attaches `thought_signature` to each tool_call in the response,
+    /// and rejects subsequent assistant messages whose tool_calls drop it. This
+    /// test asserts that the field survives deserialize → clone-into-assistant
+    /// → reserialize without any provider-specific code.
+    #[test]
+    fn gemini_thought_signature_round_trips_through_tool_calls() {
+        use crate::req::{
+            ChatCompletionMessageToolCallsRaw, ChatCompletionRequestAssistantMessageRaw,
+        };
+
+        let response: RawExtensibleChatCompletionResponse =
+            serde_json::from_value(serde_json::json!({
+                "id": "chatcmpl-gemini",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                            "thought_signature": "ZGVlcC10aG91Z2h0LXNpZw=="
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "created": 1,
+                "model": "google/gemini-3.1-pro-preview",
+                "object": "chat.completion"
+            }))
+            .unwrap();
+
+        // The tool_call JSON has the same flat shape as the variant payload
+        // (id/type/function/thought_signature live on the same level), so the
+        // unknown field is captured inside the variant's WithOtherFields, not
+        // on the outer enum wrapper.
+        let tcs = response.choices[0]
+            .inner
+            .message
+            .inner
+            .tool_calls
+            .as_ref()
+            .expect("tool_calls present");
+        assert_eq!(tcs.len(), 1);
+        let tc = &tcs[0];
+        match &tc.inner {
+            ChatCompletionMessageToolCallsRaw::Function(f) => {
+                assert_eq!(f.function.name, "lookup");
+                assert_eq!(
+                    f.other.get("thought_signature").and_then(|v| v.as_str()),
+                    Some("ZGVlcC10aG91Z2h0LXNpZw==")
+                );
+            }
+            _ => panic!("expected function tool call"),
+        }
+
+        // Cloning the tool_calls into an assistant request message and
+        // re-serializing must preserve `thought_signature` verbatim.
+        #[allow(deprecated)]
+        let assistant = WithOtherFields::new(ChatCompletionRequestAssistantMessageRaw {
+            content: None,
+            refusal: None,
+            name: None,
+            audio: None,
+            tool_calls: response.choices[0].inner.message.inner.tool_calls.clone(),
+            function_call: None,
+        });
+        let echoed = serde_json::to_value(&assistant).unwrap();
+        assert_eq!(
+            echoed["tool_calls"][0]["thought_signature"],
+            "ZGVlcC10aG91Z2h0LXNpZw=="
+        );
+        assert_eq!(echoed["tool_calls"][0]["id"], "call_1");
+        assert_eq!(echoed["tool_calls"][0]["function"]["name"], "lookup");
     }
 }

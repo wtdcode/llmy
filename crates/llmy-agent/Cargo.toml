@@ -14,8 +14,8 @@ dyn-clone.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-async-openai = {workspace = true, features = ["chat-completion-types"]}
 tokio.workspace = true
 
 llmy-agent-derive.workspace = true
+llmy-client.workspace = true
 llmy-types.workspace = true

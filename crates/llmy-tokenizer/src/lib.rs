@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use tiktoken_rs::CoreBPE;
@@ -10,6 +9,8 @@ mod generated_models {
 mod generated_claude {
     include!(concat!(env!("OUT_DIR"), "/claude_generated.rs"));
 }
+
+pub use generated_models::ModelId;
 
 // ---------------------------------------------------------------------------
 // Encoding enum
@@ -45,7 +46,7 @@ impl Encoding {
 }
 
 // ---------------------------------------------------------------------------
-// Model config (mirrors ai-tokenizer/src/models.json)
+// Model config (mirrors data/models.json)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default)]
@@ -74,8 +75,13 @@ pub struct ModelPricing {
 
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
+    /// Vendor / namespace prefix (e.g. `Some("google")` for `google/gemini-3.1-pro-preview`).
+    pub owner: Option<String>,
+    /// Identifier sent to the upstream API (the part after `owner/`).
+    pub model_name: String,
     pub encoding: String,
     pub tokens: ModelTokens,
+    /// Human-friendly display name (e.g. `"Gemini 3.1 Pro Preview"`).
     pub name: String,
     pub max_input_tokens: u64,
     pub max_tokens: u64,
@@ -101,17 +107,43 @@ impl ModelConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Models registry
+// ModelId convenience helpers (the variants themselves are generated)
 // ---------------------------------------------------------------------------
 
-static MODELS: OnceLock<HashMap<&'static str, ModelConfig>> = OnceLock::new();
+impl ModelId {
+    /// Vendor / namespace prefix derived from the canonical id.
+    pub fn owner(&self) -> Option<&str> {
+        self.as_str().split_once('/').map(|(o, _)| o)
+    }
 
-pub fn models() -> &'static HashMap<&'static str, ModelConfig> {
-    MODELS.get_or_init(|| generated_models::init_models().into_iter().collect())
+    /// Bare model name sent to the upstream API.
+    pub fn model_name(&self) -> &str {
+        self.as_str()
+            .split_once('/')
+            .map_or_else(|| self.as_str(), |(_, m)| m)
+    }
 }
 
-pub fn get_model(model_id: &str) -> Option<&'static ModelConfig> {
-    models().get(model_id)
+impl std::fmt::Display for ModelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry helpers (back compat with the previous Vec/HashMap API)
+// ---------------------------------------------------------------------------
+
+/// Iterate over all built-in models with their canonical ids and configs.
+pub fn models() -> Vec<(&'static str, ModelConfig)> {
+    ModelId::ALL_KNOWN
+        .iter()
+        .filter_map(|id| id.to_model_config().map(|c| (id.as_str(), c)))
+        .collect()
+}
+
+pub fn get_model(model_id: &str) -> Option<ModelConfig> {
+    ModelId::parse_known(model_id).and_then(|id| id.to_model_config())
 }
 
 pub fn encoding_for_model(model_id: &str) -> Option<Encoding> {
@@ -194,7 +226,7 @@ pub fn count_tokens_for_model(text: &str, model_id: &str) -> Option<usize> {
 
 /// List all known model IDs.
 pub fn model_ids() -> Vec<&'static str> {
-    let mut ids: Vec<&str> = models().keys().copied().collect();
+    let mut ids: Vec<&str> = ModelId::ALL_KNOWN.iter().map(|id| id.as_str()).collect();
     ids.sort();
     ids
 }
@@ -255,6 +287,8 @@ mod tests {
         assert_eq!(model.max_tokens, 128000);
         assert_eq!(model.max_input(), 272000);
         assert_eq!(model.max_output(), 128000);
+        assert_eq!(model.owner.as_deref(), Some("openai"));
+        assert_eq!(model.model_name, "gpt-5.1");
     }
 
     #[test]
@@ -275,5 +309,19 @@ mod tests {
         assert_eq!(model.max_input_tokens, 655360);
         assert_eq!(model.max_tokens, 393216);
         assert_eq!(model.pricing.expect("deepseek pricing").input, 1.4e-07);
+    }
+
+    #[test]
+    fn test_model_id_parse_and_custom() {
+        let known = ModelId::parse_known("openai/gpt-4o").expect("known id");
+        assert_eq!(known.as_str(), "openai/gpt-4o");
+        assert_eq!(known.owner(), Some("openai"));
+        assert_eq!(known.model_name(), "gpt-4o");
+        assert!(known.to_model_config().is_some());
+
+        let custom = ModelId::from_str_or_custom("totally-made-up");
+        assert!(matches!(custom, ModelId::Custom(_)));
+        assert_eq!(custom.as_str(), "totally-made-up");
+        assert!(custom.to_model_config().is_none());
     }
 }

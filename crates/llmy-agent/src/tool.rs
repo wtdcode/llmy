@@ -22,13 +22,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use async_openai::types::chat::{
-    ChatCompletionRequestMessage, ChatCompletionRequestToolMessage,
-    ChatCompletionRequestToolMessageContent, ChatCompletionTool, ChatCompletionTools,
-    FunctionObject,
-};
 use dyn_clone::DynClone;
+use llmy_client::req::{
+    ChatCompletionRequestMessageRaw, ChatCompletionRequestToolMessageContent,
+    ChatCompletionRequestToolMessageRaw, ChatCompletionTool, ChatCompletionToolRaw,
+    ChatCompletionTools, ChatCompletionToolsRaw, FunctionObjectRaw,
+};
 use llmy_types::error::{GeneralToolCall, LLMYError};
+use llmy_types::other::WithOtherFields;
 use schemars::schema_for;
 use serde::de::DeserializeOwned;
 use tokio::task::JoinSet;
@@ -138,8 +139,8 @@ pub trait Tool: Send + Sync + DynClone + Debug {
     /// and a JSON schema generated from [`Self::ARGUMENTS`]. Override only if
     /// you need to customise the descriptor in ways the trait does not expose.
     fn to_openai_obejct(&self) -> ChatCompletionTool {
-        ChatCompletionTool {
-            function: FunctionObject {
+        WithOtherFields::new(ChatCompletionToolRaw {
+            function: WithOtherFields::new(FunctionObjectRaw {
                 name: Self::NAME.to_string(),
                 description: Self::DESCRIPTION.map(|e| e.to_string()),
                 parameters: Some(
@@ -147,8 +148,8 @@ pub trait Tool: Send + Sync + DynClone + Debug {
                         .expect("Fail to generate schema?!"),
                 ),
                 strict: Some(Self::STRICT),
-            },
-        }
+            }),
+        })
     }
     /// Deserializes `arguments` from JSON and forwards to [`Self::invoke`].
     ///
@@ -256,7 +257,7 @@ impl ToolBox {
     pub fn openai_objects(&self) -> Vec<ChatCompletionTools> {
         self.tools
             .iter()
-            .map(|t| ChatCompletionTools::Function(t.1.to_openai_obejct()))
+            .map(|t| WithOtherFields::new(ChatCompletionToolsRaw::Function(t.1.to_openai_obejct())))
             .collect()
     }
 
@@ -343,7 +344,7 @@ impl ToolBox {
         calls: Vec<GeneralToolCall>,
     ) -> Vec<(
         GeneralToolCall,
-        Option<Result<ChatCompletionRequestMessage, LLMYError>>,
+        Option<Result<ChatCompletionRequestMessageRaw, LLMYError>>,
     )> {
         let invokes = self.invoke_many(calls).await;
         Self::agent_messages_from_invokes(invokes)
@@ -355,7 +356,7 @@ impl ToolBox {
         calls: Vec<GeneralToolCall>,
     ) -> Vec<(
         GeneralToolCall,
-        Option<Result<ChatCompletionRequestMessage, LLMYError>>,
+        Option<Result<ChatCompletionRequestMessageRaw, LLMYError>>,
     )> {
         let invokes = self.invoke_many_sequential(calls).await;
         Self::agent_messages_from_invokes(invokes)
@@ -365,18 +366,18 @@ impl ToolBox {
         invokes: Vec<(GeneralToolCall, Option<Result<String, LLMYError>>)>,
     ) -> Vec<(
         GeneralToolCall,
-        Option<Result<ChatCompletionRequestMessage, LLMYError>>,
+        Option<Result<ChatCompletionRequestMessageRaw, LLMYError>>,
     )> {
         let mut out = vec![];
         for (call, result) in invokes {
             let id = call.tool_id.clone();
             let result = result.map(|v| {
                 v.map(|s| {
-                    ChatCompletionRequestToolMessage {
+                    let tool_msg = ChatCompletionRequestToolMessageRaw {
                         content: ChatCompletionRequestToolMessageContent::Text(s),
                         tool_call_id: id,
-                    }
-                    .into()
+                    };
+                    ChatCompletionRequestMessageRaw::Tool(WithOtherFields::new(tool_msg))
                 })
             });
 

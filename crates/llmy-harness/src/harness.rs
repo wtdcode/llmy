@@ -1,9 +1,3 @@
-use async_openai::types::chat::{
-    ChatChoice, ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
-    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
-    ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
-    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, FinishReason,
-};
 use color_eyre::eyre::eyre;
 use llmy_agent::{LLMYError, StepResult, Tool, tool::ToolBox};
 use llmy_agent_tools::memory::{
@@ -11,12 +5,20 @@ use llmy_agent_tools::memory::{
 };
 use llmy_client::debug::completion_to_string;
 use llmy_client::model::OpenAIModel;
+use llmy_client::req::{
+    ChatCompletionMessageToolCallsRaw, ChatCompletionRequestMessageRaw,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageRaw,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageRaw,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageRaw,
+};
+use llmy_client::resp::{ChatChoice, FinishReason};
 use llmy_client::{
     client::{LLM, RawExtensibleChatRequestMessage},
     model::ModelConfig,
     settings::LLMSettings,
 };
 use llmy_types::error::GeneralToolCall;
+use llmy_types::other::WithOtherFields;
 
 use crate::{
     memory::AgentMemorySystemPromptCriteria,
@@ -140,11 +142,12 @@ impl Agent {
         }
     }
 
-    fn system_message(system_prompt: String) -> ChatCompletionRequestMessage {
-        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+    fn system_message(system_prompt: String) -> ChatCompletionRequestMessageRaw {
+        let raw = ChatCompletionRequestSystemMessageRaw {
             content: ChatCompletionRequestSystemMessageContent::Text(system_prompt),
             name: None,
-        })
+        };
+        ChatCompletionRequestMessageRaw::System(WithOtherFields::new(raw))
     }
 
     pub fn conversation_context(&self) -> Vec<RawExtensibleChatRequestMessage> {
@@ -158,7 +161,7 @@ impl Agent {
     pub fn render_context(&self) -> String {
         self.conversation_context()
             .iter()
-            .map(|m| completion_to_string(&m.inner))
+            .map(|m| completion_to_string(&m.0))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -196,11 +199,12 @@ impl Agent {
     }
 
     pub fn push_user_message(&mut self, user_prompt: String) {
+        let user = ChatCompletionRequestUserMessageRaw {
+            content: ChatCompletionRequestUserMessageContent::Text(user_prompt),
+            name: None,
+        };
         self.context.push(RawExtensibleChatRequestMessage::new(
-            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Text(user_prompt),
-                name: None,
-            }),
+            ChatCompletionRequestMessageRaw::User(WithOtherFields::new(user)),
         ));
     }
 
@@ -235,11 +239,10 @@ impl Agent {
             );
         }
 
-        let choice = resp.choices.pop().unwrap();
+        let choice: ChatChoice = resp.choices.pop().unwrap();
         let propagated_reasoning = propagated_reasoning_content(&choice);
-        let choice: ChatChoice = choice.into();
 
-        if let Some(refused) = choice.message.refusal {
+        if let Some(refused) = choice.message.refusal.clone() {
             return Err(LLMYError::Filtered(refused));
         }
 
@@ -249,7 +252,7 @@ impl Agent {
 
         let mut assistant_content = choice.message.content.clone();
 
-        let (step_result, extra_messages): (StepResult, Vec<ChatCompletionRequestMessage>) =
+        let (step_result, extra_messages): (StepResult, Vec<ChatCompletionRequestMessageRaw>) =
             match reason {
                 FinishReason::ToolCalls | FinishReason::FunctionCall => {
                     let calls = chat_choice_to_toolcalls(&choice);
@@ -276,24 +279,32 @@ impl Agent {
                                             call,
                                             &e
                                         );
-                                        out.push(ChatCompletionRequestToolMessage {
-                                            content: ChatCompletionRequestToolMessageContent::Text(format!("Tool call to {} does not conform to schema {:?}", call, e)),
-                                            tool_call_id: call.tool_id.clone()
-                                        }.into());
+                                        let tool_msg = ChatCompletionRequestToolMessageRaw {
+                                            content: ChatCompletionRequestToolMessageContent::Text(
+                                                format!(
+                                                    "Tool call to {} does not conform to schema {:?}",
+                                                    call, e
+                                                ),
+                                            ),
+                                            tool_call_id: call.tool_id.clone(),
+                                        };
+                                        out.push(ChatCompletionRequestMessageRaw::Tool(
+                                            WithOtherFields::new(tool_msg),
+                                        ));
                                     }
                                     Err(e) => return Err(e),
                                 }
                             } else {
                                 tracing::warn!("Tool call {} is not defined", call);
-                                out.push(
-                                    ChatCompletionRequestToolMessage {
-                                        content: ChatCompletionRequestToolMessageContent::Text(
-                                            format!("The tool of {} is not defined", call),
-                                        ),
-                                        tool_call_id: call.tool_id.clone(),
-                                    }
-                                    .into(),
-                                );
+                                let tool_msg = ChatCompletionRequestToolMessageRaw {
+                                    content: ChatCompletionRequestToolMessageContent::Text(
+                                        format!("The tool of {} is not defined", call),
+                                    ),
+                                    tool_call_id: call.tool_id.clone(),
+                                };
+                                out.push(ChatCompletionRequestMessageRaw::Tool(
+                                    WithOtherFields::new(tool_msg),
+                                ));
                             }
                         }
                     }
@@ -317,7 +328,9 @@ impl Agent {
 
         self.checkpoints
             .push((self.last_step().clone(), current_context));
-        let mut assistant_message = RawExtensibleChatRequestMessage::new(assistant.into());
+        let mut assistant_message = RawExtensibleChatRequestMessage::new(
+            ChatCompletionRequestMessageRaw::Assistant(assistant),
+        );
         if let Some(reasoning_content) = propagated_reasoning {
             assistant_message.insert_extra_string("reasoning_content", reasoning_content);
         }
@@ -337,7 +350,7 @@ impl Agent {
         config: &AgentConfig,
     ) -> Vec<(
         GeneralToolCall,
-        Option<Result<ChatCompletionRequestMessage, LLMYError>>,
+        Option<Result<ChatCompletionRequestMessageRaw, LLMYError>>,
     )> {
         if config.sequential_tool_call {
             self.tools.agent_invoke_many_sequential(calls).await
@@ -479,13 +492,13 @@ impl Agent {
 
     fn did_write_memory(&self) -> bool {
         self.context.iter().any(|message| match &message.inner {
-            ChatCompletionRequestMessage::Assistant(assistant) => {
+            ChatCompletionRequestMessageRaw::Assistant(assistant) => {
                 assistant.tool_calls.as_ref().is_some_and(|tool_calls| {
-                    tool_calls.iter().any(|tool_call| match tool_call {
-                        ChatCompletionMessageToolCalls::Function(function) => {
+                    tool_calls.iter().any(|tool_call| match &tool_call.inner {
+                        ChatCompletionMessageToolCallsRaw::Function(function) => {
                             is_memory_write_tool(function.function.name.as_str())
                         }
-                        ChatCompletionMessageToolCalls::Custom(custom) => {
+                        ChatCompletionMessageToolCallsRaw::Custom(custom) => {
                             is_memory_write_tool(custom.custom_tool.name.as_str())
                         }
                     })
@@ -496,11 +509,13 @@ impl Agent {
     }
 }
 
-fn propagated_reasoning_content(
-    choice: &llmy_client::client::RawExtensibleChatChoice,
-) -> Option<String> {
+fn propagated_reasoning_content(choice: &ChatChoice) -> Option<String> {
     choice
-        .reasoning_content()
+        .inner
+        .message
+        .other
+        .get("reasoning_content")?
+        .as_str()
         .filter(|reasoning_content| !reasoning_content.trim().is_empty())
         .map(|reasoning_content| reasoning_content.to_string())
 }
@@ -873,7 +888,7 @@ mod tests {
 
         assert_eq!(compacted.context.len(), 1);
         match &compacted.context[0].inner {
-            ChatCompletionRequestMessage::User(user) => {
+            ChatCompletionRequestMessageRaw::User(user) => {
                 assert_eq!(
                     user.content,
                     ChatCompletionRequestUserMessageContent::Text(

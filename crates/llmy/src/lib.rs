@@ -116,7 +116,12 @@ pub mod tokenizer {
 /// Common llmy error type shared across agent, tool, and client layers.
 pub use llmy_types::error::LLMYError;
 
-/// Raw `async-openai` re-export for callers that need direct protocol-level types.
+/// Raw `async-openai` re-export, kept only for transport plumbing (`Client`,
+/// `OpenAIConfig`, `AzureConfig`, errors). All chat-completion request/response
+/// types are now mirrored under [`client::req`] and [`client::resp`] with
+/// `WithOtherFields` wrappers, so unknown JSON fields (e.g. provider extras
+/// such as Gemini's `thought_signature`) are preserved on every round trip.
+/// New code should prefer the mirrored types over anything from this module.
 pub mod openai {
     pub use async_openai::*;
 }

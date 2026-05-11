@@ -7,7 +7,6 @@ use std::{
 
 use tokio::io::AsyncWriteExt;
 
-use async_openai::types::chat::CreateChatCompletionRequest;
 use color_eyre::eyre::eyre;
 use itertools::Itertools;
 use llmy_types::error::LLMYError;
@@ -17,40 +16,41 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions},
 };
 
-use async_openai::types::chat::{
-    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageContent,
-    ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestDeveloperMessageContent,
-    ChatCompletionRequestDeveloperMessageContentPart, ChatCompletionRequestMessage,
-    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
-    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
-    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionResponseMessage, ChatCompletionTools,
-};
-
 use crate::billing::ModelBilling;
-use crate::req::RawExtensibleChatCompletionRequest;
-use crate::resp::RawExtensibleChatCompletionResponse;
+use crate::req::{
+    ChatCompletionMessageToolCalls, ChatCompletionMessageToolCallsRaw,
+    ChatCompletionRequestAssistantMessageContent,
+    ChatCompletionRequestAssistantMessageContentPartRaw,
+    ChatCompletionRequestDeveloperMessageContent,
+    ChatCompletionRequestDeveloperMessageContentPartRaw, ChatCompletionRequestMessage,
+    ChatCompletionRequestMessageRaw, ChatCompletionRequestSystemMessageContent,
+    ChatCompletionRequestSystemMessageContentPartRaw, ChatCompletionRequestToolMessageContent,
+    ChatCompletionRequestToolMessageContentPartRaw, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPartRaw, ChatCompletionToolsRaw,
+    CreateChatCompletionRequestRaw, RawExtensibleChatCompletionRequest,
+};
+use crate::resp::{ChatCompletionResponseMessage, RawExtensibleChatCompletionResponse};
 
 pub fn completion_to_role(msg: &ChatCompletionRequestMessage) -> &'static str {
-    match msg {
-        ChatCompletionRequestMessage::Assistant(_) => "ASSISTANT",
-        ChatCompletionRequestMessage::Developer(_) => "DEVELOPER",
-        ChatCompletionRequestMessage::Function(_) => "FUNCTION",
-        ChatCompletionRequestMessage::System(_) => "SYSTEM",
-        ChatCompletionRequestMessage::Tool(_) => "TOOL",
-        ChatCompletionRequestMessage::User(_) => "USER",
+    match &msg.inner {
+        ChatCompletionRequestMessageRaw::Assistant(_) => "ASSISTANT",
+        ChatCompletionRequestMessageRaw::Developer(_) => "DEVELOPER",
+        ChatCompletionRequestMessageRaw::Function(_) => "FUNCTION",
+        ChatCompletionRequestMessageRaw::System(_) => "SYSTEM",
+        ChatCompletionRequestMessageRaw::Tool(_) => "TOOL",
+        ChatCompletionRequestMessageRaw::User(_) => "USER",
     }
 }
 
 pub fn toolcall_to_string(t: &ChatCompletionMessageToolCalls) -> String {
-    match t {
-        ChatCompletionMessageToolCalls::Function(t) => {
+    match &t.inner {
+        ChatCompletionMessageToolCallsRaw::Function(t) => {
             format!(
                 "<toolcall name=\"{}\">\n{}\n</toolcall>",
                 &t.function.name, &t.function.arguments
             )
         }
-        ChatCompletionMessageToolCalls::Custom(t) => {
+        ChatCompletionMessageToolCallsRaw::Custom(t) => {
             format!(
                 "<customtoolcall name=\"{}\">\n{}\n</customtoolcall>",
                 &t.custom_tool.name, &t.custom_tool.input
@@ -75,17 +75,18 @@ pub fn response_to_string(resp: &ChatCompletionResponseMessage) -> String {
         s += "\n";
     }
 
-    let role = resp.role.to_string().to_uppercase();
+    let role = format!("{:?}", resp.role).to_uppercase();
 
     format!("<{}>\n{}\n</{}>\n", &role, s, &role)
 }
 
+#[allow(deprecated)]
 pub fn completion_to_string(msg: &ChatCompletionRequestMessage) -> String {
     const CONT: &str = "<cont/>\n";
     const NONE: &str = "<none/>\n";
     let role = completion_to_role(msg);
-    let content = match msg {
-        ChatCompletionRequestMessage::Assistant(ass) => {
+    let content = match &msg.inner {
+        ChatCompletionRequestMessageRaw::Assistant(ass) => {
             let msg = ass
                 .content
                 .as_ref()
@@ -93,11 +94,11 @@ pub fn completion_to_string(msg: &ChatCompletionRequestMessage) -> String {
                     ChatCompletionRequestAssistantMessageContent::Text(s) => s.clone(),
                     ChatCompletionRequestAssistantMessageContent::Array(arr) => arr
                         .iter()
-                        .map(|v| match v {
-                            ChatCompletionRequestAssistantMessageContentPart::Text(s) => {
+                        .map(|v| match &v.inner {
+                            ChatCompletionRequestAssistantMessageContentPartRaw::Text(s) => {
                                 s.text.clone()
                             }
-                            ChatCompletionRequestAssistantMessageContentPart::Refusal(rf) => {
+                            ChatCompletionRequestAssistantMessageContentPartRaw::Refusal(rf) => {
                                 rf.refusal.clone()
                             }
                         })
@@ -112,47 +113,49 @@ pub fn completion_to_string(msg: &ChatCompletionRequestMessage) -> String {
                 .join("\n");
             format!("{}\n{}", msg, tool_calls)
         }
-        ChatCompletionRequestMessage::Developer(dev) => match &dev.content {
+        ChatCompletionRequestMessageRaw::Developer(dev) => match &dev.content {
             ChatCompletionRequestDeveloperMessageContent::Text(t) => t.clone(),
             ChatCompletionRequestDeveloperMessageContent::Array(arr) => arr
                 .iter()
-                .map(|v| match v {
-                    ChatCompletionRequestDeveloperMessageContentPart::Text(v) => v.text.clone(),
+                .map(|v| match &v.inner {
+                    ChatCompletionRequestDeveloperMessageContentPartRaw::Text(v) => v.text.clone(),
                 })
                 .join(CONT),
         },
-        ChatCompletionRequestMessage::Function(f) => f.content.clone().unwrap_or(NONE.to_string()),
-        ChatCompletionRequestMessage::System(sys) => match &sys.content {
+        ChatCompletionRequestMessageRaw::Function(f) => {
+            f.content.clone().unwrap_or(NONE.to_string())
+        }
+        ChatCompletionRequestMessageRaw::System(sys) => match &sys.content {
             ChatCompletionRequestSystemMessageContent::Text(t) => t.clone(),
             ChatCompletionRequestSystemMessageContent::Array(arr) => arr
                 .iter()
-                .map(|v| match v {
-                    ChatCompletionRequestSystemMessageContentPart::Text(t) => t.text.clone(),
+                .map(|v| match &v.inner {
+                    ChatCompletionRequestSystemMessageContentPartRaw::Text(t) => t.text.clone(),
                 })
                 .join(CONT),
         },
-        ChatCompletionRequestMessage::Tool(tool) => match &tool.content {
+        ChatCompletionRequestMessageRaw::Tool(tool) => match &tool.content {
             ChatCompletionRequestToolMessageContent::Text(t) => t.clone(),
             ChatCompletionRequestToolMessageContent::Array(arr) => arr
                 .iter()
-                .map(|v| match v {
-                    ChatCompletionRequestToolMessageContentPart::Text(t) => t.text.clone(),
+                .map(|v| match &v.inner {
+                    ChatCompletionRequestToolMessageContentPartRaw::Text(t) => t.text.clone(),
                 })
                 .join(CONT),
         },
-        ChatCompletionRequestMessage::User(usr) => match &usr.content {
+        ChatCompletionRequestMessageRaw::User(usr) => match &usr.content {
             ChatCompletionRequestUserMessageContent::Text(t) => t.clone(),
             ChatCompletionRequestUserMessageContent::Array(arr) => arr
                 .iter()
-                .map(|v| match v {
-                    ChatCompletionRequestUserMessageContentPart::Text(t) => t.text.clone(),
-                    ChatCompletionRequestUserMessageContentPart::ImageUrl(img) => {
+                .map(|v| match &v.inner {
+                    ChatCompletionRequestUserMessageContentPartRaw::Text(t) => t.text.clone(),
+                    ChatCompletionRequestUserMessageContentPartRaw::ImageUrl(img) => {
                         format!("<img url=\"{}\"/>", &img.image_url.url)
                     }
-                    ChatCompletionRequestUserMessageContentPart::InputAudio(audio) => {
+                    ChatCompletionRequestUserMessageContentPartRaw::InputAudio(audio) => {
                         format!("<audio>{}</audio>", audio.input_audio.data)
                     }
-                    ChatCompletionRequestUserMessageContentPart::File(f) => {
+                    ChatCompletionRequestUserMessageContentPartRaw::File(f) => {
                         format!("<file>{:?}</file>", f)
                     }
                 })
@@ -221,8 +224,8 @@ pub(crate) async fn save_llm_user(
         .into_iter()
         .flatten()
     {
-        let s = match tool {
-            ChatCompletionTools::Function(tool) => {
+        let s = match &tool.inner {
+            ChatCompletionToolsRaw::Function(tool) => {
                 format!(
                     "<tool name=\"{}\", description=\"{}\", strict={}>\n{}\n</tool>",
                     &tool.function.name,
@@ -236,7 +239,7 @@ pub(crate) async fn save_llm_user(
                         .unwrap_or_default()
                 )
             }
-            ChatCompletionTools::Custom(tool) => {
+            ChatCompletionToolsRaw::Custom(tool) => {
                 format!(
                     "<customtool name=\"{}\", description=\"{:?}\"></customtool>",
                     tool.custom.name, tool.custom.description
@@ -287,29 +290,30 @@ pub(crate) async fn save_llm_resp(
 /// Extract raw text from a chat completion request for token estimation.
 /// Text content is extracted as-is; tool calls and tool definitions are
 /// serialized to JSON so their token cost is still approximated.
-pub fn extract_raw_text(req: &CreateChatCompletionRequest) -> String {
+#[allow(deprecated)]
+pub fn extract_raw_text(req: &CreateChatCompletionRequestRaw) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     for msg in &req.messages {
-        match msg {
-            ChatCompletionRequestMessage::System(sys) => match &sys.content {
+        match &msg.inner {
+            ChatCompletionRequestMessageRaw::System(sys) => match &sys.content {
                 ChatCompletionRequestSystemMessageContent::Text(t) => parts.push(t.clone()),
                 ChatCompletionRequestSystemMessageContent::Array(arr) => {
                     for p in arr {
-                        match p {
-                            ChatCompletionRequestSystemMessageContentPart::Text(t) => {
+                        match &p.inner {
+                            ChatCompletionRequestSystemMessageContentPartRaw::Text(t) => {
                                 parts.push(t.text.clone())
                             }
                         }
                     }
                 }
             },
-            ChatCompletionRequestMessage::User(usr) => match &usr.content {
+            ChatCompletionRequestMessageRaw::User(usr) => match &usr.content {
                 ChatCompletionRequestUserMessageContent::Text(t) => parts.push(t.clone()),
                 ChatCompletionRequestUserMessageContent::Array(arr) => {
                     for p in arr {
-                        match p {
-                            ChatCompletionRequestUserMessageContentPart::Text(t) => {
+                        match &p.inner {
+                            ChatCompletionRequestUserMessageContentPartRaw::Text(t) => {
                                 parts.push(t.text.clone())
                             }
                             _ => {}
@@ -317,7 +321,7 @@ pub fn extract_raw_text(req: &CreateChatCompletionRequest) -> String {
                     }
                 }
             },
-            ChatCompletionRequestMessage::Assistant(ass) => {
+            ChatCompletionRequestMessageRaw::Assistant(ass) => {
                 if let Some(content) = &ass.content {
                     match content {
                         ChatCompletionRequestAssistantMessageContent::Text(t) => {
@@ -325,11 +329,11 @@ pub fn extract_raw_text(req: &CreateChatCompletionRequest) -> String {
                         }
                         ChatCompletionRequestAssistantMessageContent::Array(arr) => {
                             for p in arr {
-                                match p {
-                                    ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
-                                        parts.push(t.text.clone())
-                                    }
-                                    ChatCompletionRequestAssistantMessageContentPart::Refusal(
+                                match &p.inner {
+                                    ChatCompletionRequestAssistantMessageContentPartRaw::Text(
+                                        t,
+                                    ) => parts.push(t.text.clone()),
+                                    ChatCompletionRequestAssistantMessageContentPartRaw::Refusal(
                                         r,
                                     ) => parts.push(r.refusal.clone()),
                                 }
@@ -345,31 +349,31 @@ pub fn extract_raw_text(req: &CreateChatCompletionRequest) -> String {
                     }
                 }
             }
-            ChatCompletionRequestMessage::Tool(tool) => match &tool.content {
+            ChatCompletionRequestMessageRaw::Tool(tool) => match &tool.content {
                 ChatCompletionRequestToolMessageContent::Text(t) => parts.push(t.clone()),
                 ChatCompletionRequestToolMessageContent::Array(arr) => {
                     for p in arr {
-                        match p {
-                            ChatCompletionRequestToolMessageContentPart::Text(t) => {
+                        match &p.inner {
+                            ChatCompletionRequestToolMessageContentPartRaw::Text(t) => {
                                 parts.push(t.text.clone())
                             }
                         }
                     }
                 }
             },
-            ChatCompletionRequestMessage::Developer(dev) => match &dev.content {
+            ChatCompletionRequestMessageRaw::Developer(dev) => match &dev.content {
                 ChatCompletionRequestDeveloperMessageContent::Text(t) => parts.push(t.clone()),
                 ChatCompletionRequestDeveloperMessageContent::Array(arr) => {
                     for p in arr {
-                        match p {
-                            ChatCompletionRequestDeveloperMessageContentPart::Text(t) => {
+                        match &p.inner {
+                            ChatCompletionRequestDeveloperMessageContentPartRaw::Text(t) => {
                                 parts.push(t.text.clone())
                             }
                         }
                     }
                 }
             },
-            ChatCompletionRequestMessage::Function(f) => {
+            ChatCompletionRequestMessageRaw::Function(f) => {
                 if let Some(c) = &f.content {
                     parts.push(c.clone());
                 }
@@ -391,11 +395,11 @@ pub fn extract_raw_text(req: &CreateChatCompletionRequest) -> String {
 /// Per-request metadata that is recorded on the debug row and is not derivable
 /// from the chat completion request alone.
 #[derive(Debug, Clone)]
-pub struct DebugRowContext<'a> {
-    pub model_name: &'a str,
-    pub endpoint: &'a str,
-    pub azure_deployment: Option<&'a str>,
-    pub cache_key: Option<&'a str>,
+pub struct DebugRowContext {
+    pub model_name: String,
+    pub endpoint: String,
+    pub azure_deployment: Option<String>,
+    pub cache_key: Option<String>,
     pub cap_usd: f64,
 }
 
@@ -728,7 +732,7 @@ impl Sqlite3DebugDB {
     async fn insert_request(
         &self,
         debug_prefix: &str,
-        ctx: &DebugRowContext<'_>,
+        ctx: &DebugRowContext,
         req: &RawExtensibleChatCompletionRequest,
     ) -> Result<i64, LLMYError> {
         let raw_req = serde_json::to_string(req)?;
@@ -747,10 +751,10 @@ impl Sqlite3DebugDB {
         )
         .bind(client_id)
         .bind(debug_prefix)
-        .bind(ctx.model_name)
-        .bind(ctx.endpoint)
-        .bind(ctx.azure_deployment)
-        .bind(ctx.cache_key)
+        .bind(&ctx.model_name)
+        .bind(&ctx.endpoint)
+        .bind(ctx.azure_deployment.as_deref())
+        .bind(ctx.cache_key.as_deref())
         .bind(raw_req)
         .bind(full_conversation)
         .bind(0.0_f64)
@@ -889,7 +893,7 @@ impl DebugBackend {
     pub async fn start(
         &self,
         debug_prefix: &str,
-        ctx: DebugRowContext<'_>,
+        ctx: DebugRowContext,
         req: &RawExtensibleChatCompletionRequest,
     ) -> Option<DebugHandle> {
         match self {
@@ -1003,48 +1007,49 @@ fn format_full_conversation(
 #[allow(deprecated)]
 mod sqlite_tests {
     use super::*;
-    use async_openai::types::chat::{
-        ChatChoice, ChatCompletionRequestUserMessageArgs, ChatCompletionResponseMessage,
-        CreateChatCompletionRequestArgs, CreateChatCompletionResponse, Role,
+    use crate::req::{ChatCompletionRequestMessageRaw, ChatCompletionRequestUserMessageRaw, Role};
+    use crate::resp::{
+        ChatChoiceRaw, ChatCompletionResponseMessageRaw, CreateChatCompletionResponseRaw,
     };
+    use llmy_types::other::WithOtherFields;
 
     fn dummy_req() -> RawExtensibleChatCompletionRequest {
-        let user = ChatCompletionRequestUserMessageArgs::default()
-            .content("hello")
-            .build()
-            .unwrap();
-        let raw = CreateChatCompletionRequestArgs::default()
-            .messages(vec![user.into()])
-            .model("gpt-test")
-            .build()
-            .unwrap();
-        RawExtensibleChatCompletionRequest::from(raw)
+        let user = ChatCompletionRequestMessageRaw::User(
+            ChatCompletionRequestUserMessageRaw::new_text("hello"),
+        );
+        let mut raw = CreateChatCompletionRequestRaw::default();
+        raw.model = "gpt-test".to_string();
+        raw.messages = vec![WithOtherFields::new(user)];
+        RawExtensibleChatCompletionRequest::new(raw)
     }
 
     fn dummy_resp() -> RawExtensibleChatCompletionResponse {
-        RawExtensibleChatCompletionResponse::new(CreateChatCompletionResponse {
+        let message = WithOtherFields::new(ChatCompletionResponseMessageRaw {
+            content: Some("world".to_string()),
+            refusal: None,
+            tool_calls: None,
+            annotations: None,
+            role: Role::Assistant,
+            function_call: None,
+            audio: None,
+        });
+        let choice = WithOtherFields::new(ChatChoiceRaw {
+            index: 0,
+            message,
+            finish_reason: None,
+            logprobs: None,
+        });
+        let raw = CreateChatCompletionResponseRaw {
             id: "test".to_string(),
-            choices: vec![ChatChoice {
-                index: 0,
-                message: ChatCompletionResponseMessage {
-                    content: Some("world".to_string()),
-                    refusal: None,
-                    tool_calls: None,
-                    annotations: None,
-                    role: Role::Assistant,
-                    function_call: None,
-                    audio: None,
-                },
-                finish_reason: None,
-                logprobs: None,
-            }],
+            choices: vec![choice],
             created: 1,
             model: "gpt-test".to_string(),
             service_tier: None,
             system_fingerprint: None,
             object: "chat.completion".to_string(),
             usage: None,
-        })
+        };
+        RawExtensibleChatCompletionResponse::new(raw)
     }
 
     #[tokio::test]
@@ -1063,10 +1068,10 @@ mod sqlite_tests {
 
         let req = dummy_req();
         let ctx = DebugRowContext {
-            model_name: "gpt-test",
-            endpoint: "openai",
+            model_name: "gpt-test".to_string(),
+            endpoint: "openai".to_string(),
             azure_deployment: None,
-            cache_key: Some("cache-key-1"),
+            cache_key: Some("cache-key-1".to_string()),
             cap_usd: 10.0,
         };
         let id = db.insert_request("test", &ctx, &req).await.unwrap();

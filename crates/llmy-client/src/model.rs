@@ -2,30 +2,75 @@ use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub use llmy_tokenizer::{ModelConfig, ModelPricing, ModelTokens};
+pub use llmy_tokenizer::{ModelConfig, ModelId, ModelPricing, ModelTokens};
 
 #[derive(Debug, Clone)]
 pub struct OpenAIModel {
-    model_id: String, // TODO: Have enum?
+    model_id: ModelId,
     pub config: ModelConfig,
+    /// When true, the wire/`Display` form is the canonical `owner/name` id
+    /// (e.g. `"openai/gpt-5.4-mini"`) instead of the bare `name`. Aggregators
+    /// like OpenRouter expect this form.
+    use_full_id: bool,
 }
 
 impl OpenAIModel {
-    pub fn model_id(&self) -> &str {
+    /// The strongly-typed model identifier.
+    pub fn model_id(&self) -> &ModelId {
         &self.model_id
     }
 
+    /// Canonical id string (e.g. `"google/gemini-3.1-pro-preview"`).
+    pub fn model_id_str(&self) -> &str {
+        self.model_id.as_str()
+    }
+
+    /// Bare model name (the part after `owner/`). E.g. `"gpt-4o"`.
+    pub fn model_name(&self) -> &str {
+        &self.config.model_name
+    }
+
+    /// Vendor / namespace prefix (e.g. `Some("google")`).
+    pub fn owner(&self) -> Option<&str> {
+        self.config.owner.as_deref()
+    }
+
     pub fn is_mimo(&self) -> bool {
-        self.model_id.starts_with("mimo/")
-            || self
-                .model_id
-                .rsplit('/')
-                .next()
-                .is_some_and(|name| name.starts_with("mimo-"))
+        self.owner() == Some("mimo")
     }
 
     pub fn is_google(&self) -> bool {
-        self.model_id.starts_with("google/")
+        self.owner() == Some("google")
+    }
+
+    /// Whether outgoing chat-completion requests send the canonical
+    /// `owner/name` id (e.g. for OpenRouter) instead of the bare model name.
+    pub fn use_full_id(&self) -> bool {
+        self.use_full_id
+    }
+
+    /// Toggle whether outgoing chat-completion requests send the canonical
+    /// `owner/name` id or the bare model name. Display/serialization is
+    /// unaffected — they always emit the canonical id.
+    pub fn with_full_id(mut self, flag: bool) -> Self {
+        self.use_full_id = flag;
+        self
+    }
+
+    /// In-place equivalent of [`Self::with_full_id`].
+    pub fn set_full_id(&mut self, flag: bool) {
+        self.use_full_id = flag;
+    }
+
+    /// The identifier to send in the `model` field of a chat-completion
+    /// request. Defaults to the bare name; switches to the canonical
+    /// `owner/name` id when [`Self::use_full_id`] is set.
+    pub fn api_model_name(&self) -> &str {
+        if self.use_full_id {
+            self.model_id_str()
+        } else {
+            self.model_name()
+        }
     }
 
     /// Per-token USD pricing. Returns zero pricing if unavailable.
@@ -45,8 +90,10 @@ impl OpenAIModel {
 
 impl fmt::Display for OpenAIModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = self.model_id.rsplit('/').next().unwrap_or(&self.model_id);
-        f.write_str(name)
+        // Display is always the canonical `owner/name` id, independent of the
+        // wire-format toggle. Use [`Self::api_model_name`] for the value to put
+        // in an outgoing chat-completion request.
+        f.write_str(self.model_id_str())
     }
 }
 
@@ -105,50 +152,62 @@ impl FromStr for OpenAIModel {
 
             if let Some((model_id, mut config)) = find_registered_model(name.trim()) {
                 config.pricing = Some(pricing);
-                return Ok(Self { model_id, config });
+                return Ok(Self {
+                    model_id,
+                    config,
+                    use_full_id: false,
+                });
             }
 
-            let name = name.trim().to_string();
-            return Ok(Self {
-                model_id: name.clone(),
-                config: ModelConfig {
-                    encoding: "o200k_base".to_string(),
-                    tokens: ModelTokens::default(),
-                    name,
-                    max_input_tokens: 0,
-                    max_tokens: 0,
-                    pricing: Some(pricing),
-                },
-            });
+            return Ok(custom_model(name.trim(), Some(pricing)));
         }
 
         // Case-insensitive match against registry model short names
         if let Some((model_id, config)) = find_registered_model(s) {
-            return Ok(Self { model_id, config });
+            return Ok(Self {
+                model_id,
+                config,
+                use_full_id: false,
+            });
         }
 
         // Unknown model, zero pricing
         tracing::info!("No valid model detected for {}, assume not billed", s);
-        Ok(Self {
-            model_id: s.to_string(),
-            config: ModelConfig {
-                encoding: "o200k_base".to_string(),
-                tokens: ModelTokens::default(),
-                name: s.to_string(),
-                max_input_tokens: 0,
-                max_tokens: 0,
-                pricing: None,
-            },
-        })
+        Ok(custom_model(s, None))
     }
 }
 
-fn find_registered_model(name: &str) -> Option<(String, ModelConfig)> {
-    for (id, config) in llmy_tokenizer::models() {
-        let short = id.rsplit('/').next().unwrap_or(id);
-        if id == &name || short.eq_ignore_ascii_case(name) || config.name.eq_ignore_ascii_case(name)
+fn custom_model(s: &str, pricing: Option<ModelPricing>) -> OpenAIModel {
+    let (owner, model_name) = match s.split_once('/') {
+        Some((owner, name)) => (Some(owner.to_string()), name.to_string()),
+        None => (None, s.to_string()),
+    };
+    OpenAIModel {
+        model_id: ModelId::Custom(s.to_string()),
+        config: ModelConfig {
+            owner,
+            model_name: model_name.clone(),
+            encoding: "o200k_base".to_string(),
+            tokens: ModelTokens::default(),
+            name: model_name,
+            max_input_tokens: 0,
+            max_tokens: 0,
+            pricing,
+        },
+        use_full_id: false,
+    }
+}
+
+fn find_registered_model(name: &str) -> Option<(ModelId, ModelConfig)> {
+    for id in ModelId::ALL_KNOWN {
+        let canonical = id.as_str();
+        let short = id.model_name();
+        let config = id.to_model_config()?;
+        if canonical == name
+            || short.eq_ignore_ascii_case(name)
+            || config.name.eq_ignore_ascii_case(name)
         {
-            return Some((id.to_string(), config.clone()));
+            return Some((id.clone(), config));
         }
     }
 
@@ -168,7 +227,9 @@ mod tests {
         let model = OpenAIModel::from_str("DeepSeek V4 Flash,0.5,1.5,0.1").unwrap();
         let pricing = model.pricing();
 
-        assert_eq!(model.model_id(), "deepseek/deepseek-v4-flash");
+        assert_eq!(model.model_id_str(), "deepseek/deepseek-v4-flash");
+        assert_eq!(model.owner(), Some("deepseek"));
+        assert_eq!(model.model_name(), "deepseek-v4-flash");
         assert_eq!(model.config.max_input_tokens, 655360);
         assert_eq!(model.config.max_tokens, 393216);
         assert_close(pricing.input, 5e-07);
@@ -181,10 +242,66 @@ mod tests {
         let model = OpenAIModel::from_str("custom-model,2,4").unwrap();
         let pricing = model.pricing();
 
-        assert_eq!(model.model_id(), "custom-model");
+        assert_eq!(model.model_id_str(), "custom-model");
+        assert!(matches!(model.model_id(), ModelId::Custom(_)));
+        assert_eq!(model.owner(), None);
+        assert_eq!(model.model_name(), "custom-model");
         assert_eq!(model.config.max_input_tokens, 0);
         assert_eq!(model.config.max_tokens, 0);
         assert_close(pricing.input, 2e-06);
         assert_close(pricing.output, 4e-06);
+    }
+
+    #[test]
+    fn unknown_qualified_model_splits_owner_and_name() {
+        let model = OpenAIModel::from_str("openrouter/some-foo").unwrap();
+        assert_eq!(model.model_id_str(), "openrouter/some-foo");
+        assert_eq!(model.owner(), Some("openrouter"));
+        assert_eq!(model.model_name(), "some-foo");
+    }
+
+    #[test]
+    fn custom_pricing_qualified_unknown_splits_owner_and_name() {
+        let model = OpenAIModel::from_str("openrouter/some-foo,1,2").unwrap();
+        assert_eq!(model.model_id_str(), "openrouter/some-foo");
+        assert_eq!(model.owner(), Some("openrouter"));
+        assert_eq!(model.model_name(), "some-foo");
+    }
+
+    #[test]
+    fn display_always_emits_canonical_id() {
+        let model = OpenAIModel::from_str("openai/gpt-4o").unwrap();
+        assert!(!model.use_full_id());
+        // Display is the canonical id regardless of the wire-format toggle.
+        assert_eq!(model.to_string(), "openai/gpt-4o");
+        let serialized = serde_json::to_string(&model).unwrap();
+        assert_eq!(serialized, "\"openai/gpt-4o\"");
+    }
+
+    #[test]
+    fn api_model_name_defaults_to_bare_name() {
+        let model = OpenAIModel::from_str("openai/gpt-4o").unwrap();
+        assert_eq!(model.api_model_name(), "gpt-4o");
+    }
+
+    #[test]
+    fn api_model_name_with_full_id_uses_canonical_form() {
+        let model = OpenAIModel::from_str("openai/gpt-4o")
+            .unwrap()
+            .with_full_id(true);
+        assert!(model.use_full_id());
+        assert_eq!(model.api_model_name(), "openai/gpt-4o");
+        // Display is unaffected by the toggle.
+        assert_eq!(model.to_string(), "openai/gpt-4o");
+    }
+
+    #[test]
+    fn api_model_name_is_inert_for_unqualified_custom_models() {
+        // A bare custom name has no owner; both forms collapse to the same string.
+        let model = OpenAIModel::from_str("custom-model,2,4")
+            .unwrap()
+            .with_full_id(true);
+        assert_eq!(model.api_model_name(), "custom-model");
+        assert_eq!(model.to_string(), "custom-model");
     }
 }

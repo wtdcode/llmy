@@ -1,6 +1,5 @@
 pub fn run_models() -> color_eyre::Result<()> {
-    let models = llmy_tokenizer::models();
-    let mut entries: Vec<_> = models.iter().collect();
+    let mut entries = llmy_tokenizer::models();
     entries.sort_by_key(|(id, _)| *id);
 
     println!(

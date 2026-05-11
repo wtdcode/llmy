@@ -1,13 +1,15 @@
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use async_openai::types::chat::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, FinishReason, FunctionCall,
-};
+use llmy_types::other::WithOtherFields;
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use crate::{req::RawExtensibleChatCompletionRequest, resp::RawExtensibleChatCompletionResponse};
+use crate::req::{
+    ChatCompletionMessageToolCallRaw, ChatCompletionMessageToolCalls,
+    ChatCompletionMessageToolCallsRaw, FunctionCallRaw, RawExtensibleChatCompletionRequest,
+};
+use crate::resp::{FinishReason, RawExtensibleChatCompletionResponse};
 
 pub trait OpenAIContentFilter: Send + Sync + Debug {
     fn filter_input(&self, _req: &mut RawExtensibleChatCompletionRequest) {}
@@ -78,14 +80,15 @@ impl MiMoContentFilter {
                 }
                 let arguments = serde_json::to_string(&args).ok()?;
                 let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-                tool_calls.push(ChatCompletionMessageToolCalls::Function(
-                    ChatCompletionMessageToolCall {
-                        id: format!("salvage-{}", id),
-                        function: FunctionCall {
-                            name: name.to_string(),
-                            arguments,
-                        },
-                    },
+                let tool_call = WithOtherFields::new(ChatCompletionMessageToolCallRaw {
+                    id: format!("salvage-{}", id),
+                    function: WithOtherFields::new(FunctionCallRaw {
+                        name: name.to_string(),
+                        arguments,
+                    }),
+                });
+                tool_calls.push(WithOtherFields::new(
+                    ChatCompletionMessageToolCallsRaw::Function(tool_call),
                 ));
             }
         }
@@ -167,7 +170,7 @@ mod tests {
         assert!(choice.message.content.is_none());
         let tcs = choice.message.tool_calls.as_ref().unwrap();
         assert_eq!(tcs.len(), 1);
-        let ChatCompletionMessageToolCalls::Function(tc) = &tcs[0] else {
+        let ChatCompletionMessageToolCallsRaw::Function(tc) = &tcs[0].inner else {
             panic!("expected function tool call");
         };
         assert_eq!(tc.function.name, "read_file");
@@ -204,8 +207,8 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .iter()
-                .map(|tc| match tc {
-                    ChatCompletionMessageToolCalls::Function(f) => f.id.clone(),
+                .map(|tc| match &tc.inner {
+                    ChatCompletionMessageToolCallsRaw::Function(f) => f.id.clone(),
                     _ => panic!("expected function"),
                 })
                 .collect()
@@ -259,8 +262,8 @@ mod tests {
             resp.choices[0].message.tool_calls.as_ref().unwrap().len(),
             1
         );
-        let ChatCompletionMessageToolCalls::Function(tc) =
-            &resp.choices[0].message.tool_calls.as_ref().unwrap()[0]
+        let ChatCompletionMessageToolCallsRaw::Function(tc) =
+            &resp.choices[0].message.tool_calls.as_ref().unwrap()[0].inner
         else {
             panic!("expected function");
         };

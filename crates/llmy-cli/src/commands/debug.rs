@@ -4,6 +4,7 @@ use chrono::{DateTime, Local};
 use clap::Args;
 use color_eyre::eyre::eyre;
 use llmy_client::debug::{LLMDebugRow, Sqlite3DebugDB};
+use serde::Serialize;
 
 fn format_timestamp(ts: i64) -> String {
     DateTime::from_timestamp(ts, 0)
@@ -163,33 +164,48 @@ fn build_conversation_xml(row: &LLMDebugRow) -> String {
     s
 }
 
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+enum JsonlEntry {
+    Request(serde_json::Value),
+    Response(serde_json::Value),
+    Billing(BillingEntry),
+}
+
+#[derive(Serialize)]
+struct BillingEntry {
+    input_without_cached_tokens: Option<i64>,
+    cached_tokens: Option<i64>,
+    output_without_reasoning_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+    current_usage_usd: f64,
+    cap_usd: f64,
+}
+
 fn build_jsonl(row: &LLMDebugRow) -> color_eyre::Result<String> {
     let req: serde_json::Value = serde_json::from_str(&row.raw_req)?;
     let resp: serde_json::Value = match row.raw_resp.as_deref() {
         Some(s) => serde_json::from_str(s)?,
         None => serde_json::Value::Null,
     };
-    let billing = serde_json::json!({
-        "input_without_cached_tokens": row.input_without_cached_tokens,
-        "cached_tokens": row.cached_tokens,
-        "output_without_reasoning_tokens": row.output_without_reasoning_tokens,
-        "reasoning_tokens": row.reasoning_tokens,
-        "current_usage_usd": row.current_usage_usd,
-        "cap_usd": row.cap_usd,
-    });
+    let entries = [
+        JsonlEntry::Request(req),
+        JsonlEntry::Response(resp),
+        JsonlEntry::Billing(BillingEntry {
+            input_without_cached_tokens: row.input_without_cached_tokens,
+            cached_tokens: row.cached_tokens,
+            output_without_reasoning_tokens: row.output_without_reasoning_tokens,
+            reasoning_tokens: row.reasoning_tokens,
+            current_usage_usd: row.current_usage_usd,
+            cap_usd: row.cap_usd,
+        }),
+    ];
+
     let mut out = String::new();
-    out.push_str(&serde_json::to_string(
-        &serde_json::json!({"kind": "request", "data": req}),
-    )?);
-    out.push('\n');
-    out.push_str(&serde_json::to_string(
-        &serde_json::json!({"kind": "response", "data": resp}),
-    )?);
-    out.push('\n');
-    out.push_str(&serde_json::to_string(
-        &serde_json::json!({"kind": "billing", "data": billing}),
-    )?);
-    out.push('\n');
+    for entry in &entries {
+        out.push_str(&serde_json::to_string(entry)?);
+        out.push('\n');
+    }
     Ok(out)
 }
 

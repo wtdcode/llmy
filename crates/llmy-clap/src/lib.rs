@@ -31,6 +31,17 @@ macro_rules! make_openai_args {
             #[arg(long, env = concat!($prefix,"OPENAI_API_MODEL"))]
             pub model: Option<OpenAIModel>,
 
+            /// Send the canonical `owner/name` model id (e.g. `openai/gpt-5.4-mini`)
+            /// in chat completion requests instead of the bare model name.
+            /// Required for aggregators like OpenRouter.
+            #[arg(
+                long,
+                env = concat!($prefix, "LLM_FULL_MODEL_NAME"),
+                default_value_t = false,
+                value_parser = clap::builder::BoolishValueParser::new()
+            )]
+            pub use_full_model_id: bool,
+
             /// Where to dump LLM interaction logs. A directory path enables the
             /// folder backend (one xml/json pair per request); a value starting
             /// with `sqlite3://` or ending in `sqlite3` enables the SQLite
@@ -91,13 +102,21 @@ macro_rules! make_openai_args {
 
             pub fn to_config(&self) -> SupportedConfig {
                 if let Some(ep) = self.azure_openai_endpoint.as_ref() {
+                    // Azure deployment names are user-chosen and almost never
+                    // contain `/`; fall back to the bare model name, not the
+                    // canonical `owner/name` form.
+                    let fallback_deployment = self
+                        .model
+                        .as_ref()
+                        .expect("LLM model id not given")
+                        .model_name()
+                        .to_string();
                     SupportedConfig::new_azure(
                         ep,
                         self.openai_key.clone().unwrap_or_default().as_str(),
                         self.azure_deployment
-                            .as_ref()
-                            .unwrap_or(&self.model.as_ref().expect("LLM model id not given").to_string())
-                            .as_str(),
+                            .as_deref()
+                            .unwrap_or(&fallback_deployment),
                         &self.azure_api_version
                     )
                 } else {
@@ -109,6 +128,7 @@ macro_rules! make_openai_args {
             async fn llm_new_inner(&self, model: OpenAIModel) -> Result<LLM, LLMYError> {
                 let config = self.to_config();
                 let debug_target = self.llm_debug.clone();
+                let model = model.with_full_id(self.use_full_model_id);
                 LLM::new_async(
                     config,
                     model,

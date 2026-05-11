@@ -4,11 +4,13 @@ use std::{
     str::FromStr,
 };
 
-use async_openai::types::chat::{
-    ChatCompletionNamedToolChoiceCustom, ChatCompletionToolChoiceOption, CustomName,
-    ReasoningEffort, ToolChoiceOptions,
-};
 use color_eyre::eyre::eyre;
+use llmy_types::other::WithOtherFields;
+
+use crate::req::{
+    ChatCompletionNamedToolChoiceCustomRaw, ChatCompletionToolChoiceOption,
+    ChatCompletionToolChoiceOptionRaw, CustomNameRaw, ReasoningEffort, ToolChoiceOptions,
+};
 
 #[derive(Debug, Clone)]
 pub struct LLMToolChoice(pub ChatCompletionToolChoiceOption);
@@ -16,24 +18,19 @@ pub struct LLMToolChoice(pub ChatCompletionToolChoiceOption);
 impl FromStr for LLMToolChoice {
     type Err = Infallible;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        Ok(match s {
-            "auto" => Self(ChatCompletionToolChoiceOption::Mode(
-                ToolChoiceOptions::Auto,
-            )),
-            "required" => Self(ChatCompletionToolChoiceOption::Mode(
-                ToolChoiceOptions::Required,
-            )),
-            "none" => Self(ChatCompletionToolChoiceOption::Mode(
-                ToolChoiceOptions::None,
-            )),
-            _ => Self(ChatCompletionToolChoiceOption::Custom(
-                ChatCompletionNamedToolChoiceCustom {
-                    custom: CustomName {
+        let raw = match s {
+            "auto" => ChatCompletionToolChoiceOptionRaw::Mode(ToolChoiceOptions::Auto),
+            "required" => ChatCompletionToolChoiceOptionRaw::Mode(ToolChoiceOptions::Required),
+            "none" => ChatCompletionToolChoiceOptionRaw::Mode(ToolChoiceOptions::None),
+            _ => ChatCompletionToolChoiceOptionRaw::Custom(WithOtherFields::new(
+                ChatCompletionNamedToolChoiceCustomRaw {
+                    custom: WithOtherFields::new(CustomNameRaw {
                         name: s.to_string(),
-                    },
+                    }),
                 },
             )),
-        })
+        };
+        Ok(Self(WithOtherFields::new(raw)))
     }
 }
 
