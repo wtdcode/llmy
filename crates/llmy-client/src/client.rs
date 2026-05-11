@@ -517,13 +517,14 @@ impl LLMInner {
             .map(|v| v.as_secs_f64())
             .unwrap_or_default();
         tracing::info!(
-            "Usage: {}, Speed: {:.2} tok/s",
+            "Usage: {}, Speed: {:.2} tok/s (client={:?})",
             &self.billing.read().await,
             if delta.is_normal() && delta.is_sign_positive() {
                 output_tokens as f64 / delta
             } else {
                 0.0f64
-            }
+            },
+            self.debug_backend.as_ref().map(|v| v.client_id()).flatten()
         );
         Ok(resp)
     }

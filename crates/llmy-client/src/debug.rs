@@ -874,6 +874,12 @@ pub enum DebugBackend {
 }
 
 impl DebugBackend {
+    pub fn client_id(&self) -> Option<i64> {
+        match self {
+            Self::Sqlite3(v) => v.client_id(),
+            _ => None,
+        }
+    }
     /// Detect which backend the env-style debug string is asking for and
     /// build it. Returns the backend or any I/O error encountered while
     /// preparing it.
