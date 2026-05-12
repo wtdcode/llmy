@@ -31,3 +31,12 @@ dotenvy.workspace = true
 rustyline.workspace = true
 shlex.workspace = true
 tracing-subscriber = {workspace = true, features = ["env-filter"]}
+
+[features]
+# Forwarded from `llmy-agent-tools` so the CLI binary can pick a TLS backend.
+default = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"]
+
+hf-hub-native-tls = ["llmy-agent-tools/hf-hub-native-tls"]
+hf-hub-rustls-tls = ["llmy-agent-tools/hf-hub-rustls-tls"]
+ort-download-binaries-native-tls = ["llmy-agent-tools/ort-download-binaries-native-tls"]
+ort-download-binaries-rustls-tls = ["llmy-agent-tools/ort-download-binaries-rustls-tls"]

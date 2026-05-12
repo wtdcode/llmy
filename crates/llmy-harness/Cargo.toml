@@ -19,6 +19,16 @@ llmy-agent.workspace = true
 llmy-client.workspace = true
 llmy-types.workspace = true
 
+[features]
+# Forwarded from `llmy-agent-tools` so the harness library doesn't lock
+# downstream choosers into a specific TLS backend.
+default = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"]
+
+hf-hub-native-tls = ["llmy-agent-tools/hf-hub-native-tls"]
+hf-hub-rustls-tls = ["llmy-agent-tools/hf-hub-rustls-tls"]
+ort-download-binaries-native-tls = ["llmy-agent-tools/ort-download-binaries-native-tls"]
+ort-download-binaries-rustls-tls = ["llmy-agent-tools/ort-download-binaries-rustls-tls"]
+
 [dev-dependencies]
 tempfile.workspace = true
 serde_json.workspace = true

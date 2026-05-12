@@ -257,9 +257,9 @@ dependencies = [
 
 [[package]]
 name = "avif-serialize"
-version = "0.8.8"
+version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "375082f007bd67184fb9c0374614b29f9aaa604ec301635f72338bb65386a53d"
+checksum = "e7178fe5f7d460b13895ebb9dcb28a3a6216d2df2574a0806cb51b555d297f38"
 dependencies = [
  "arrayvec",
 ]
@@ -1379,9 +1379,9 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "h2"
-version = "0.4.13"
+version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+checksum = "171fefbc92fe4a4de27e0698d6a5b392d6a0e333506bc49133760b3bcf948733"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1786,9 +1786,9 @@ dependencies = [
 
 [[package]]
 name = "imgref"
-version = "1.12.0"
+version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7c5cedc30da3a610cac6b4ba17597bdf7152cf974e8aab3afb3d54455e371c8"
+checksum = "40fac9d56ed6437b198fddba683305e8e2d651aa42647f00f5ae542e7f5c94a2"
 
 [[package]]
 name = "indenter"
@@ -2038,7 +2038,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llmy"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-openai",
  "llmy-agent",
@@ -2053,7 +2053,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-agent"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "dyn-clone",
  "llmy-agent-derive",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-agent-derive"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "heck",
  "proc-macro-crate",
@@ -2079,7 +2079,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-agent-derive-test"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "llmy",
  "llmy-agent",
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-agent-tools"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "color-eyre",
  "const_format",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-clap"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "clap",
  "llmy-client",
@@ -2119,7 +2119,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-openai",
  "chrono",
@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-client"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-openai",
  "color-eyre",
@@ -2163,7 +2163,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-harness"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-openai",
  "color-eyre",
@@ -2179,7 +2179,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-tokenizer"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -2189,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "llmy-types"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-openai",
  "color-eyre",
@@ -2424,9 +2424,9 @@ dependencies = [
 
 [[package]]
 name = "no_std_io2"
-version = "0.9.3"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b51ed7824b6e07d354605f4abb3d9d300350701299da96642ee084f5ce631550"
+checksum = "418abd1b6d34fbf6cae440dc874771b0525a604428704c76e48b29a5e67b8003"
 dependencies = [
  "memchr",
 ]
@@ -2575,15 +2575,14 @@ dependencies = [
 
 [[package]]
 name = "openssl"
-version = "0.10.78"
+version = "0.10.79"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f38c4372413cdaaf3cc79dd92d29d7d9f5ab09b51b10dded508fb90bb70b9222"
+checksum = "bf0b434746ee2832f4f0baf10137e1cabb18cbe6912c69e2e33263c45250f542"
 dependencies = [
  "bitflags",
  "cfg-if",
  "foreign-types",
  "libc",
- "once_cell",
  "openssl-macros",
  "openssl-sys",
 ]
@@ -2607,9 +2606,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "openssl-sys"
-version = "0.9.114"
+version = "0.9.115"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13ce1245cd07fcc4cfdb438f7507b0c7e4f3849a69fd84d52374c66d83741bb6"
+checksum = "158fe5b292746440aa6e7a7e690e55aeb72d41505e2804c23c6973ad0e9c9781"
 dependencies = [
  "cc",
  "libc",
@@ -2803,18 +2802,18 @@ dependencies = [
 
 [[package]]
 name = "profiling"
-version = "1.0.17"
+version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eb8486b569e12e2c32ad3e204dbaba5e4b5b216e9367044f25f1dba42341773"
+checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 dependencies = [
  "profiling-procmacros",
 ]
 
 [[package]]
 name = "profiling-procmacros"
-version = "1.0.17"
+version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52717f9a02b6965224f95ca2a81e2e0c5c43baacd28ca057577988930b6c3d5b"
+checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
 dependencies = [
  "quote",
  "syn",
