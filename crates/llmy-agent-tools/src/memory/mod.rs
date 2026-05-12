@@ -1,13 +1,16 @@
+#[cfg(feature = "embed")]
 pub mod embed;
 
+#[cfg(feature = "memory-embed-search")]
+use std::cmp::Ordering;
 use std::{
-    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fmt,
     ops::Deref,
     sync::Arc,
 };
 
+#[cfg(feature = "memory-embed-search")]
 use color_eyre::eyre::eyre;
 use llmy_agent::{LLMYError, tool::ToolBox};
 use llmy_agent_derive::tool;
@@ -15,6 +18,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+#[cfg(feature = "memory-embed-search")]
 use crate::memory::embed::{Embeding, SimilarityModel};
 
 #[derive(Clone, Debug)]
@@ -38,6 +42,7 @@ impl Default for AgentMemorySearchWeights {
     }
 }
 
+#[cfg(feature = "memory-embed-search")]
 #[derive(Clone, Debug, Default)]
 struct CachedMemoryEmbeddings {
     title: Option<Embeding>,
@@ -46,6 +51,7 @@ struct CachedMemoryEmbeddings {
     content: Vec<Embeding>,
 }
 
+#[cfg(feature = "memory-embed-search")]
 #[derive(Clone, Debug)]
 struct SearchableMemoryEntry {
     title: String,
@@ -54,6 +60,7 @@ struct SearchableMemoryEntry {
     content: String,
 }
 
+#[cfg(feature = "memory-embed-search")]
 #[derive(Clone, Debug)]
 struct MemoryFieldLengthViolation {
     field_name: &'static str,
@@ -61,6 +68,7 @@ struct MemoryFieldLengthViolation {
     max_tokens: usize,
 }
 
+#[cfg(feature = "memory-embed-search")]
 impl MemoryFieldLengthViolation {
     fn render(&self) -> String {
         format!(
@@ -120,8 +128,11 @@ pub struct AgentMemory {
 
 pub struct AgentMemoryContextInner {
     pub memory: RwLock<AgentMemory>,
+    #[cfg(feature = "memory-embed-search")]
     pub embed: Option<SimilarityModel>,
+    #[cfg(feature = "memory-embed-search")]
     search_weights: AgentMemorySearchWeights,
+    #[cfg(feature = "memory-embed-search")]
     search_embed_cache: RwLock<BTreeMap<String, CachedMemoryEmbeddings>>,
 }
 
@@ -144,6 +155,7 @@ impl Deref for AgentMemoryContext {
 }
 
 impl AgentMemoryContext {
+    #[cfg(feature = "memory-embed-search")]
     pub fn new(memory: AgentMemory, embed: SimilarityModel) -> Self {
         Self::new_with_search_weights(memory, embed, AgentMemorySearchWeights::default())
     }
@@ -152,13 +164,17 @@ impl AgentMemoryContext {
         Self {
             inner: Arc::new(AgentMemoryContextInner {
                 memory: RwLock::new(memory),
+                #[cfg(feature = "memory-embed-search")]
                 embed: None,
+                #[cfg(feature = "memory-embed-search")]
                 search_weights: AgentMemorySearchWeights::default(),
+                #[cfg(feature = "memory-embed-search")]
                 search_embed_cache: RwLock::new(BTreeMap::new()),
             }),
         }
     }
 
+    #[cfg(feature = "memory-embed-search")]
     pub fn new_with_search_weights(
         memory: AgentMemory,
         embed: SimilarityModel,
@@ -176,14 +192,18 @@ impl AgentMemoryContext {
 
     pub async fn derive_with_long_term(&self) -> Self {
         let ltm = self.memory.read().await.long_term.clone();
+        #[cfg(feature = "memory-embed-search")]
         let cache = self.search_embed_cache.read().await.clone();
         let memory = AgentMemoryContextInner {
             memory: RwLock::new(AgentMemory {
                 long_term: ltm,
                 short_term: BTreeMap::new(),
             }),
+            #[cfg(feature = "memory-embed-search")]
             embed: self.embed.clone(),
+            #[cfg(feature = "memory-embed-search")]
             search_embed_cache: RwLock::new(cache),
+            #[cfg(feature = "memory-embed-search")]
             search_weights: self.search_weights.clone(),
         };
         Self {
@@ -192,7 +212,14 @@ impl AgentMemoryContext {
     }
 
     pub fn search_enabled(&self) -> bool {
-        self.embed.is_some()
+        #[cfg(feature = "memory-embed-search")]
+        {
+            return self.embed.is_some();
+        }
+        #[cfg(not(feature = "memory-embed-search"))]
+        {
+            false
+        }
     }
 
     pub fn tool_box(&self) -> ToolBox {
@@ -200,6 +227,7 @@ impl AgentMemoryContext {
         tools.add_tool(ListMemoriesTool::new(self.clone()));
         tools.add_tool(ReadMemoryTool::new(self.clone()));
         tools.add_tool(ReadMemoryRawTool::new(self.clone()));
+        #[cfg(feature = "memory-embed-search")]
         if self.search_enabled() {
             tools.add_tool(SearchMemoryTool::new(self.clone()));
         }
@@ -214,6 +242,7 @@ impl AgentMemoryContext {
         memory_content: AgentMemoryContent,
         is_long_term: bool,
     ) -> MemoryWriteResult {
+        #[cfg(feature = "memory-embed-search")]
         if let Some(violation) = self
             .validate_searchable_fields([
                 ("title", Some(memory_content.title.as_str())),
@@ -273,6 +302,7 @@ impl AgentMemoryContext {
         content: Option<String>,
         raw_content: Option<String>,
     ) -> MemoryUpdateResult {
+        #[cfg(feature = "memory-embed-search")]
         if let Some(violation) = self
             .validate_searchable_fields([
                 ("related_context", related_context.as_deref()),
@@ -323,6 +353,7 @@ impl AgentMemoryContext {
         if updated_fields.is_empty() {
             MemoryUpdateResult::NoChanges
         } else {
+            #[cfg(feature = "memory-embed-search")]
             if updated_fields
                 .iter()
                 .any(|field| matches!(*field, "related_context" | "trigger_scenario" | "content"))
@@ -352,6 +383,7 @@ impl AgentMemoryContext {
 
         match deleted_scope {
             Some(scope) => {
+                #[cfg(feature = "memory-embed-search")]
                 self.search_embed_cache.write().await.remove(title);
                 MemoryDeleteResult::Deleted { scope }
             }
@@ -378,6 +410,7 @@ impl AgentMemoryContext {
         titles[start..end].to_vec()
     }
 
+    #[cfg(feature = "memory-embed-search")]
     pub async fn search_memory(&self, query: &str) -> Result<Vec<String>, LLMYError> {
         let Some(embed) = self.embed.as_ref() else {
             return Err(eyre!("memory search is disabled for this context").into());
@@ -425,6 +458,7 @@ impl AgentMemoryContext {
             .collect::<Vec<_>>())
     }
 
+    #[cfg(feature = "memory-embed-search")]
     async fn validate_searchable_fields<const N: usize>(
         &self,
         fields: [(&'static str, Option<&str>); N],
@@ -468,6 +502,7 @@ impl AgentMemoryContext {
         None
     }
 
+    #[cfg(feature = "memory-embed-search")]
     async fn cached_memory_embeddings(
         &self,
         entries: &[SearchableMemoryEntry],
@@ -579,6 +614,7 @@ enum MemoryWriteResult {
         scope: MemoryScope,
     },
     AlreadyExists,
+    #[cfg(feature = "memory-embed-search")]
     ValidationRejected {
         violation: MemoryFieldLengthViolation,
     },
@@ -591,6 +627,7 @@ enum MemoryUpdateResult {
     },
     NoChanges,
     NotFound,
+    #[cfg(feature = "memory-embed-search")]
     ValidationRejected {
         violation: MemoryFieldLengthViolation,
     },
@@ -620,6 +657,7 @@ fn collect_memory_titles(memory: &AgentMemory) -> Vec<String> {
     titles
 }
 
+#[cfg(feature = "memory-embed-search")]
 fn collect_searchable_memory_entries(memory: &AgentMemory) -> Vec<SearchableMemoryEntry> {
     let mut seen_titles = BTreeSet::new();
     let mut entries = Vec::with_capacity(memory.short_term.len() + memory.long_term.len());
@@ -649,6 +687,7 @@ fn collect_searchable_memory_entries(memory: &AgentMemory) -> Vec<SearchableMemo
     entries
 }
 
+#[cfg(feature = "memory-embed-search")]
 #[derive(Clone, Copy, Debug)]
 enum SearchField {
     Title,
@@ -657,6 +696,7 @@ enum SearchField {
     Content,
 }
 
+#[cfg(feature = "memory-embed-search")]
 fn queue_search_embedding(
     pending_fields: &mut Vec<(String, SearchField)>,
     pending_inputs: &mut Vec<String>,
@@ -672,6 +712,7 @@ fn queue_search_embedding(
     pending_inputs.push(value);
 }
 
+#[cfg(feature = "memory-embed-search")]
 fn weighted_similarity(
     query_embedding: &Embeding,
     cached_embeddings: &CachedMemoryEmbeddings,
@@ -697,6 +738,7 @@ fn weighted_similarity(
     )
 }
 
+#[cfg(feature = "memory-embed-search")]
 fn weighted_field_similarity(
     query_embedding: &Embeding,
     target: Option<&Embeding>,
@@ -713,6 +755,7 @@ fn weighted_field_similarity(
     query_embedding.cosine_similarity(target).unwrap_or(0.0) * weight
 }
 
+#[cfg(feature = "memory-embed-search")]
 fn weighted_content_similarity(
     query_embedding: &Embeding,
     targets: &[Embeding],
@@ -780,6 +823,7 @@ impl WriteMemoryTool {
                     "Memory {:?} already exists. Do not replace it with write_memory; call update_memory instead.",
                     title
                 ),
+                #[cfg(feature = "memory-embed-search")]
                 MemoryWriteResult::ValidationRejected { violation } => violation.render(),
             },
         )
@@ -840,6 +884,7 @@ impl UpdateMemoryTool {
                 MemoryUpdateResult::NotFound => {
                     format!("No exact memory found with title {:?}", args.title)
                 }
+                #[cfg(feature = "memory-embed-search")]
                 MemoryUpdateResult::ValidationRejected { violation } => violation.render(),
             },
         )
@@ -978,6 +1023,7 @@ impl ListMemoriesTool {
     }
 }
 
+#[cfg(feature = "memory-embed-search")]
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchMemoryArgs {
     pub query: String,
@@ -985,6 +1031,7 @@ pub struct SearchMemoryArgs {
     pub page_index: Option<usize>,
 }
 
+#[cfg(feature = "memory-embed-search")]
 #[derive(Debug, Clone)]
 #[tool(
     arguments = SearchMemoryArgs,
@@ -996,6 +1043,7 @@ pub struct SearchMemoryTool {
     pub context: AgentMemoryContext,
 }
 
+#[cfg(feature = "memory-embed-search")]
 impl SearchMemoryTool {
     pub fn new(context: AgentMemoryContext) -> Self {
         Self { context }
@@ -1020,7 +1068,7 @@ impl SearchMemoryTool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "memory-embed-search"))]
 mod tests {
     use super::*;
     use crate::memory::embed::SimilarityModelConfig;

@@ -20,11 +20,22 @@ llmy-tokenizer.workspace = true
 async-openai.workspace = true
 
 [features]
-# Forwarded from `llmy-agent-tools` so downstreams can pick a TLS backend
-# from the top-level crate.
-default = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"]
+# Off by default. `embed` / `memory-embed-search` pull in `fastembed` +
+# `ort-sys`, which does not support musl. When off, the umbrella crate
+# has no `fastembed`/`openssl-sys` in its dep graph.
+default = []
 
-hf-hub-native-tls = ["llmy-agent-tools/hf-hub-native-tls"]
-hf-hub-rustls-tls = ["llmy-agent-tools/hf-hub-rustls-tls"]
-ort-download-binaries-native-tls = ["llmy-agent-tools/ort-download-binaries-native-tls"]
-ort-download-binaries-rustls-tls = ["llmy-agent-tools/ort-download-binaries-rustls-tls"]
+# Expose the embedding utilities (re-exports `ebmed`). No memory-search code.
+embed = ["llmy-agent-tools/embed", "llmy-harness/embed"]
+
+# Embedding-backed memory search. Implies `embed`.
+memory-embed-search = [
+    "llmy-agent-tools/memory-embed-search",
+    "llmy-harness/memory-embed-search",
+    "embed",
+]
+
+hf-hub-rustls-tls = ["llmy-agent-tools/hf-hub-rustls-tls", "llmy-harness/hf-hub-rustls-tls"]
+hf-hub-native-tls = ["llmy-agent-tools/hf-hub-native-tls", "llmy-harness/hf-hub-native-tls"]
+ort-download-binaries-rustls-tls = ["llmy-agent-tools/ort-download-binaries-rustls-tls", "llmy-harness/ort-download-binaries-rustls-tls"]
+ort-download-binaries-native-tls = ["llmy-agent-tools/ort-download-binaries-native-tls", "llmy-harness/ort-download-binaries-native-tls"]

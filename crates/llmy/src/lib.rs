@@ -41,7 +41,11 @@
 //! [`agent::tools::memory::AgentMemoryContext`] and then build the agent with
 //! [`harness::Agent::with_memory`].
 //!
+//! Requires the `memory-embed-search` cargo feature on `llmy` (it gates the
+//! local embedding model — `ort-sys` does not support musl, hence the opt-in).
+//!
 //! ```no_run
+//! # #[cfg(feature = "memory-embed-search")] {
 //! use llmy::agent::tool::ToolBox;
 //! use llmy::agent::tools::memory::{
 //!     AgentMemory,
@@ -65,6 +69,7 @@
 //!     )
 //!     .await)
 //! }
+//! # }
 //! ```
 //!
 //! # Module Guide
@@ -99,6 +104,8 @@ pub mod agent {
 }
 
 /// Embedding and similarity helpers used by memory search, token counting, and input truncation.
+/// Only available when the `embed` (or `memory-embed-search`) feature is enabled.
+#[cfg(feature = "embed")]
 pub mod ebmed {
     pub use llmy_agent_tools::memory::embed::*;
 }

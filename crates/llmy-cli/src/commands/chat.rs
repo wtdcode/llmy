@@ -9,13 +9,16 @@ use llmy_agent_tools::bash::{BashTool, BashToolConfig};
 use llmy_agent_tools::files::{
     DeleteFileTool, EditFileTool, FindFileTool, ListDirectoryTool, ReadFileTool, WriteFileTool,
 };
+#[cfg(feature = "memory-embed-search")]
 use llmy_agent_tools::memory::{
     AgentMemory, AgentMemoryContext,
     embed::{SimilarityModel, SimilarityModelConfig},
 };
 use llmy_clap::OpenAISetup;
 use llmy_client::client::LLM;
-use llmy_harness::{Agent, memory::AgentMemorySystemPromptCriteria};
+#[cfg(feature = "memory-embed-search")]
+use llmy_harness::memory::AgentMemorySystemPromptCriteria;
+use llmy_harness::Agent;
 use rustyline::{DefaultEditor, error::ReadlineError};
 
 use super::chat_commands::{ChatInput, parse_chat_input, run_chat_command};
@@ -38,14 +41,17 @@ pub struct ChatArgs {
     agent_bash: bool,
 
     /// Enable shared memory tools for the chat agent.
+    /// Requires the `memory-embed-search` cargo feature at build time.
     #[arg(long, default_value_t = false)]
     memory: bool,
 
     /// Local embedding model used by memory search. Used only with --memory.
+    #[cfg(feature = "memory-embed-search")]
     #[arg(long, default_value_t = default_memory_embed_model())]
     memory_embed_model: String,
 
     /// Cache directory for the local embedding model. Used only with --memory.
+    #[cfg(feature = "memory-embed-search")]
     #[arg(long)]
     memory_cache_dir: Option<PathBuf>,
 }
@@ -100,6 +106,7 @@ pub async fn run_chat(args: ChatArgs) -> color_eyre::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "memory-embed-search")]
 async fn build_agent(
     args: &ChatArgs,
     system_prompt: String,
@@ -129,6 +136,26 @@ async fn build_agent(
     .await)
 }
 
+#[cfg(not(feature = "memory-embed-search"))]
+async fn build_agent(
+    args: &ChatArgs,
+    system_prompt: String,
+    tools: ToolBox,
+) -> color_eyre::Result<Agent> {
+    if args.memory {
+        return Err(color_eyre::eyre::eyre!(
+            "--memory requires the `memory-embed-search` cargo feature; rebuild with \
+             `--features memory-embed-search`"
+        ));
+    }
+    Ok(Agent::new(
+        system_prompt,
+        tools,
+        "llmy-cli-chat".to_string(),
+    ))
+}
+
+#[cfg(feature = "memory-embed-search")]
 fn build_memory_config(args: &ChatArgs) -> color_eyre::Result<SimilarityModelConfig> {
     let mut config = SimilarityModelConfig::default();
     config.model = args.memory_embed_model.parse().map_err(|error| {
@@ -142,6 +169,7 @@ fn build_memory_config(args: &ChatArgs) -> color_eyre::Result<SimilarityModelCon
     Ok(config)
 }
 
+#[cfg(feature = "memory-embed-search")]
 fn default_memory_embed_model() -> String {
     SimilarityModelConfig::default().model.to_string()
 }

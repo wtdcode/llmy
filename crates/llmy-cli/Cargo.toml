@@ -33,10 +33,19 @@ shlex.workspace = true
 tracing-subscriber = {workspace = true, features = ["env-filter"]}
 
 [features]
-# Forwarded from `llmy-agent-tools` so the CLI binary can pick a TLS backend.
-default = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"]
+# Off by default. The CLI binary's `--memory` flag becomes a runtime
+# error unless `memory-embed-search` is enabled at build time.
+default = []
 
-hf-hub-native-tls = ["llmy-agent-tools/hf-hub-native-tls"]
-hf-hub-rustls-tls = ["llmy-agent-tools/hf-hub-rustls-tls"]
-ort-download-binaries-native-tls = ["llmy-agent-tools/ort-download-binaries-native-tls"]
-ort-download-binaries-rustls-tls = ["llmy-agent-tools/ort-download-binaries-rustls-tls"]
+embed = ["llmy-agent-tools/embed", "llmy-harness/embed"]
+
+memory-embed-search = [
+    "llmy-agent-tools/memory-embed-search",
+    "llmy-harness/memory-embed-search",
+    "embed",
+]
+
+hf-hub-rustls-tls = ["llmy-agent-tools/hf-hub-rustls-tls", "llmy-harness/hf-hub-rustls-tls"]
+hf-hub-native-tls = ["llmy-agent-tools/hf-hub-native-tls", "llmy-harness/hf-hub-native-tls"]
+ort-download-binaries-rustls-tls = ["llmy-agent-tools/ort-download-binaries-rustls-tls", "llmy-harness/ort-download-binaries-rustls-tls"]
+ort-download-binaries-native-tls = ["llmy-agent-tools/ort-download-binaries-native-tls", "llmy-harness/ort-download-binaries-native-tls"]

@@ -14,9 +14,10 @@ glob.workspace = true
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["fs", "io-util", "process", "rt", "time"] }
-# fastembed default features pull in native-tls (which drags openssl-sys).
-# Disable them and let the consumer pick a TLS backend via our own feature gates.
-fastembed = { workspace = true, default-features = false, features = ["image-models"] }
+# Optional: only pulled in when `memory-embed-search` (or one of its
+# TLS-specific variants) is enabled. ort-sys does not support musl, which
+# is why this is gated.
+fastembed = { workspace = true, default-features = false, features = ["image-models"], optional = true }
 walkdir.workspace = true
 color-eyre.workspace = true
 tracing.workspace = true
@@ -26,15 +27,33 @@ llmy-agent.workspace = true
 llmy-agent-derive.workspace = true
 
 [features]
-# Default: rustls everywhere. Override with `default-features = false` plus
-# `hf-hub-native-tls` / `ort-download-binaries-native-tls` if you need
-# system openssl (e.g. on a platform where rustls' aws-lc-rs backend won't build).
-default = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"]
+# Off by default — when off, the crate does not depend on `fastembed`
+# (and therefore no `ort-sys` / no `openssl-sys`), so it builds on musl.
+default = []
 
-hf-hub-native-tls = ["fastembed/hf-hub-native-tls"]
-hf-hub-rustls-tls = ["fastembed/hf-hub-rustls-tls"]
-ort-download-binaries-native-tls = ["fastembed/ort-download-binaries-native-tls"]
-ort-download-binaries-rustls-tls = ["fastembed/ort-download-binaries-rustls-tls"]
+# Activate the `memory::embed` module — exposes `SimilarityModel`,
+# `Embeding`, and the local embedding helpers. Pulls in `fastembed`.
+# Enabling this alone does NOT activate the memory search/cache code in
+# `memory::AgentMemoryContext`; for that, use `memory-embed-search`.
+embed = [
+    "dep:fastembed",
+    "fastembed/hf-hub-rustls-tls",
+    "fastembed/ort-download-binaries-rustls-tls",
+]
+
+# Activate embedding-backed search inside `AgentMemoryContext`
+# (`search_memory`, content-length validation, the SearchMemoryTool,
+# per-entry embedding cache). Implies `embed`.
+memory-embed-search = ["embed"]
+
+# Granular TLS toggles for callers that need to mix and match (e.g. one
+# backend rustls, the other native-tls). Each implies `dep:fastembed`,
+# but NOT `embed` — pair them with `embed` (or `memory-embed-search`)
+# to actually expose the embed module.
+hf-hub-rustls-tls = ["dep:fastembed", "fastembed/hf-hub-rustls-tls"]
+hf-hub-native-tls = ["dep:fastembed", "fastembed/hf-hub-native-tls"]
+ort-download-binaries-rustls-tls = ["dep:fastembed", "fastembed/ort-download-binaries-rustls-tls"]
+ort-download-binaries-native-tls = ["dep:fastembed", "fastembed/ort-download-binaries-native-tls"]
 
 [dev-dependencies]
 tempfile.workspace = true

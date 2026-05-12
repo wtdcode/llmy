@@ -20,14 +20,22 @@ llmy-client.workspace = true
 llmy-types.workspace = true
 
 [features]
-# Forwarded from `llmy-agent-tools` so the harness library doesn't lock
-# downstream choosers into a specific TLS backend.
-default = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"]
+# Off by default — when off, no `fastembed` dependency at all, so the
+# harness builds on musl.
+default = []
 
-hf-hub-native-tls = ["llmy-agent-tools/hf-hub-native-tls"]
+# Expose the local embedding utilities (`SimilarityModel`, `Embeding`)
+# without enabling the in-memory search/cache code path. Pulls in `fastembed`.
+embed = ["llmy-agent-tools/embed"]
+
+# Embedding-backed memory search inside `AgentMemoryContext`. Implies `embed`.
+memory-embed-search = ["llmy-agent-tools/memory-embed-search", "embed"]
+
+# Granular TLS toggles forwarded from `llmy-agent-tools`.
 hf-hub-rustls-tls = ["llmy-agent-tools/hf-hub-rustls-tls"]
-ort-download-binaries-native-tls = ["llmy-agent-tools/ort-download-binaries-native-tls"]
+hf-hub-native-tls = ["llmy-agent-tools/hf-hub-native-tls"]
 ort-download-binaries-rustls-tls = ["llmy-agent-tools/ort-download-binaries-rustls-tls"]
+ort-download-binaries-native-tls = ["llmy-agent-tools/ort-download-binaries-native-tls"]
 
 [dev-dependencies]
 tempfile.workspace = true

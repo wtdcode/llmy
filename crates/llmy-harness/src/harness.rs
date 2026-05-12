@@ -902,6 +902,7 @@ mod tests {
         assert!(compacted.checkpoints.is_empty());
     }
 
+    #[cfg(feature = "memory-embed-search")]
     #[tokio::test]
     async fn with_memory_snapshots_prompt_until_fresh_agent() {
         use llmy_agent_tools::memory::{
