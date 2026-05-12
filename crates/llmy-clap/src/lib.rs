@@ -3,39 +3,39 @@ use llmy_client::{client::*, model::OpenAIModel, settings::*};
 use llmy_types::error::LLMYError;
 
 macro_rules! make_openai_args {
-    ($struct_name:ident, $prefix:literal) => {
+    ($struct_name:ident, $prefix:literal, $long:literal) => {
         #[derive(Args, Clone, Debug)]
         pub struct $struct_name {
             #[arg(
-                long,
+                long = concat!($long, "openai-url"),
                 env = concat!($prefix, "OPENAI_API_URL"),
                 default_value = "https://api.openai.com/v1"
             )]
             pub openai_url: String,
 
-            #[arg(long, env = concat!($prefix, "AZURE_OPENAI_ENDPOINT"))]
+            #[arg(long = concat!($long, "azure-openai-endpoint"), env = concat!($prefix, "AZURE_OPENAI_ENDPOINT"))]
             pub azure_openai_endpoint: Option<String>,
 
-            #[arg(long, env = concat!($prefix, "OPENAI_API_KEY"))]
+            #[arg(long = concat!($long, "openai-key"), env = concat!($prefix, "OPENAI_API_KEY"))]
             pub openai_key: Option<String>,
 
-            #[arg(long, env = concat!($prefix, "AZURE_API_DEPLOYMENT"))]
+            #[arg(long = concat!($long, "azure-deployment"), env = concat!($prefix, "AZURE_API_DEPLOYMENT"))]
             pub azure_deployment: Option<String>,
 
-            #[arg(long, env = concat!($prefix,"AZURE_API_VERSION"), default_value = "2025-01-01-preview")]
+            #[arg(long = concat!($long, "azure-api-version"), env = concat!($prefix, "AZURE_API_VERSION"), default_value = "2025-01-01-preview")]
             pub azure_api_version: String,
 
-            #[arg(long, default_value_t = 10.0, env = concat!($prefix,"OPENAI_BILLING_CAP"))]
+            #[arg(long = concat!($long, "biling-cap"), default_value_t = 10.0, env = concat!($prefix, "OPENAI_BILLING_CAP"))]
             pub biling_cap: f64,
 
-            #[arg(long, env = concat!($prefix,"OPENAI_API_MODEL"))]
+            #[arg(long = concat!($long, "model"), env = concat!($prefix, "OPENAI_API_MODEL"))]
             pub model: Option<OpenAIModel>,
 
             /// Send the canonical `owner/name` model id (e.g. `openai/gpt-5.4-mini`)
             /// in chat completion requests instead of the bare model name.
             /// Required for aggregators like OpenRouter.
             #[arg(
-                long,
+                long = concat!($long, "use-full-model-id"),
                 env = concat!($prefix, "LLM_FULL_MODEL_NAME"),
                 default_value_t = false,
                 value_parser = clap::builder::BoolishValueParser::new()
@@ -46,40 +46,40 @@ macro_rules! make_openai_args {
             /// folder backend (one xml/json pair per request); a value starting
             /// with `sqlite3://` or ending in `sqlite3` enables the SQLite
             /// backend.
-            #[arg(long, env = concat!($prefix,"LLM_DEBUG"))]
+            #[arg(long = concat!($long, "llm-debug"), env = concat!($prefix, "LLM_DEBUG"))]
             pub llm_debug: Option<String>,
 
-            #[arg(long, env = concat!($prefix, "LLM_TEMPERATURE"))]
+            #[arg(long = concat!($long, "llm-temperature"), env = concat!($prefix, "LLM_TEMPERATURE"))]
             pub llm_temperature: Option<f32>,
 
-            #[arg(long, env = concat!($prefix, "LLM_PRESENCE_PENALTY"))]
+            #[arg(long = concat!($long, "llm-presence-penalty"), env = concat!($prefix, "LLM_PRESENCE_PENALTY"))]
             pub llm_presence_penalty: Option<f32>,
 
-            #[arg(long, env = concat!($prefix, "LLM_PROMPT_TIMEOUT"), default_value_t = 20 * 60)]
+            #[arg(long = concat!($long, "llm-prompt-timeout"), env = concat!($prefix, "LLM_PROMPT_TIMEOUT"), default_value_t = 20 * 60)]
             pub llm_prompt_timeout: u64,
 
-            #[arg(long, env = concat!($prefix, "LLM_RETRY"), default_value_t = 5)]
+            #[arg(long = concat!($long, "llm-retry"), env = concat!($prefix, "LLM_RETRY"), default_value_t = 5)]
             pub llm_retry: u64,
 
-            #[arg(long, env = concat!($prefix, "LLM_MAX_COMPLETION_TOKENS"))]
+            #[arg(long = concat!($long, "llm-max-completion-tokens"), env = concat!($prefix, "LLM_MAX_COMPLETION_TOKENS"))]
             pub llm_max_completion_tokens: Option<u32>,
 
-            #[arg(long, env = concat!($prefix, "LLM_TOOL_CHOINCE"))]
+            #[arg(long = concat!($long, "llm-tool-choice"), env = concat!($prefix, "LLM_TOOL_CHOINCE"))]
             pub llm_tool_choice: Option<LLMToolChoice>,
 
             #[arg(
-                long,
+                long = concat!($long, "llm-stream"),
                 env = concat!($prefix, "LLM_STREAM"),
                 default_value_t = false,
                 value_parser = clap::builder::BoolishValueParser::new()
             )]
             pub llm_stream: bool,
 
-            #[arg(long, env = concat!($prefix, "LLM_TOP_P"))]
+            #[arg(long = concat!($long, "top-p"), env = concat!($prefix, "LLM_TOP_P"))]
             pub top_p: Option<f32>,
 
             #[arg(
-                long,
+                long = concat!($long, "reasoning-effort"),
                 env = concat!($prefix, "LLM_REASONING_EFFORT"),
             )]
             pub reasoning_effort: Option<Reasoning>
@@ -155,6 +155,6 @@ macro_rules! make_openai_args {
     };
 }
 
-make_openai_args!(OpenAISetup, "");
-make_openai_args!(OptOpenAISetup, "OPT_");
-make_openai_args!(OptOptOpenAISetup, "OPT_OPT_");
+make_openai_args!(OpenAISetup, "", "");
+make_openai_args!(OptOpenAISetup, "OPT_", "opt-");
+make_openai_args!(OptOptOpenAISetup, "OPT_OPT_", "opt-opt-");
