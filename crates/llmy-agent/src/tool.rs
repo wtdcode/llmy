@@ -50,16 +50,55 @@ pub trait ToolDyn: DynClone + Debug + Send + Sync + std::any::Any {
     fn name(&self) -> String;
     /// Returns the human-readable description shown to the model, if any.
     fn description(&self) -> Option<String>;
+    /// Returns the JSON Schema describing this tool's expected arguments.
+    fn schema(&self) -> schemars::Schema;
     /// Renders the tool as an OpenAI [`ChatCompletionTool`] descriptor,
     /// including its JSON schema, ready to be sent in a chat completion
     /// request.
-    fn to_openai_obejct(&self) -> ChatCompletionTool;
+    fn to_openai_obejct(&self) -> ChatCompletionTool {
+        WithOtherFields::new(ChatCompletionToolRaw {
+            function: WithOtherFields::new(FunctionObjectRaw {
+                name: self.name(),
+                description: self.description(),
+                parameters: Some(
+                    serde_json::to_value(self.schema()).expect("Fail to serialize schema"),
+                ),
+                strict: None,
+            }),
+        })
+    }
+    /// Renders the tool as an MCP [`rmcp::model::Tool`] descriptor.
+    fn to_mcp_tool(&self) -> rmcp::model::Tool {
+        let input_schema = serde_json::to_value(self.schema()).expect("Fail to serialize schema");
+        let input_schema = input_schema.as_object().cloned().unwrap_or_default();
+        rmcp::model::Tool::new_with_raw(
+            self.name(),
+            self.description().map(Into::into),
+            Arc::new(input_schema),
+        )
+    }
     /// Invokes the tool with raw JSON-encoded `arguments`. The string is
     /// deserialized into the tool's `ARGUMENTS` type by the blanket impl on
     /// top of [`Tool`].
     fn call(
         &self,
         arguments: String,
+    ) -> Pin<Box<dyn Future<Output = Result<String, LLMYError>> + Send + '_>> {
+        Box::pin(async move {
+            match serde_json::from_str::<serde_json::Value>(&arguments) {
+                Ok(value) => self.invoke(value).await,
+                Err(_) => Err(LLMYError::IncorrectToolCall(
+                    self.name(),
+                    arguments,
+                    self.schema(),
+                )),
+            }
+        })
+    }
+    /// Invokes the tool with a [`serde_json::Value`] as arguments.
+    fn invoke(
+        &self,
+        arguments: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<String, LLMYError>> + Send + '_>>;
 }
 
@@ -133,40 +172,31 @@ pub trait Tool: Send + Sync + DynClone + Debug {
     /// Maps to OpenAI's `strict` field on the function descriptor.
     const STRICT: bool = false;
 
-    /// Builds the OpenAI [`ChatCompletionTool`] descriptor for this tool.
-    ///
-    /// The default implementation uses [`Self::NAME`], [`Self::DESCRIPTION`]
-    /// and a JSON schema generated from [`Self::ARGUMENTS`]. Override only if
-    /// you need to customise the descriptor in ways the trait does not expose.
+    fn schema(&self) -> schemars::Schema {
+        schema_for!(Self::ARGUMENTS)
+    }
+
     fn to_openai_obejct(&self) -> ChatCompletionTool {
         WithOtherFields::new(ChatCompletionToolRaw {
             function: WithOtherFields::new(FunctionObjectRaw {
                 name: Self::NAME.to_string(),
                 description: Self::DESCRIPTION.map(|e| e.to_string()),
                 parameters: Some(
-                    serde_json::to_value(schema_for!(Self::ARGUMENTS))
-                        .expect("Fail to generate schema?!"),
+                    serde_json::to_value(self.schema()).expect("Fail to serialize schema"),
                 ),
                 strict: Some(Self::STRICT),
             }),
         })
     }
-    /// Deserializes `arguments` from JSON and forwards to [`Self::invoke`].
-    ///
-    /// On parse failure the returned error is
-    /// [`LLMYError::IncorrectToolCall`], carrying the tool name, the offending
-    /// payload and the expected schema so the model can be re-prompted.
-    fn call(&self, arguments: String) -> impl Future<Output = Result<String, LLMYError>> + Send {
-        async move {
-            match serde_json::from_str::<Self::ARGUMENTS>(&arguments) {
-                Ok(args) => self.invoke(args).await,
-                Err(_) => Err(LLMYError::IncorrectToolCall(
-                    Self::NAME.to_string(),
-                    arguments.clone(),
-                    schema_for!(Self::ARGUMENTS),
-                )),
-            }
-        }
+
+    fn to_mcp_tool(&self) -> rmcp::model::Tool {
+        let input_schema = serde_json::to_value(self.schema()).expect("Fail to serialize schema");
+        let input_schema = input_schema.as_object().cloned().unwrap_or_default();
+        rmcp::model::Tool::new_with_raw(
+            Self::NAME,
+            Self::DESCRIPTION.map(Into::into),
+            Arc::new(input_schema),
+        )
     }
 
     /// Performs the tool's actual work on already-deserialized `arguments`
@@ -184,15 +214,30 @@ impl<T: Tool + DynClone + 'static> ToolDyn for T {
     fn description(&self) -> Option<String> {
         Self::DESCRIPTION.map(|v| v.to_string())
     }
-    fn call(
-        &self,
-        arguments: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, LLMYError>> + Send + '_>> {
-        Box::pin(self.call(arguments))
+    fn schema(&self) -> schemars::Schema {
+        Tool::schema(self)
+    }
+    fn to_openai_obejct(&self) -> ChatCompletionTool {
+        Tool::to_openai_obejct(self)
+    }
+    fn to_mcp_tool(&self) -> rmcp::model::Tool {
+        Tool::to_mcp_tool(self)
     }
 
-    fn to_openai_obejct(&self) -> ChatCompletionTool {
-        self.to_openai_obejct()
+    fn invoke(
+        &self,
+        arguments: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<String, LLMYError>> + Send + '_>> {
+        Box::pin(async move {
+            match serde_json::from_value::<T::ARGUMENTS>(arguments.clone()) {
+                Ok(args) => Tool::invoke(self, args).await,
+                Err(_) => Err(LLMYError::IncorrectToolCall(
+                    T::NAME.to_string(),
+                    arguments.to_string(),
+                    schema_for!(T::ARGUMENTS),
+                )),
+            }
+        })
     }
 }
 
@@ -252,6 +297,12 @@ impl ToolBox {
         self.tools.contains_key(tool)
     }
 
+    /// Renders every registered tool as an MCP [`rmcp::model::Tool`]
+    /// descriptor.
+    pub fn mcp_tools(&self) -> Vec<rmcp::model::Tool> {
+        self.tools.values().map(|t| t.to_mcp_tool()).collect()
+    }
+
     /// Renders every registered tool as an OpenAI `ChatCompletionTools`
     /// entry, ready to be attached to a chat completion request.
     pub fn openai_objects(&self) -> Vec<ChatCompletionTools> {
@@ -287,6 +338,19 @@ impl ToolBox {
         if let Some(tool) = self.tools.get(&tool_name) {
             debug!("Invoking tool {} with arguments {}", &tool_name, &arguments);
             Some(tool.call(arguments).await)
+        } else {
+            None
+        }
+    }
+
+    pub async fn invoke_value(
+        &self,
+        tool_name: String,
+        arguments: serde_json::Value,
+    ) -> Option<Result<String, LLMYError>> {
+        if let Some(tool) = self.tools.get(&tool_name) {
+            debug!("Invoking tool {} with arguments {}", &tool_name, &arguments);
+            Some(tool.invoke(arguments).await)
         } else {
             None
         }

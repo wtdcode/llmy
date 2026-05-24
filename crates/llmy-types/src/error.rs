@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use async_openai::error::OpenAIError;
+use rmcp::service::ServerInitializeError;
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,10 @@ pub enum LLMYError {
     EmptyChoice,
     #[error("reach output length limit")]
     OutputLength,
+    #[error("mcp server init error: {0}")]
+    McpServerInit(#[from] ServerInitializeError),
+    #[error("mcp task join error: {0}")]
+    McpJoin(#[from] tokio::task::JoinError),
     #[error(transparent)]
     Other(#[from] color_eyre::Report),
 }

@@ -16,9 +16,9 @@ use llmy_agent_tools::memory::{
 };
 use llmy_clap::OpenAISetup;
 use llmy_client::client::LLM;
+use llmy_harness::Agent;
 #[cfg(feature = "memory-embed-search")]
 use llmy_harness::memory::AgentMemorySystemPromptCriteria;
-use llmy_harness::Agent;
 use rustyline::{DefaultEditor, error::ReadlineError};
 
 use super::chat_commands::{ChatInput, parse_chat_input, run_chat_command};
