@@ -34,8 +34,11 @@ impl McpToolBox {
         Ok(())
     }
 
-    pub async fn serve_http(self, addr: impl tokio::net::ToSocketAddrs) -> Result<(), LLMYError> {
-        let config = StreamableHttpServerConfig::default();
+    pub async fn serve_http(
+        self,
+        addr: impl tokio::net::ToSocketAddrs,
+        config: StreamableHttpServerConfig,
+    ) -> Result<(), LLMYError> {
         let session_manager = Arc::new(LocalSessionManager::default());
         let service = StreamableHttpService::new(move || Ok(self.clone()), session_manager, config);
         let router = axum::Router::new().fallback_service(service);

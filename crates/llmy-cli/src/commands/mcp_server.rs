@@ -5,6 +5,7 @@ use llmy_agent::mcp::McpToolBox;
 use llmy_agent::tool::ToolBox;
 use llmy_agent_tools::files::{FindFileTool, ListDirectoryTool, ReadFileTool};
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::transport::StreamableHttpServerConfig;
 
 #[derive(Args)]
 pub struct McpServerArgs {
@@ -38,7 +39,9 @@ pub async fn run_mcp_server(args: McpServerArgs) -> color_eyre::Result<()> {
 
     if let Some(addr) = args.listen {
         eprintln!("Listening on {addr}");
-        server.serve_http(addr).await?;
+        server
+            .serve_http(addr, StreamableHttpServerConfig::default())
+            .await?;
     } else {
         server.serve_stdio().await?;
     }
