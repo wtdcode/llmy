@@ -15,7 +15,7 @@ async-openai.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
 serde.workspace = true
-rmcp = { workspace = true, features = ["server"] }
+rmcp = { workspace = true, features = ["server", "client"] }
 tokio.workspace = true
 
 [dev-dependencies]

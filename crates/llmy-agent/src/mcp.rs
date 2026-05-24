@@ -1,9 +1,14 @@
+use std::future::Future;
+use std::sync::Arc;
+
 use llmy_types::error::LLMYError;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ListToolsResult, PaginatedRequestParams,
     ServerInfo,
 };
 use rmcp::transport::io::stdio;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, ServerHandler, serve_server};
 
 use crate::tool::ToolBox;
@@ -29,18 +34,16 @@ impl McpToolBox {
         Ok(())
     }
 
-    pub async fn serve_network(
-        self,
-        addr: impl tokio::net::ToSocketAddrs,
-    ) -> Result<(), LLMYError> {
+    pub async fn serve_http(self, addr: impl tokio::net::ToSocketAddrs) -> Result<(), LLMYError> {
+        let config = StreamableHttpServerConfig::default();
+        let session_manager = Arc::new(LocalSessionManager::default());
+        let service = StreamableHttpService::new(move || Ok(self.clone()), session_manager, config);
+        let router = axum::Router::new().fallback_service(service);
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let handler = self.clone();
-            tokio::spawn(async move {
-                let _ = serve_server(handler, stream).await;
-            });
-        }
+        axum::serve(listener, router)
+            .await
+            .map_err(|e| LLMYError::IO(e.into()))?;
+        Ok(())
     }
 
     fn to_mcp_tools(&self) -> Vec<rmcp::model::Tool> {
@@ -72,6 +75,7 @@ impl ServerHandler for McpToolBox {
                 .arguments
                 .map(serde_json::Value::Object)
                 .unwrap_or(serde_json::Value::Object(Default::default()));
+            tracing::info!("MCP server call_tool: {} {}", &name, &arguments);
 
             match self.toolbox.invoke_value(name, arguments).await {
                 Some(Ok(result)) => Ok(CallToolResult::success(vec![Content::text(result)])),

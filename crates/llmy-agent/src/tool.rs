@@ -52,6 +52,10 @@ pub trait ToolDyn: DynClone + Debug + Send + Sync + std::any::Any {
     fn description(&self) -> Option<String>;
     /// Returns the JSON Schema describing this tool's expected arguments.
     fn schema(&self) -> schemars::Schema;
+    /// Whether the model should honour the JSON schema strictly.
+    fn strict(&self) -> bool {
+        false
+    }
     /// Renders the tool as an OpenAI [`ChatCompletionTool`] descriptor,
     /// including its JSON schema, ready to be sent in a chat completion
     /// request.
@@ -63,7 +67,7 @@ pub trait ToolDyn: DynClone + Debug + Send + Sync + std::any::Any {
                 parameters: Some(
                     serde_json::to_value(self.schema()).expect("Fail to serialize schema"),
                 ),
-                strict: None,
+                strict: Some(self.strict()),
             }),
         })
     }
@@ -86,7 +90,7 @@ pub trait ToolDyn: DynClone + Debug + Send + Sync + std::any::Any {
     ) -> Pin<Box<dyn Future<Output = Result<String, LLMYError>> + Send + '_>> {
         Box::pin(async move {
             match serde_json::from_str::<serde_json::Value>(&arguments) {
-                Ok(value) => self.invoke(value).await,
+                Ok(value) => self.run(value).await,
                 Err(_) => Err(LLMYError::IncorrectToolCall(
                     self.name(),
                     arguments,
@@ -96,7 +100,7 @@ pub trait ToolDyn: DynClone + Debug + Send + Sync + std::any::Any {
         })
     }
     /// Invokes the tool with a [`serde_json::Value`] as arguments.
-    fn invoke(
+    fn run(
         &self,
         arguments: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<String, LLMYError>> + Send + '_>>;
@@ -172,33 +176,6 @@ pub trait Tool: Send + Sync + DynClone + Debug {
     /// Maps to OpenAI's `strict` field on the function descriptor.
     const STRICT: bool = false;
 
-    fn schema(&self) -> schemars::Schema {
-        schema_for!(Self::ARGUMENTS)
-    }
-
-    fn to_openai_obejct(&self) -> ChatCompletionTool {
-        WithOtherFields::new(ChatCompletionToolRaw {
-            function: WithOtherFields::new(FunctionObjectRaw {
-                name: Self::NAME.to_string(),
-                description: Self::DESCRIPTION.map(|e| e.to_string()),
-                parameters: Some(
-                    serde_json::to_value(self.schema()).expect("Fail to serialize schema"),
-                ),
-                strict: Some(Self::STRICT),
-            }),
-        })
-    }
-
-    fn to_mcp_tool(&self) -> rmcp::model::Tool {
-        let input_schema = serde_json::to_value(self.schema()).expect("Fail to serialize schema");
-        let input_schema = input_schema.as_object().cloned().unwrap_or_default();
-        rmcp::model::Tool::new_with_raw(
-            Self::NAME,
-            Self::DESCRIPTION.map(Into::into),
-            Arc::new(input_schema),
-        )
-    }
-
     /// Performs the tool's actual work on already-deserialized `arguments`
     /// and returns the textual result that will be sent back to the model.
     fn invoke(
@@ -215,22 +192,19 @@ impl<T: Tool + DynClone + 'static> ToolDyn for T {
         Self::DESCRIPTION.map(|v| v.to_string())
     }
     fn schema(&self) -> schemars::Schema {
-        Tool::schema(self)
+        schema_for!(T::ARGUMENTS)
     }
-    fn to_openai_obejct(&self) -> ChatCompletionTool {
-        Tool::to_openai_obejct(self)
-    }
-    fn to_mcp_tool(&self) -> rmcp::model::Tool {
-        Tool::to_mcp_tool(self)
+    fn strict(&self) -> bool {
+        T::STRICT
     }
 
-    fn invoke(
+    fn run(
         &self,
         arguments: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<String, LLMYError>> + Send + '_>> {
         Box::pin(async move {
             match serde_json::from_value::<T::ARGUMENTS>(arguments.clone()) {
-                Ok(args) => Tool::invoke(self, args).await,
+                Ok(args) => self.invoke(args).await,
                 Err(_) => Err(LLMYError::IncorrectToolCall(
                     T::NAME.to_string(),
                     arguments.to_string(),
@@ -350,7 +324,7 @@ impl ToolBox {
     ) -> Option<Result<String, LLMYError>> {
         if let Some(tool) = self.tools.get(&tool_name) {
             debug!("Invoking tool {} with arguments {}", &tool_name, &arguments);
-            Some(tool.invoke(arguments).await)
+            Some(tool.run(arguments).await)
         } else {
             None
         }

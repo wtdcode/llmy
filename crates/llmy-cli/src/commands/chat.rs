@@ -9,6 +9,7 @@ use llmy_agent_tools::bash::{BashTool, BashToolConfig};
 use llmy_agent_tools::files::{
     DeleteFileTool, EditFileTool, FindFileTool, ListDirectoryTool, ReadFileTool, WriteFileTool,
 };
+use llmy_agent_tools::mcp::McpClient;
 #[cfg(feature = "memory-embed-search")]
 use llmy_agent_tools::memory::{
     AgentMemory, AgentMemoryContext,
@@ -40,6 +41,10 @@ pub struct ChatArgs {
     #[arg(long, default_value_t = false)]
     agent_bash: bool,
 
+    /// Connect to MCP servers. Accepts URLs (http/https) or "command arg1 arg2..." for stdio.
+    #[arg(long = "mcp-server", value_name = "URL_OR_CMD")]
+    mcp_servers: Vec<String>,
+
     /// Enable shared memory tools for the chat agent.
     /// Requires the `memory-embed-search` cargo feature at build time.
     #[arg(long, default_value_t = false)]
@@ -66,7 +71,16 @@ pub async fn run_chat(args: ChatArgs) -> color_eyre::Result<()> {
     let files_root = resolve_files_root(args.agent_files.clone())?;
     let bash_root = resolve_bash_root(args.agent_bash)?;
     let system_prompt = build_system_prompt(system, files_root.as_deref(), bash_root.as_deref());
-    let tools = build_toolbox(files_root.clone(), bash_root);
+    let mut tools = build_toolbox(files_root.clone(), bash_root);
+
+    let mut _mcp_clients = Vec::new();
+    for server in &args.mcp_servers {
+        let client = connect_mcp_server(server).await?;
+        let mcp_tools = client.to_toolbox().await?;
+        tools.extend(mcp_tools);
+        _mcp_clients.push(client);
+    }
+
     let mut agent = build_agent(&args, system_prompt, tools).await?;
 
     let stdin = std::io::stdin();
@@ -229,6 +243,10 @@ fn build_system_prompt(base: &str, files_root: Option<&Path>, bash_root: Option<
     }
 
     sections.join("\n\n")
+}
+
+async fn connect_mcp_server(server: &str) -> color_eyre::Result<McpClient> {
+    Ok(McpClient::connect(server).await?)
 }
 
 fn print_last_step(agent: &Agent, is_tty: bool) -> bool {

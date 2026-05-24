@@ -15,7 +15,8 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-rmcp = {workspace = true, features = ["server", "client", "transport-io", "macros"]}
+axum.workspace = true
+rmcp = {workspace = true, features = ["server", "transport-io", "transport-streamable-http-server", "macros"]}
 
 llmy-agent-derive.workspace = true
 llmy-client.workspace = true

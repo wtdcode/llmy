@@ -1,5 +1,6 @@
 use llmy::agent::Tool as LlmyTool;
 use llmy_agent::Tool as LlmyAgentTool;
+use llmy_agent::tool::ToolDyn as _;
 use llmy_agent_derive::tool;
 use schemars::JsonSchema;
 use serde::Deserialize;

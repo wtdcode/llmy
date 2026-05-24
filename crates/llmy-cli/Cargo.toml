@@ -20,6 +20,7 @@ serde_json.workspace = true
 chrono.workspace = true
 llmy-clap.workspace = true
 llmy-agent.workspace = true
+rmcp = {workspace = true, features = ["server"]}
 llmy-agent-tools.workspace = true
 llmy-harness.workspace = true
 llmy-client.workspace = true

@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use async_openai::error::OpenAIError;
-use rmcp::service::ServerInitializeError;
+use rmcp::service::{ClientInitializeError, ServerInitializeError, ServiceError};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -42,6 +42,10 @@ pub enum LLMYError {
     OutputLength,
     #[error("mcp server init error: {0}")]
     McpServerInit(#[from] ServerInitializeError),
+    #[error("mcp client init error: {0}")]
+    McpClientInit(#[from] ClientInitializeError),
+    #[error("mcp service error: {0}")]
+    McpService(#[from] ServiceError),
     #[error("mcp task join error: {0}")]
     McpJoin(#[from] tokio::task::JoinError),
     #[error(transparent)]

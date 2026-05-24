@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand};
 mod commands;
 
 use commands::{
-    ChatArgs, DumpClientArgs, DumpReqArgs, ListReqArgs, TokenizerArgs, run_chat, run_dump_client,
-    run_dump_req, run_list_req, run_models, run_tokenizer,
+    ChatArgs, DumpClientArgs, DumpReqArgs, ListReqArgs, McpServerArgs, TokenizerArgs, run_chat,
+    run_dump_client, run_dump_req, run_list_req, run_mcp_server, run_models, run_tokenizer,
 };
 
 #[derive(Parser)]
@@ -30,6 +30,8 @@ enum Commands {
     DumpReq(DumpReqArgs),
     /// Dump every request of one client into XML conversations + raw JSONL
     DumpClient(DumpClientArgs),
+    /// Run an MCP file server exposing read/list/find tools
+    McpServer(McpServerArgs),
 }
 
 async fn main_entry() -> color_eyre::Result<()> {
@@ -41,6 +43,7 @@ async fn main_entry() -> color_eyre::Result<()> {
         Commands::ListReq(args) => run_list_req(args).await,
         Commands::DumpReq(args) => run_dump_req(args).await,
         Commands::DumpClient(args) => run_dump_client(args).await,
+        Commands::McpServer(args) => run_mcp_server(args).await,
     }
 }
 
