@@ -1,6 +1,6 @@
 # LLMY
 
-All-in-one LLM utilities for Rust — plug OpenAI / Azure settings straight into [clap](https://crates.io/crates/clap), track spend with built-in billing, and replay every request when things go wrong.
+All-in-one LLM utilities for Rust — plug OpenAI / Azure settings straight into [clap](https://crates.io/crates/clap), track spend with built-in billing, replay every request when things go wrong, and bridge tools between your agent and the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP).
 
 ## Harnessing An Agent
 
@@ -11,7 +11,7 @@ The example below builds a basic agent that can read files, list directories, an
 ```toml
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-llmy = "0.8"
+llmy = "0.13"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -74,6 +74,58 @@ Run it with your OpenAI settings:
 OPENAI_API_KEY=sk-... cargo run -- --model gpt-4o --root .
 ```
 
+## MCP Support
+
+`llmy` has first-class support for the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP), both as a server and as a client.
+
+### MCP Server — expose a `ToolBox` as an MCP server
+
+Any `ToolBox` can be served as an MCP server over stdio or Streamable HTTP:
+
+```rust
+use llmy::agent::tool::ToolBox;
+use llmy::agent::mcp::McpToolBox;
+use llmy::agent::tools::files::{FindFileTool, ListDirectoryTool, ReadFileTool};
+use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::transport::StreamableHttpServerConfig;
+
+let mut tools = ToolBox::new();
+tools.add_tool(ReadFileTool::new(".".into()));
+tools.add_tool(ListDirectoryTool::new_root(".".into()));
+tools.add_tool(FindFileTool::new(".".into()));
+
+let server_info = ServerInfo::new(
+    ServerCapabilities::builder().enable_tools().build(),
+).with_server_info(Implementation::new("my-server", "0.1.0"));
+
+let server = McpToolBox::new(tools, server_info);
+
+// Serve over stdio (for use with MCP clients like Claude Desktop):
+// server.serve_stdio().await?;
+
+// Or serve over HTTP:
+// server.serve_http("127.0.0.1:3000", StreamableHttpServerConfig::default()).await?;
+```
+
+### MCP Client — connect to remote MCP servers
+
+Connect to any MCP server and import its tools into a `ToolBox`:
+
+```rust
+use llmy::agent::tools::mcp::McpClient;
+
+// Auto-detects HTTP vs stdio based on the URL scheme:
+let client = McpClient::connect("http://127.0.0.1:3000").await?;
+// Or for stdio: McpClient::connect("npx some-mcp-server").await?;
+
+let remote_tools = client.to_toolbox().await?;
+
+// Merge into your agent's toolbox:
+tools.extend(remote_tools);
+```
+
+The client wraps each remote MCP tool as a `ToolDyn`, so they integrate seamlessly with the agent loop. MCP resources are also exposed as read-only tools.
+
 ## CLI
 
 Install the command-line tool:
@@ -95,6 +147,35 @@ concurrent code with zero-cost abstractions at compile time.
 ```
 
 Supports `--system` for a custom system prompt. Reads from stdin when not a TTY.
+
+#### Connecting to MCP servers
+
+Use `--mcp-server` (repeatable) to connect to MCP servers and make their tools available to the agent:
+
+```bash
+# HTTP server
+llmy chat --model gpt-4o --mcp-server http://127.0.0.1:3000
+
+# Stdio server (command is split on whitespace)
+llmy chat --model gpt-4o --mcp-server "npx some-mcp-server"
+
+# Multiple servers
+llmy chat --model gpt-4o \
+    --mcp-server http://localhost:3000 \
+    --mcp-server "npx another-server"
+```
+
+### `llmy mcp-server` — serve file tools over MCP
+
+Run a built-in MCP server that exposes `read_file`, `list_dir`, and `find_file` tools:
+
+```bash
+# Over stdio (for Claude Desktop, etc.)
+llmy mcp-server --root /path/to/project
+
+# Over HTTP
+llmy mcp-server --root . --listen 127.0.0.1:3005
+```
 
 ### `llmy tokenizer` — count tokens offline
 
@@ -150,7 +231,7 @@ Add the dependency (the root crate re-exports everything):
 
 ```toml
 [dependencies]
-llmy = "0.8"
+llmy = "0.13"
 ```
 
 ### 1. Clap integration — up to 3 LLM slots
@@ -175,7 +256,7 @@ struct Cli {
 async fn main() {
     let cli = Cli::parse();
 
-    // One-liner: clap args → ready-to-use async LLM client
+    // One-liner: clap args -> ready-to-use async LLM client
     let llm = cli.llm.to_llm().await;
 
     let resp = llm
@@ -206,7 +287,7 @@ OPENAI_API_KEY=... cargo run -- \
     --model gpt-4o
 ```
 
-Every setting (temperature, timeout, retries, max tokens, reasoning effort, tool choice, …) is exposed as a flag **and** an env-var:
+Every setting (temperature, timeout, retries, max tokens, reasoning effort, tool choice, ...) is exposed as a flag **and** an env-var:
 
 | Flag | Env var | Default |
 |------|---------|---------|
@@ -305,7 +386,7 @@ You can also embed the read API directly: `Sqlite3DebugDB::open_existing(url)` +
 
 ### 3. Built-in billing with automatic budget enforcement
 
-`llmy` ships with up-to-date per-token pricing for 110+ models (GPT-4o, o1, o3, GPT-5 family, Claude, Gemini, …). Token usage is tracked in real-time including **cached-input** and **reasoning** token discounts. When spend exceeds the budget cap the client returns `LLMYError::Billing` immediately — no more surprise bills.
+`llmy` ships with up-to-date per-token pricing for 110+ models (GPT-4o, o1, o3, GPT-5 family, Claude, Gemini, ...). Token usage is tracked in real-time including **cached-input** and **reasoning** token discounts. When spend exceeds the budget cap the client returns `LLMYError::Billing` immediately — no more surprise bills.
 
 ```rust
 use llmy::client::{LLM, SupportedConfig};
@@ -323,7 +404,7 @@ let llm = LLM::new(
 );
 
 match llm.prompt_once("system", "user", None, None, None).await {
-    Ok(resp) => { /* … */ }
+    Ok(resp) => { /* ... */ }
     Err(llmy::LLMYError::Billing(cap, current)) => {
         eprintln!("Budget exceeded: ${:.4} / ${:.2}", current, cap);
     }
@@ -378,27 +459,21 @@ You can depend on either the focused crate pair:
 
 ```toml
 [dependencies]
-llmy-agent = "0.8"
-llmy-agent-derive = "0.8"
+llmy-agent = "0.13"
+llmy-agent-derive = "0.13"
 ```
 
 or the root crate plus the derive crate:
 
 ```toml
 [dependencies]
-llmy = "0.8"
-llmy-agent-derive = "0.8"
+llmy = "0.13"
+llmy-agent-derive = "0.13"
 ```
 
-The trait contract is:
+The `Tool` trait defines the typed interface that users implement:
 
 ```rust
-use std::future::Future;
-
-use llmy_agent::{LLMYError, Tool};
-use schemars::JsonSchema;
-use serde::de::DeserializeOwned;
-
 pub trait Tool: Send + Sync + std::fmt::Debug {
     type ARGUMENTS: DeserializeOwned + JsonSchema + Send;
     const NAME: &str;
@@ -410,6 +485,8 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
     ) -> impl Future<Output = Result<String, LLMYError>> + Send;
 }
 ```
+
+The companion `ToolDyn` trait provides the object-safe, type-erased interface used by `ToolBox` and the agent loop. A blanket `impl ToolDyn for T: Tool` bridges the two automatically — users only implement `Tool`.
 
 In practice you usually write the typed arguments and the async method, then let `llmy-agent-derive` generate the `impl Tool` for you:
 

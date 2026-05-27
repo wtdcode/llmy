@@ -1,3 +1,6 @@
+//! MCP client support — connect to a remote MCP server and wrap its
+//! tools and resources as [`ToolDyn`] entries in a [`ToolBox`].
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -10,6 +13,8 @@ use rmcp::service::{Peer, RoleClient, RunningService};
 
 type McpPeer = Arc<Peer<RoleClient>>;
 
+/// A client that connects to a remote MCP server and exposes its tools
+/// and resources as a [`ToolBox`].
 pub struct McpClient {
     _service: RunningService<RoleClient, ()>,
     peer: McpPeer,
@@ -33,6 +38,8 @@ impl McpClient {
         }
     }
 
+    /// Connects to an MCP server by spawning `command` with `args` and
+    /// communicating over the child process's stdio.
     pub async fn connect_stdio(command: &str, args: &[&str]) -> Result<Self, LLMYError> {
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args);
@@ -45,6 +52,7 @@ impl McpClient {
         })
     }
 
+    /// Connects to an MCP server over Streamable HTTP at the given URL.
     pub async fn connect_http(url: &str) -> Result<Self, LLMYError> {
         let transport = rmcp::transport::StreamableHttpClientTransport::from_uri(url);
         let service = serve_client((), transport).await?;
@@ -55,6 +63,8 @@ impl McpClient {
         })
     }
 
+    /// Lists the server's tools and resources and returns them as a
+    /// [`ToolBox`] ready to be merged into an agent.
     pub async fn to_toolbox(&self) -> Result<ToolBox, LLMYError> {
         let mut toolbox = ToolBox::new();
 

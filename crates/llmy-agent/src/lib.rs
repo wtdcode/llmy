@@ -51,6 +51,7 @@
 //! [`tool`](macro@tool) attribute macro.
 
 pub mod agent;
+/// MCP server support — serve a [`tool::ToolBox`] over stdio or HTTP.
 pub mod mcp;
 pub mod tool;
 
@@ -59,6 +60,7 @@ pub use llmy_agent_derive::tool;
 pub use llmy_types::error::LLMYError;
 pub use tool::{Tool, ToolDyn};
 
+/// Re-export of the [`rmcp`] crate for MCP protocol types.
 pub mod rcmp {
     pub use rmcp::*;
 }

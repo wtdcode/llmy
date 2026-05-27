@@ -1,3 +1,6 @@
+//! MCP server support — expose a [`ToolBox`] as an MCP server over
+//! stdio or Streamable HTTP.
+
 use std::future::Future;
 use std::sync::Arc;
 
@@ -13,6 +16,10 @@ use rmcp::{ErrorData, ServerHandler, serve_server};
 
 use crate::tool::ToolBox;
 
+/// An MCP server backed by a [`ToolBox`].
+///
+/// Wraps a [`ToolBox`] and [`ServerInfo`], implementing the
+/// [`ServerHandler`] trait so it can be served over stdio or HTTP.
 #[derive(Clone)]
 pub struct McpToolBox {
     toolbox: ToolBox,
@@ -20,6 +27,7 @@ pub struct McpToolBox {
 }
 
 impl McpToolBox {
+    /// Creates a new MCP server from the given tools and server metadata.
     pub fn new(toolbox: ToolBox, server_info: ServerInfo) -> Self {
         Self {
             toolbox,
@@ -27,6 +35,7 @@ impl McpToolBox {
         }
     }
 
+    /// Serves the MCP server over stdin/stdout.
     pub async fn serve_stdio(self) -> Result<(), LLMYError> {
         let transport = stdio();
         let server = serve_server(self, transport).await?;
@@ -34,6 +43,7 @@ impl McpToolBox {
         Ok(())
     }
 
+    /// Serves the MCP server over Streamable HTTP on the given address.
     pub async fn serve_http(
         self,
         addr: impl tokio::net::ToSocketAddrs,
