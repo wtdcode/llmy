@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use llmy_agent::mcp::McpToolBox;
 use llmy_agent::tool::ToolBox;
-use llmy_agent_tools::files::{FindFileTool, ListDirectoryTool, ReadFileTool};
+use llmy_agent_tools::files::{FindFileTool, GrepDirectoryTool, ListDirectoryTool, ReadFileTool};
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::transport::StreamableHttpServerConfig;
 
@@ -28,7 +28,8 @@ pub async fn run_mcp_server(args: McpServerArgs) -> color_eyre::Result<()> {
     let mut toolbox = ToolBox::new();
     toolbox.add_tool(ReadFileTool::new(root.clone()));
     toolbox.add_tool(ListDirectoryTool::new_root(root.clone()));
-    toolbox.add_tool(FindFileTool::new(root));
+    toolbox.add_tool(FindFileTool::new(root.clone()));
+    toolbox.add_tool(GrepDirectoryTool::new(root));
 
     let server_info =
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(

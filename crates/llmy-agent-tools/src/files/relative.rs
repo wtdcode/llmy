@@ -4,15 +4,16 @@ use llmy_agent::LLMYError;
 use llmy_agent_derive::tool;
 
 use super::common::{
-    DeleteFileArgs, EditFileArgs, FindFileArgs, ListDirectoryToolArgs, ReadFileToolArgs,
-    WriteFileArgs, delete_file_at_path, edit_file_at_path, find_file_blocking_at_path,
-    list_directory_at_path, list_files_relative, read_file_at_path, sanitize_join_relative_path,
-    write_file_at_path,
+    DeleteFileArgs, EditFileArgs, FindFileArgs, GrepDirectoryArgs, ListDirectoryToolArgs,
+    ReadFileToolArgs, WriteFileArgs, delete_file_at_path, edit_file_at_path,
+    find_file_blocking_at_path, grep_directory_blocking_at_path, list_directory_at_path,
+    list_files_relative, read_file_at_path, sanitize_join_relative_path, write_file_at_path,
 };
 use super::prompt::{
     RELATIVE_DELETE_FILE_TOOL_DESCRIPTION, RELATIVE_EDIT_FILE_TOOL_DESCRIPTION,
-    RELATIVE_FIND_FILE_TOOL_DESCRIPTION, RELATIVE_LIST_DIRECTORY_TOOL_DESCRIPTION,
-    RELATIVE_READ_FILE_TOOL_DESCRIPTION, RELATIVE_WRITE_FILE_TOOL_DESCRIPTION,
+    RELATIVE_FIND_FILE_TOOL_DESCRIPTION, RELATIVE_GREP_TOOL_DESCRIPTION,
+    RELATIVE_LIST_DIRECTORY_TOOL_DESCRIPTION, RELATIVE_READ_FILE_TOOL_DESCRIPTION,
+    RELATIVE_WRITE_FILE_TOOL_DESCRIPTION,
 };
 
 /// Reads a file from a sandboxed working directory.
@@ -120,6 +121,45 @@ impl FindFileTool {
         })
         .await
         .expect("fail to join")
+    }
+}
+
+/// Searches file contents by regular expression under a sandboxed root.
+#[derive(Debug, Clone)]
+#[tool(
+    arguments = GrepDirectoryArgs,
+    invoke = grep_directory,
+    name = "grep",
+    description = RELATIVE_GREP_TOOL_DESCRIPTION,
+)]
+pub struct GrepDirectoryTool {
+    /// Root directory that all file operations are constrained to.
+    pub cwd: PathBuf,
+}
+
+impl GrepDirectoryTool {
+    /// Creates a recursive content-search tool rooted at `cwd`.
+    pub fn new(cwd: PathBuf) -> Self {
+        Self { cwd }
+    }
+
+    fn grep_directory_blocking(cwd: PathBuf, args: GrepDirectoryArgs) -> Result<String, LLMYError> {
+        let target_path = match sanitize_join_relative_path(&cwd, &args.directory) {
+            Ok(path) => path,
+            Err(error) => return Ok(error),
+        };
+
+        grep_directory_blocking_at_path(&target_path, &args.directory, &args, move |path| {
+            path.strip_prefix(&cwd).unwrap_or(path).to_path_buf()
+        })
+    }
+
+    /// Recursively searches `directory` for lines matching `pattern`.
+    pub async fn grep_directory(&self, args: GrepDirectoryArgs) -> Result<String, LLMYError> {
+        let cwd = self.cwd.clone();
+        tokio::task::spawn_blocking(move || Self::grep_directory_blocking(cwd, args))
+            .await
+            .expect("fail to join")
     }
 }
 

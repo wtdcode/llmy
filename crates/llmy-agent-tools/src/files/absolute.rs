@@ -11,14 +11,16 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use super::common::{
-    DeleteFileArgs, EditFileArgs, FindFileArgs, ReadFileToolArgs, WriteFileArgs,
-    delete_file_at_path, edit_file_at_path, find_file_blocking_at_path, list_directory_at_path,
-    list_files_absolute, read_file_at_path, write_file_at_path,
+    DeleteFileArgs, EditFileArgs, FindFileArgs, GrepDirectoryArgs, ReadFileToolArgs, WriteFileArgs,
+    delete_file_at_path, edit_file_at_path, find_file_blocking_at_path,
+    grep_directory_blocking_at_path, list_directory_at_path, list_files_absolute,
+    read_file_at_path, write_file_at_path,
 };
 use super::prompt::{
     ABSOLUTE_DELETE_FILE_TOOL_DESCRIPTION, ABSOLUTE_EDIT_FILE_TOOL_DESCRIPTION,
-    ABSOLUTE_FIND_FILE_TOOL_DESCRIPTION, ABSOLUTE_LIST_DIRECTORY_TOOL_DESCRIPTION,
-    ABSOLUTE_READ_FILE_TOOL_DESCRIPTION, ABSOLUTE_WRITE_FILE_TOOL_DESCRIPTION,
+    ABSOLUTE_FIND_FILE_TOOL_DESCRIPTION, ABSOLUTE_GREP_TOOL_DESCRIPTION,
+    ABSOLUTE_LIST_DIRECTORY_TOOL_DESCRIPTION, ABSOLUTE_READ_FILE_TOOL_DESCRIPTION,
+    ABSOLUTE_WRITE_FILE_TOOL_DESCRIPTION,
 };
 
 /// Arguments accepted by the dangerous direct-path list-directory tool.
@@ -111,6 +113,39 @@ impl AbsoluteFindFileTool {
         })
         .await
         .expect("fail to join")
+    }
+}
+
+/// Direct-path recursive content-search tool.
+///
+/// This bypasses the sandbox root and can search any directory visible to the
+/// current process, so prefer the relative-path variant whenever you can
+/// constrain the agent to a workspace root.
+#[derive(Debug, Clone, Default)]
+#[tool(
+    arguments = GrepDirectoryArgs,
+    invoke = grep_directory,
+    name = "grep",
+    description = ABSOLUTE_GREP_TOOL_DESCRIPTION,
+)]
+pub struct AbsoluteGrepDirectoryTool {}
+
+impl AbsoluteGrepDirectoryTool {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    fn grep_directory_blocking(args: GrepDirectoryArgs) -> Result<String, LLMYError> {
+        let target_path = args.directory.clone();
+        grep_directory_blocking_at_path(&target_path, &args.directory, &args, |path| {
+            path.to_path_buf()
+        })
+    }
+
+    pub async fn grep_directory(&self, args: GrepDirectoryArgs) -> Result<String, LLMYError> {
+        tokio::task::spawn_blocking(move || Self::grep_directory_blocking(args))
+            .await
+            .expect("fail to join")
     }
 }
 

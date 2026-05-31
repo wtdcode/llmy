@@ -1,15 +1,28 @@
 use std::{
     fmt::Write,
     fs::Metadata,
+    io,
     path::{Component, Path, PathBuf},
 };
 
+use grep::matcher::Matcher;
+use grep::pcre2::{RegexMatcher, RegexMatcherBuilder};
+use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
+use ignore::WalkBuilder;
+use ignore::overrides::{Override, OverrideBuilder};
 use llmy_agent::LLMYError;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
 pub const MAX_READ_BYTES: usize = 8192;
+
+/// Default cap on the number of matching lines a directory grep returns.
+pub const DEFAULT_GREP_MAX_MATCHES: usize = 50;
+
+/// Maximum number of bytes rendered for a single matching line before it is
+/// truncated. Keeps a single minified line from flooding the output.
+const MAX_GREP_LINE_BYTES: usize = 512;
 
 /// Joins a relative path to `cwd` while rejecting absolute and parent-traversal paths.
 pub fn sanitize_join_relative_path(cwd: &Path, rpath: &Path) -> Result<PathBuf, String> {
@@ -123,6 +136,34 @@ pub struct FindFileArgs {
     pub directory: PathBuf,
     /// Glob pattern matched against each file name, for example `*.rs`.
     pub file_name_pattern: String,
+}
+
+/// Arguments accepted by the directory-grep tools.
+#[derive(Deserialize, JsonSchema)]
+pub struct GrepDirectoryArgs {
+    /// Directory to search recursively for file contents.
+    pub directory: PathBuf,
+    /// PCRE2 regular expression. Only lines matching it are reported.
+    pub pattern: String,
+    /// Optional PCRE2 regular expression. Lines that also match this pattern are
+    /// dropped from the results, like piping through `grep -v`.
+    #[serde(default)]
+    pub invert_pattern: Option<String>,
+    /// Optional glob patterns (globset / gitignore syntax, e.g. `*.rs`,
+    /// `src/**/*.ts`) restricting which files are searched. When non-empty, only
+    /// files matching at least one pattern are searched.
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// Optional glob patterns (globset / gitignore syntax) excluding files from
+    /// the search. Applied on top of `include`.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Search case-insensitively. Defaults to false.
+    #[serde(default)]
+    pub case_insensitive: bool,
+    /// Maximum number of matching lines to return. Defaults to 50.
+    #[serde(default)]
+    pub max_matches: Option<usize>,
 }
 
 /// Arguments accepted by file-writing tools.
@@ -326,6 +367,232 @@ where
         pattern,
         lns.join("\n")
     ))
+}
+
+/// A single matching line collected during a directory grep.
+struct GrepMatch {
+    display: String,
+    line_number: u64,
+    content: String,
+}
+
+/// Truncates a single line to [`MAX_GREP_LINE_BYTES`] on a char boundary.
+fn truncate_line(line: &str) -> String {
+    if line.len() <= MAX_GREP_LINE_BYTES {
+        return line.to_string();
+    }
+
+    let mut cutoff = MAX_GREP_LINE_BYTES;
+    while cutoff > 0 && !line.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    format!("{}… [line truncated]", &line[..cutoff])
+}
+
+/// Builds a PCRE2 matcher mirroring the engine ripgrep uses for `--pcre2`.
+fn build_pcre2_matcher(
+    pattern: &str,
+    case_insensitive: bool,
+) -> Result<RegexMatcher, grep::pcre2::Error> {
+    RegexMatcherBuilder::new()
+        .caseless(case_insensitive)
+        .build(pattern)
+}
+
+/// Builds the include/exclude override set, applying excludes as negated globs
+/// just like ripgrep's `--glob` handling (which is itself backed by globset).
+fn build_overrides(
+    root: &Path,
+    include: &[String],
+    exclude: &[String],
+) -> Result<Override, ignore::Error> {
+    let mut builder = OverrideBuilder::new(root);
+    for glob in include {
+        builder.add(glob)?;
+    }
+    for glob in exclude {
+        builder.add(&format!("!{}", glob))?;
+    }
+    builder.build()
+}
+
+/// Collects matching lines from a single file, honoring the invert pattern and
+/// the global match limit.
+struct GrepSink<'a> {
+    matches: &'a mut Vec<GrepMatch>,
+    display: &'a str,
+    invert: Option<&'a RegexMatcher>,
+    limit: usize,
+}
+
+impl Sink for GrepSink<'_> {
+    type Error = io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, io::Error> {
+        if let Some(invert) = self.invert {
+            if invert.is_match(mat.bytes()).map_err(io::Error::other)? {
+                // Matches the invert pattern, so skip it but keep searching.
+                return Ok(true);
+            }
+        }
+
+        let raw = String::from_utf8_lossy(mat.bytes());
+        let trimmed = raw.trim_end_matches(['\n', '\r']);
+        self.matches.push(GrepMatch {
+            display: self.display.to_string(),
+            line_number: mat.line_number().unwrap_or(0),
+            content: truncate_line(trimmed),
+        });
+
+        // Stop searching this file once the global limit is reached.
+        Ok(self.matches.len() < self.limit)
+    }
+}
+
+/// Recursively greps `target_path` for lines matching `args.pattern`.
+///
+/// `display_match_path` maps each matched file's on-disk path to the path shown
+/// in the output, letting the relative tool strip the sandbox root while the
+/// absolute tool renders the path verbatim.
+pub fn grep_directory_blocking_at_path<F>(
+    target_path: &Path,
+    display_path: &Path,
+    args: &GrepDirectoryArgs,
+    display_match_path: F,
+) -> Result<String, LLMYError>
+where
+    F: Fn(&Path) -> PathBuf,
+{
+    if !target_path.is_dir() {
+        return Ok(format!("{:?} is not a directory", display_path));
+    }
+
+    let limit = args.max_matches.unwrap_or(DEFAULT_GREP_MAX_MATCHES);
+    if limit == 0 {
+        return Ok("max_matches must be greater than or equal to 1".to_string());
+    }
+
+    let matcher = match build_pcre2_matcher(&args.pattern, args.case_insensitive) {
+        Ok(matcher) => matcher,
+        Err(error) => {
+            return Ok(format!(
+                "Fail to compile the match pattern due to {}",
+                error
+            ));
+        }
+    };
+    let invert_matcher = match args.invert_pattern.as_deref() {
+        Some(pattern) => match build_pcre2_matcher(pattern, args.case_insensitive) {
+            Ok(matcher) => Some(matcher),
+            Err(error) => {
+                return Ok(format!(
+                    "Fail to compile the invert pattern due to {}",
+                    error
+                ));
+            }
+        },
+        None => None,
+    };
+
+    let overrides = match build_overrides(target_path, &args.include, &args.exclude) {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            return Ok(format!(
+                "Fail to compile the include/exclude globs due to {}",
+                error
+            ));
+        }
+    };
+
+    let walker = WalkBuilder::new(target_path).overrides(overrides).build();
+    let mut searcher = SearcherBuilder::new()
+        .line_number(true)
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .build();
+
+    let mut matches: Vec<GrepMatch> = Vec::new();
+    let mut truncated = false;
+
+    for entry in walker {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+
+        let path = entry.path();
+        let display = display_match_path(path).to_string_lossy().into_owned();
+        let sink = GrepSink {
+            matches: &mut matches,
+            display: &display,
+            invert: invert_matcher.as_ref(),
+            limit,
+        };
+
+        if let Err(error) = searcher.search_path(&matcher, path, sink) {
+            tracing::debug!(path = ?path, %error, "grep: failed to search file");
+            continue;
+        }
+
+        if matches.len() >= limit {
+            truncated = true;
+            break;
+        }
+    }
+
+    Ok(format_grep_results(
+        display_path,
+        args,
+        &matches,
+        limit,
+        truncated,
+    ))
+}
+
+/// Renders the collected matches into the textual tool result.
+fn format_grep_results(
+    display_path: &Path,
+    args: &GrepDirectoryArgs,
+    matches: &[GrepMatch],
+    limit: usize,
+    truncated: bool,
+) -> String {
+    if matches.is_empty() {
+        return format!(
+            "No matching lines for pattern {:?} under {:?}.",
+            args.pattern, display_path
+        );
+    }
+
+    let mut out = format!(
+        "Found {} matching line(s) for pattern {:?} under {:?}:\n",
+        matches.len(),
+        args.pattern,
+        display_path
+    );
+    for (index, grep_match) in matches.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let _ = write!(
+            out,
+            "{}:{}:{}",
+            grep_match.display, grep_match.line_number, grep_match.content
+        );
+    }
+    if truncated {
+        let _ = write!(
+            out,
+            "\n... reached the max_matches limit of {}; more matches may exist.",
+            limit
+        );
+    }
+    out
 }
 
 pub async fn write_file_at_path(

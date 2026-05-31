@@ -32,6 +32,9 @@ const_format = "0.2"
 fastembed = { version = "5", default-features = false }
 tempfile = "3"
 glob = "0.3"
+globset = "0.4"
+grep = { version = "0.3", features = ["pcre2"] }
+ignore = "0.4"
 walkdir = "2"
 dotenvy = "0"
 rustyline = "18"

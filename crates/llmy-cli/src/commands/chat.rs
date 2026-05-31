@@ -7,7 +7,8 @@ use clap::Args;
 use llmy_agent::tool::ToolBox;
 use llmy_agent_tools::bash::{BashTool, BashToolConfig};
 use llmy_agent_tools::files::{
-    DeleteFileTool, EditFileTool, FindFileTool, ListDirectoryTool, ReadFileTool, WriteFileTool,
+    DeleteFileTool, EditFileTool, FindFileTool, GrepDirectoryTool, ListDirectoryTool, ReadFileTool,
+    WriteFileTool,
 };
 use llmy_agent_tools::mcp::McpClient;
 #[cfg(feature = "memory-embed-search")]
@@ -217,6 +218,7 @@ fn build_toolbox(files_root: Option<PathBuf>, bash_root: Option<PathBuf>) -> Too
         toolbox.add_tool(ReadFileTool::new(root.clone()));
         toolbox.add_tool(ListDirectoryTool::new_root(root.clone()));
         toolbox.add_tool(FindFileTool::new(root.clone()));
+        toolbox.add_tool(GrepDirectoryTool::new(root.clone()));
         toolbox.add_tool(WriteFileTool::new(root.clone()));
         toolbox.add_tool(DeleteFileTool::new(root.clone()));
         toolbox.add_tool(EditFileTool::new(root));

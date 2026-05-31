@@ -11,6 +11,8 @@ pub const LIST_DIRECTORY_USAGE_DESCRIPTION: &str = "Lists the immediate entries 
 
 pub const FIND_FILE_USAGE_DESCRIPTION: &str = "Finds files by glob pattern.\n\nUsage:\n- Supports glob patterns such as `*.rs` or `src/**/*.ts`.\n- Searches recursively under the given directory.\n- Use this tool when you need to find files by name pattern rather than by file contents.";
 
+pub const GREP_USAGE_DESCRIPTION: &str = "Searches file contents recursively for lines matching a regular expression, in the spirit of ripgrep.\n\nUsage:\n- `pattern` is a PCRE2 regular expression (the same engine as `rg --pcre2`); only lines matching it are returned.\n- Provide `invert_pattern` (also PCRE2) to drop lines that additionally match it, like piping through `grep -v`.\n- Use `include`/`exclude` glob patterns (globset / gitignore syntax such as `*.rs` or `src/**/*.ts`) to limit which files are searched.\n- `.gitignore` rules and hidden files are respected, and binary files are skipped, just like ripgrep.\n- Results are reported as `path:line_number:line` and capped by `max_matches` (default 50).\n- Use `find_file` instead when you need to locate files by name rather than search their contents.";
+
 pub const WRITE_FILE_USAGE_DESCRIPTION: &str = "Writes a file to the local filesystem.\n\nUsage:\n- This tool overwrites the existing file if there is one at the target path.\n- Prefer `edit_file` for localized modifications; use `write_file` for new files or complete rewrites.\n- If you are replacing existing content, read the file first so you do not accidentally discard unrelated changes.\n- Parent directories are created automatically.";
 
 pub const DELETE_FILE_USAGE_DESCRIPTION: &str = "Deletes a file from the local filesystem.\n\nUsage:\n- This tool only deletes files, not directories.\n- Deletion is permanent from the tool's perspective, so verify the path carefully before using it.\n- If you are not certain about the target, inspect the directory or read the file first.";
@@ -57,6 +59,20 @@ pub const ABSOLUTE_FIND_FILE_TOOL_DESCRIPTION: &str = concatcp!(
     DIRECT_PATH_USAGE_DESCRIPTION,
     " ",
     FIND_FILE_USAGE_DESCRIPTION,
+);
+
+pub const RELATIVE_GREP_TOOL_DESCRIPTION: &str = concatcp!(
+    "Search file contents in the sandboxed local filesystem. ",
+    SANDBOXED_PATH_USAGE_DESCRIPTION,
+    " ",
+    GREP_USAGE_DESCRIPTION,
+);
+
+pub const ABSOLUTE_GREP_TOOL_DESCRIPTION: &str = concatcp!(
+    "Search file contents in the local filesystem using the provided path without sandboxing. ",
+    DIRECT_PATH_USAGE_DESCRIPTION,
+    " ",
+    GREP_USAGE_DESCRIPTION,
 );
 
 pub const RELATIVE_WRITE_FILE_TOOL_DESCRIPTION: &str = concatcp!(
