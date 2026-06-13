@@ -57,6 +57,11 @@ impl AgentConfig {
         }
         config
     }
+
+    pub fn sequential_toolcall(mut self) -> Self {
+        self.sequential_tool_call = true;
+        self
+    }
 }
 
 /// Agent implementation backed by an in-memory conversation context and toolbox.
