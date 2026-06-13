@@ -1,5 +1,6 @@
 use std::{fmt, str::FromStr};
 
+use rust_decimal::{Decimal, dec};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use llmy_tokenizer::{ModelConfig, ModelId, ModelPricing, ModelTokens};
@@ -76,8 +77,8 @@ impl OpenAIModel {
     /// Per-token USD pricing. Returns zero pricing if unavailable.
     pub fn pricing(&self) -> ModelPricing {
         self.config.pricing.unwrap_or(ModelPricing {
-            input: 0.0,
-            output: 0.0,
+            input: Decimal::ZERO,
+            output: Decimal::ZERO,
             input_cache_read: None,
             input_cache_write: None,
         })
@@ -118,30 +119,33 @@ impl FromStr for OpenAIModel {
         if let Some(comma_pos) = s.find(',') {
             let name = &s[..comma_pos];
             let rest = &s[comma_pos + 1..];
-            let values: Vec<f64> = rest
+            let values: Vec<Decimal> = rest
                 .split(',')
-                .map(|t| f64::from_str(t.trim()))
+                .map(|t| Decimal::from_str(t.trim()))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
 
+            // CLI prices are per-1M-token USD; convert to per-token. Decimal
+            // division by a power of ten is exact (it just shifts the scale).
+            let per_million = dec!(1_000_000);
             let pricing = match values.len() {
                 2 => ModelPricing {
-                    input: values[0] / 1e6,
-                    output: values[1] / 1e6,
+                    input: values[0] / per_million,
+                    output: values[1] / per_million,
                     input_cache_read: None,
                     input_cache_write: None,
                 },
                 3 => ModelPricing {
-                    input: values[0] / 1e6,
-                    output: values[1] / 1e6,
-                    input_cache_read: Some(values[2] / 1e6),
+                    input: values[0] / per_million,
+                    output: values[1] / per_million,
+                    input_cache_read: Some(values[2] / per_million),
                     input_cache_write: None,
                 },
                 4 => ModelPricing {
-                    input: values[0] / 1e6,
-                    output: values[1] / 1e6,
-                    input_cache_read: Some(values[2] / 1e6),
-                    input_cache_write: Some(values[3] / 1e6),
+                    input: values[0] / per_million,
+                    output: values[1] / per_million,
+                    input_cache_read: Some(values[2] / per_million),
+                    input_cache_write: Some(values[3] / per_million),
                 },
                 _ => {
                     return Err(
@@ -218,10 +222,6 @@ fn find_registered_model(name: &str) -> Option<(ModelId, ModelConfig)> {
 mod tests {
     use super::*;
 
-    fn assert_close(left: f64, right: f64) {
-        assert!((left - right).abs() < f64::EPSILON);
-    }
-
     #[test]
     fn custom_pricing_reuses_registered_model_limits() {
         let model = OpenAIModel::from_str("DeepSeek V4 Flash,0.5,1.5,0.1").unwrap();
@@ -232,9 +232,12 @@ mod tests {
         assert_eq!(model.model_name(), "deepseek-v4-flash");
         assert_eq!(model.config.max_input_tokens, 655360);
         assert_eq!(model.config.max_tokens, 393216);
-        assert_close(pricing.input, 5e-07);
-        assert_close(pricing.output, 1.5e-06);
-        assert_close(pricing.input_cache_read.unwrap(), 1e-07);
+        assert_eq!(pricing.input, rust_decimal::dec!(0.0000005));
+        assert_eq!(pricing.output, rust_decimal::dec!(0.0000015));
+        assert_eq!(
+            pricing.input_cache_read.unwrap(),
+            rust_decimal::dec!(0.0000001)
+        );
     }
 
     #[test]
@@ -248,8 +251,8 @@ mod tests {
         assert_eq!(model.model_name(), "custom-model");
         assert_eq!(model.config.max_input_tokens, 0);
         assert_eq!(model.config.max_tokens, 0);
-        assert_close(pricing.input, 2e-06);
-        assert_close(pricing.output, 4e-06);
+        assert_eq!(pricing.input, rust_decimal::dec!(0.000002));
+        assert_eq!(pricing.output, rust_decimal::dec!(0.000004));
     }
 
     #[test]

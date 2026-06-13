@@ -13,6 +13,8 @@ use async_openai::{
 use color_eyre::eyre::eyre;
 use llmy_types::error::LLMYError;
 use llmy_types::other::WithOtherFields;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::de::DeserializeOwned;
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
@@ -154,7 +156,7 @@ impl LLM {
     pub fn new(
         config: SupportedConfig,
         model: OpenAIModel,
-        cap: f64,
+        cap: Decimal,
         settings: LLMSettings,
         debug_backend: Option<DebugBackend>,
     ) -> Self {
@@ -209,7 +211,7 @@ impl LLM {
     pub async fn new_async(
         config: SupportedConfig,
         model: OpenAIModel,
-        cap: f64,
+        cap: Decimal,
         settings: LLMSettings,
         debug_prefix: Option<String>,
         debug_target: Option<String>,
@@ -240,7 +242,7 @@ pub struct LLMInner {
     pub debug_backend: Option<DebugBackend>,
     pub endpoint: String,
     pub azure_deployment: Option<String>,
-    pub cap: f64,
+    pub cap: Decimal,
     pub default_settings: LLMSettings,
     content_filter: StdRwLock<Box<dyn OpenAIContentFilter>>,
 }
@@ -276,7 +278,9 @@ impl LLMInner {
             endpoint: self.endpoint.clone(),
             azure_deployment: self.azure_deployment.clone(),
             cache_key: cache_key.map(|s| s.to_string()),
-            cap_usd: self.cap,
+            // The debug DB stores USD as a SQLite REAL column; SQLite has no
+            // native decimal type, so collapse to f64 only at this boundary.
+            cap_usd: self.cap.to_f64().unwrap_or_default(),
         }
     }
 

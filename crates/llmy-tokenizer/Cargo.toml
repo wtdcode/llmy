@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 tiktoken-rs = "0.9"
+rust_decimal = { workspace = true, features = ["macros"] }
 
 [build-dependencies]
 serde = { workspace = true, features = ["derive"] }

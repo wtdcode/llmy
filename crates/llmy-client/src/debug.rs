@@ -10,6 +10,7 @@ use tokio::io::AsyncWriteExt;
 use color_eyre::eyre::eyre;
 use itertools::Itertools;
 use llmy_types::error::LLMYError;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sqlx::{
     Row,
@@ -813,8 +814,10 @@ impl Sqlite3DebugDB {
         .bind(usage.cached_tokens as i64)
         .bind(usage.output_without_reasoning_tokens as i64)
         .bind(usage.reasoning_tokens as i64)
-        .bind(billing.current)
-        .bind(billing.cap)
+        // SQLite stores USD as REAL; convert the exact Decimal to f64 only at
+        // this storage boundary (the debug DB is observability-only).
+        .bind(billing.current.to_f64().unwrap_or_default())
+        .bind(billing.cap.to_f64().unwrap_or_default())
         .bind(row_id)
         .execute(&self.pool)
         .await
@@ -1085,7 +1088,7 @@ mod sqlite_tests {
         let resp = dummy_resp();
         db.update_response(id, &req, &resp).await.unwrap();
 
-        let billing = ModelBilling::new(10.0);
+        let billing = ModelBilling::new(rust_decimal::dec!(10.0));
         let usage = DebugUsage {
             input_without_cached_tokens: 7,
             cached_tokens: 3,

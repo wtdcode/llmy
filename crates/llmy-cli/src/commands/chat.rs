@@ -17,7 +17,6 @@ use llmy_agent_tools::memory::{
     embed::{SimilarityModel, SimilarityModelConfig},
 };
 use llmy_clap::OpenAISetup;
-use llmy_client::client::LLM;
 use llmy_harness::Agent;
 #[cfg(feature = "memory-embed-search")]
 use llmy_harness::memory::AgentMemorySystemPromptCriteria;

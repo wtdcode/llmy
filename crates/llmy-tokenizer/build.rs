@@ -70,9 +70,18 @@ fn fmt_f64(v: f64) -> String {
     format!("{:?}", v)
 }
 
-fn fmt_opt_f64(v: Option<f64>) -> String {
+/// Emit a `Decimal` literal from a JSON-sourced price. `f64`'s `Display`
+/// (unlike `Debug`) never uses scientific notation, so it yields the exact,
+/// shortest decimal string (e.g. `1e-06` -> `0.000001`) that `dec!` parses
+/// losslessly. Prices are exact decimals in `models.json`, so no precision is
+/// lost going JSON number -> f64 -> shortest decimal string -> Decimal.
+fn fmt_decimal(v: f64) -> String {
+    format!("rust_decimal::dec!({})", v)
+}
+
+fn fmt_opt_decimal(v: Option<f64>) -> String {
     match v {
-        Some(val) => format!("Some({:?})", val),
+        Some(val) => format!("Some({})", fmt_decimal(val)),
         None => "None".to_string(),
     }
 }
@@ -232,10 +241,10 @@ fn generate_models(data_dir: &Path, out_dir: &str) {
         let pricing = match &c.pricing {
             Some(p) => format!(
                 "Some(super::ModelPricing {{ input: {}, output: {}, input_cache_read: {}, input_cache_write: {} }})",
-                fmt_f64(p.input),
-                fmt_f64(p.output),
-                fmt_opt_f64(p.input_cache_read),
-                fmt_opt_f64(p.input_cache_write),
+                fmt_decimal(p.input),
+                fmt_decimal(p.output),
+                fmt_opt_decimal(p.input_cache_read),
+                fmt_opt_decimal(p.input_cache_write),
             ),
             None => "None".to_string(),
         };

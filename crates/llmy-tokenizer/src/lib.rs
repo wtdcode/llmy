@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
 
+use rust_decimal::Decimal;
 use tiktoken_rs::CoreBPE;
 
 // Build-time generated data
@@ -67,10 +68,14 @@ pub struct ModelTokens {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ModelPricing {
-    pub input: f64,
-    pub output: f64,
-    pub input_cache_read: Option<f64>,
-    pub input_cache_write: Option<f64>,
+    /// Per-token USD price for uncached input.
+    pub input: Decimal,
+    /// Per-token USD price for output.
+    pub output: Decimal,
+    /// Per-token USD price for cache reads (falls back to `input` when absent).
+    pub input_cache_read: Option<Decimal>,
+    /// Per-token USD price for cache writes.
+    pub input_cache_write: Option<Decimal>,
 }
 
 #[derive(Debug, Clone)]
@@ -298,7 +303,10 @@ mod tests {
         assert_eq!(model.encoding(), Some(Encoding::O200kBase));
         assert_eq!(model.max_input_tokens, 917504);
         assert_eq!(model.max_tokens, 131072);
-        assert_eq!(model.pricing.expect("mimo pricing").input, 1e-06);
+        assert_eq!(
+            model.pricing.expect("mimo pricing").input,
+            rust_decimal::dec!(0.000001)
+        );
     }
 
     #[test]
@@ -308,7 +316,10 @@ mod tests {
         assert_eq!(model.encoding(), Some(Encoding::O200kBase));
         assert_eq!(model.max_input_tokens, 655360);
         assert_eq!(model.max_tokens, 393216);
-        assert_eq!(model.pricing.expect("deepseek pricing").input, 1.4e-07);
+        assert_eq!(
+            model.pricing.expect("deepseek pricing").input,
+            rust_decimal::dec!(0.00000014)
+        );
     }
 
     #[test]

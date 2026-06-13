@@ -25,8 +25,8 @@ macro_rules! make_openai_args {
             #[arg(long = concat!($long, "azure-api-version"), env = concat!($prefix, "AZURE_API_VERSION"), default_value = "2025-01-01-preview")]
             pub azure_api_version: String,
 
-            #[arg(long = concat!($long, "biling-cap"), default_value_t = 10.0, env = concat!($prefix, "OPENAI_BILLING_CAP"))]
-            pub biling_cap: f64,
+            #[arg(long = concat!($long, "biling-cap"), default_value_t = rust_decimal::dec!(10.0), env = concat!($prefix, "OPENAI_BILLING_CAP"))]
+            pub biling_cap: rust_decimal::Decimal,
 
             #[arg(long = concat!($long, "model"), env = concat!($prefix, "OPENAI_API_MODEL"))]
             pub model: Option<OpenAIModel>,

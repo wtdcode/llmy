@@ -2,6 +2,7 @@ use std::fmt::Display;
 
 use async_openai::error::OpenAIError;
 use rmcp::service::{ClientInitializeError, ServerInitializeError, ServiceError};
+use rust_decimal::Decimal;
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -29,7 +30,7 @@ pub enum LLMYError {
     #[error("json error: {0}")]
     STDJSON(#[from] serde_json::Error),
     #[error("billing error: reach cap {0}, current {1}")]
-    Billing(f64, f64),
+    Billing(Decimal, Decimal),
     #[error("incorrect tool call for tool {0} with args {1} given schema {2:?}")]
     IncorrectToolCall(String, String, schemars::Schema),
     #[error("toolcall {0} has nested error: {1}")]

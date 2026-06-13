@@ -102,10 +102,14 @@ fn format_token_usage(
     approx_context_tokens: Option<usize>,
     model: &ModelConfig,
 ) -> String {
-    let uncached_input_tokens = billing.input_tokens.saturating_sub(billing.cache_tokens);
+    let uncached_input_tokens = billing
+        .tokens
+        .input_tokens
+        .saturating_sub(billing.tokens.cache_tokens);
     let non_reasoning_output_tokens = billing
+        .tokens
         .output_tokens
-        .saturating_sub(billing.reasoning_tokens);
+        .saturating_sub(billing.tokens.reasoning_tokens);
     let context_usage = match (approx_context_tokens, model.max_input_tokens) {
         (Some(tokens), max_input_tokens) if max_input_tokens > 0 => format!(
             "approx_context_tokens: {} / {} (remaining={})",
@@ -128,11 +132,13 @@ fn format_token_usage(
         "Session token usage:".to_string(),
         format!(
             "input_tokens: total={} uncached={} cached={}",
-            billing.input_tokens, uncached_input_tokens, billing.cache_tokens
+            billing.tokens.input_tokens, uncached_input_tokens, billing.tokens.cache_tokens
         ),
         format!(
             "output_tokens: total={} response={} reasoning={}",
-            billing.output_tokens, non_reasoning_output_tokens, billing.reasoning_tokens
+            billing.tokens.output_tokens,
+            non_reasoning_output_tokens,
+            billing.tokens.reasoning_tokens
         ),
         format!(
             "estimated_cost_usd: {:.4} / {}",
@@ -145,7 +151,7 @@ fn format_token_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llmy_client::billing::ModelBilling;
+    use llmy_client::billing::{ModelBilling, TokenUsage};
     use std::str::FromStr;
 
     #[test]
@@ -230,12 +236,14 @@ mod tests {
     fn format_token_usage_renders_cached_and_reasoning_breakdown() {
         let rendered = format_token_usage(
             &ModelBilling {
-                input_tokens: 120,
-                output_tokens: 45,
-                cache_tokens: 20,
-                reasoning_tokens: 5,
-                current: 0.0123,
-                cap: 10.0,
+                tokens: TokenUsage {
+                    input_tokens: 120,
+                    output_tokens: 45,
+                    cache_tokens: 20,
+                    reasoning_tokens: 5,
+                },
+                current: rust_decimal::dec!(0.0123),
+                cap: rust_decimal::dec!(10.0),
             },
             Some(512),
             &llmy_client::model::OpenAIModel::from_str("o1")

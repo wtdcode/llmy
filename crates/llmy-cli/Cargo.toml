@@ -25,6 +25,7 @@ llmy-agent-tools.workspace = true
 llmy-harness.workspace = true
 llmy-client.workspace = true
 llmy-tokenizer.workspace = true
+rust_decimal = { workspace = true, features = ["macros"] }
 tokio = {workspace = true, features = ["full"]}
 tracing.workspace = true
 color-eyre.workspace = true

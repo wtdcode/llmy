@@ -44,6 +44,7 @@ regex = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 axum = "0.8"
 rmcp = { version = "1", default-features = false }
+rust_decimal = { version = "1" }
 
 llmy-clap = {version = "0.14.1", path = "./crates/llmy-clap"}
 llmy-client = {version = "0.14.1", path = "./crates/llmy-client"}
