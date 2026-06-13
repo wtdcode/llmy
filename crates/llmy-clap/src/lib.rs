@@ -1,6 +1,11 @@
 use clap::Args;
+use color_eyre::eyre::eyre;
 use llmy_client::{client::*, model::OpenAIModel, settings::*};
 use llmy_types::error::LLMYError;
+
+/// Default OpenAI-compatible base URL, used when neither `--openai-url` nor
+/// `--azure-openai-endpoint` is provided.
+const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1";
 
 macro_rules! make_openai_args {
     ($struct_name:ident, $prefix:literal, $long:literal) => {
@@ -9,9 +14,8 @@ macro_rules! make_openai_args {
             #[arg(
                 long = concat!($long, "openai-url"),
                 env = concat!($prefix, "OPENAI_API_URL"),
-                default_value = "https://api.openai.com/v1"
             )]
-            pub openai_url: String,
+            pub openai_url: Option<String>,
 
             #[arg(long = concat!($long, "azure-openai-endpoint"), env = concat!($prefix, "AZURE_OPENAI_ENDPOINT"))]
             pub azure_openai_endpoint: Option<String>,
@@ -100,33 +104,54 @@ macro_rules! make_openai_args {
                 }
             }
 
-            pub fn to_config(&self) -> SupportedConfig {
-                if let Some(ep) = self.azure_openai_endpoint.as_ref() {
-                    // Azure deployment names are user-chosen and almost never
-                    // contain `/`; fall back to the bare model name, not the
-                    // canonical `owner/name` form.
-                    let fallback_deployment = self
-                        .model
-                        .as_ref()
-                        .expect("LLM model id not given")
-                        .model_name()
-                        .to_string();
-                    SupportedConfig::new_azure(
-                        ep,
-                        self.openai_key.clone().unwrap_or_default().as_str(),
-                        self.azure_deployment
-                            .as_deref()
-                            .unwrap_or(&fallback_deployment),
-                        &self.azure_api_version
-                    )
-                } else {
-                    SupportedConfig::new(&self.openai_url, self.openai_key.clone().unwrap_or_default().as_str())
+            /// Build the upstream config from the URL/endpoint flags:
+            /// - neither set      => OpenAI at [`DEFAULT_OPENAI_URL`]
+            /// - only `openai-url`   => OpenAI at that URL
+            /// - only `azure-...`    => Azure
+            /// - both set            => error (ambiguous)
+            pub fn to_config(&self) -> Result<SupportedConfig, LLMYError> {
+                let key = self.openai_key.clone().unwrap_or_default();
+                match (&self.openai_url, &self.azure_openai_endpoint) {
+                    (Some(_), Some(_)) => Err(LLMYError::Other(eyre!(
+                        "both --openai-url and --azure-openai-endpoint are set; provide only one"
+                    ))),
+                    (None, Some(ep)) => {
+                        // Azure deployment names are user-chosen and almost never
+                        // contain `/`; fall back to the bare model name, not the
+                        // canonical `owner/name` form. The model is only needed
+                        // for that fallback, so require it only when no explicit
+                        // deployment is given.
+                        let deployment = match self.azure_deployment.as_deref() {
+                            Some(deployment) => deployment.to_string(),
+                            None => self
+                                .model
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    LLMYError::Other(eyre!(
+                                        "azure config needs --azure-deployment or a model id to \
+                                         derive it from"
+                                    ))
+                                })?
+                                .model_name()
+                                .to_string(),
+                        };
+                        Ok(SupportedConfig::new_azure(
+                            ep,
+                            key.as_str(),
+                            &deployment,
+                            &self.azure_api_version,
+                        ))
+                    }
+                    (openai_url, None) => {
+                        let url = openai_url.as_deref().unwrap_or(DEFAULT_OPENAI_URL);
+                        Ok(SupportedConfig::new(url, key.as_str()))
+                    }
                 }
             }
 
 
             async fn llm_new_inner(&self, model: OpenAIModel) -> Result<LLM, LLMYError> {
-                let config = self.to_config();
+                let config = self.to_config()?;
                 let debug_target = self.llm_debug.clone();
                 let model = model.with_full_id(self.use_full_model_id);
                 LLM::new_async(
@@ -149,7 +174,7 @@ macro_rules! make_openai_args {
                 let model = self.model.clone().expect("LLM model not given");
                 self.llm_new_inner(model)
                     .await
-                    .expect("Failed to construct LLM")
+                    .expect("construct LLM")
             }
         }
     };
