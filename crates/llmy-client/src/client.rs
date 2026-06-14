@@ -308,6 +308,32 @@ impl LLMInner {
         .await
     }
 
+    /// Like [`Self::prompt_once_with_retry`], but a response whose first-choice
+    /// content fails to deserialize into `T` is treated as a transient failure
+    /// and retried (up to `settings.llm_retry`).
+    pub async fn prompt_once_with_retry_typed<T: DeserializeOwned>(
+        &self,
+        sys_msg: &str,
+        user_msg: &str,
+        debug_prefix: Option<&str>,
+        cache_key: Option<&str>,
+        settings: Option<LLMSettings>,
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        let sys = ChatCompletionRequestSystemMessageRaw::new_text(sys_msg);
+        let user = ChatCompletionRequestUserMessageRaw::new_text(user_msg);
+        self.prompt_messages_once_typed::<T>(
+            vec![
+                ChatCompletionRequestMessageRaw::System(sys),
+                ChatCompletionRequestMessageRaw::User(user),
+            ],
+            debug_prefix,
+            cache_key,
+            settings,
+            None,
+        )
+        .await
+    }
+
     // Note only consider the `content` of the first choice
     pub async fn prompt_json_with_retry<T: DeserializeOwned>(
         &self,
@@ -317,20 +343,17 @@ impl LLMInner {
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
     ) -> Result<Option<T>, LLMYError> {
+        // The typed prompt already retries until the content parses as `T`, so by
+        // the time we get here the first-choice content is known to deserialize
+        // (or be absent); this final parse is just to hand back the value.
         let msg = self
-            .prompt_once_with_retry(sys_msg, user_msg, debug_prefix, cache_key, settings)
+            .prompt_once_with_retry_typed::<T>(sys_msg, user_msg, debug_prefix, cache_key, settings)
             .await?;
         Ok(msg
             .choices
             .first()
-            .map(|v| {
-                v.inner
-                    .message
-                    .content
-                    .as_ref()
-                    .map(|k| serde_json::from_str::<T>(&k))
-            })
-            .flatten()
+            .and_then(|v| v.inner.message.content.as_ref())
+            .map(|k| serde_json::from_str::<T>(k))
             .transpose()?)
     }
 
@@ -372,6 +395,35 @@ impl LLMInner {
         last.ok_or_else(|| eyre!("no response after {} retries?!", retry))?
     }
 
+    /// Like [`Self::complete_extensible_once_with_retry`], but each attempt also
+    /// requires the first-choice content to deserialize into `T`; a malformed
+    /// response is retried like any other error (reusing the same `retry` budget).
+    pub async fn complete_extensible_once_with_retry_typed<T: DeserializeOwned>(
+        &self,
+        req: &RawExtensibleChatCompletionRequest,
+        debug_prefix: Option<&str>,
+        timeout: Option<Duration>,
+        retry: Option<u64>,
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        let retry = retry.unwrap_or(u64::MAX);
+
+        let mut last = None;
+        for idx in 0..retry {
+            match self
+                .complete_extensible_typed::<T>(req.clone(), debug_prefix, timeout)
+                .await
+            {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    tracing::warn!("Having an error {} during {} retry", e, idx);
+                    last = Some(Err(e));
+                }
+            }
+        }
+
+        last.ok_or_else(|| eyre!("no response after {} retries?!", retry))?
+    }
+
     pub async fn complete(
         &self,
         req: CreateChatCompletionRequestRaw,
@@ -381,6 +433,32 @@ impl LLMInner {
         let req = RawExtensibleChatCompletionRequest::new(req);
         self.complete_extensible(req, debug_prefix, timeout_overwrite)
             .await
+    }
+
+    /// A single completion attempt that additionally requires the first-choice
+    /// content to deserialize into `T`, surfacing a malformed response as an
+    /// error so the caller's retry loop re-issues it. The retry itself lives in
+    /// [`Self::complete_extensible_once_with_retry_typed`].
+    pub async fn complete_extensible_typed<T: DeserializeOwned>(
+        &self,
+        req: RawExtensibleChatCompletionRequest,
+        debug_prefix: Option<&str>,
+        timeout_overwrite: Option<Duration>,
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        let resp = self
+            .complete_extensible(req, debug_prefix, timeout_overwrite)
+            .await?;
+        // Gate success on the first-choice content deserializing into `T`: a
+        // malformed response becomes an error so the caller's retry loop re-issues
+        // it. Absent content is not an error (mirrors `prompt_json_with_retry`).
+        if let Some(content) = resp
+            .choices
+            .first()
+            .and_then(|c| c.inner.message.content.as_ref())
+        {
+            serde_json::from_str::<T>(content)?;
+        }
+        Ok(resp)
     }
 
     pub async fn complete_extensible(
@@ -776,6 +854,34 @@ impl LLMInner {
         let req = self.build_chat_request(wrapped, cache_key, &settings, tools)?;
         self.complete_extensible_once_with_retry(&req, debug_prefix, Some(timeout), Some(retry))
             .await
+    }
+
+    /// Like [`Self::prompt_messages_once`], but a response whose first-choice
+    /// content fails to deserialize into `T` is retried (up to `settings.llm_retry`).
+    pub async fn prompt_messages_once_typed<T: DeserializeOwned>(
+        &self,
+        messages: Vec<ChatCompletionRequestMessageRaw>,
+        debug_prefix: Option<&str>,
+        cache_key: Option<&str>,
+        settings: Option<LLMSettings>,
+        tools: Option<Vec<ChatCompletionTools>>,
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        let settings = settings.unwrap_or_else(|| self.default_settings.clone());
+        let timeout = settings.timeout();
+        let retry = settings.llm_retry;
+        let wrapped = messages
+            .into_iter()
+            .map(RawExtensibleChatRequestMessage::new)
+            .collect();
+        let req: RawExtensibleChatCompletionRequest =
+            self.build_chat_request(wrapped, cache_key, &settings, tools)?;
+        self.complete_extensible_once_with_retry_typed::<T>(
+            &req,
+            debug_prefix,
+            Some(timeout),
+            Some(retry),
+        )
+        .await
     }
 
     pub async fn prompt_once(
