@@ -17,7 +17,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions},
 };
 
-use crate::billing::TokenBilling;
+use crate::billing::{TokenBilling, TokenUsage};
 use crate::req::{
     ChatCompletionMessageToolCalls, ChatCompletionMessageToolCallsRaw,
     ChatCompletionRequestAssistantMessageContent,
@@ -198,6 +198,25 @@ pub(crate) async fn rewrite_json<T: Serialize + Debug>(
     fp.write_all(b"\n").await?;
     fp.flush().await?;
 
+    Ok(())
+}
+
+/// Overwrite `path` with the pretty-printed JSON of `t` (truncating any prior
+/// content). Used for snapshots that are continuously refreshed in place, like
+/// the per-prefix billing summary.
+pub(crate) async fn write_json_snapshot<T: Serialize>(
+    path: &Path,
+    t: &T,
+) -> Result<(), LLMYError> {
+    let s = serde_json::to_string_pretty(t)?;
+    let mut fp = tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .await?;
+    fp.write_all(s.as_bytes()).await?;
+    fp.flush().await?;
     Ok(())
 }
 
@@ -413,6 +432,16 @@ pub struct DebugUsage {
     pub reasoning_tokens: u64,
 }
 
+/// One row of the cumulative per-`debug_prefix` billing breakdown: total token
+/// usage attributed to that prefix plus its USD cost. Persisted (and kept up to
+/// date) by [`DebugBackend::record_prefix_billing`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrefixBilling {
+    pub prefix: String,
+    pub tokens: TokenUsage,
+    pub cost_usd: f64,
+}
+
 /// Returned by `DebugBackend::start`; opaque pointer to the row/file the
 /// subsequent `record_*` calls should target.
 #[derive(Debug, Clone)]
@@ -543,6 +572,17 @@ CREATE TABLE IF NOT EXISTS llm_debug (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_debug_cache_key ON llm_debug(cache_key);
 CREATE INDEX IF NOT EXISTS idx_llm_debug_client_id ON llm_debug(client_id);
+CREATE TABLE IF NOT EXISTS prefix_billing (
+    client_id INTEGER NOT NULL,
+    prefix TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    cached_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    reasoning_tokens INTEGER NOT NULL,
+    cost_usd REAL NOT NULL,
+    PRIMARY KEY (client_id, prefix),
+    FOREIGN KEY(client_id) REFERENCES client(id)
+);
 "#;
 
 /// Best-effort migrations applied after `SCHEMA_SQL`. Each statement is
@@ -825,6 +865,38 @@ impl Sqlite3DebugDB {
         Ok(())
     }
 
+    /// Upsert the cumulative per-`debug_prefix` totals for this client: one row
+    /// per `(client_id, prefix)`, replaced in place so the table always reflects
+    /// the latest running totals.
+    async fn upsert_prefix_billing(&self, rows: &[PrefixBilling]) -> Result<(), LLMYError> {
+        let client_id = self.require_client_id()?;
+        for row in rows {
+            sqlx::query(
+                r#"INSERT INTO prefix_billing
+                     (client_id, prefix, input_tokens, cached_tokens,
+                      output_tokens, reasoning_tokens, cost_usd)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(client_id, prefix) DO UPDATE SET
+                     input_tokens = excluded.input_tokens,
+                     cached_tokens = excluded.cached_tokens,
+                     output_tokens = excluded.output_tokens,
+                     reasoning_tokens = excluded.reasoning_tokens,
+                     cost_usd = excluded.cost_usd"#,
+            )
+            .bind(client_id)
+            .bind(&row.prefix)
+            .bind(row.tokens.input_tokens as i64)
+            .bind(row.tokens.cache_tokens as i64)
+            .bind(row.tokens.output_tokens as i64)
+            .bind(row.tokens.reasoning_tokens as i64)
+            .bind(row.cost_usd)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| eyre!("failed to upsert prefix_billing for {:?}: {}", row.prefix, e))?;
+        }
+        Ok(())
+    }
+
     async fn update_error(&self, row_id: i64, error: &str) -> Result<(), LLMYError> {
         let payload = serde_json::to_string(&serde_json::json!({ "error": error }))?;
         sqlx::query("UPDATE llm_debug SET raw_resp = ? WHERE id = ?")
@@ -980,6 +1052,26 @@ impl DebugBackend {
             _ => tracing::warn!("DebugHandle / DebugBackend variant mismatch"),
         }
     }
+
+    /// Persist the cumulative per-`debug_prefix` billing breakdown. This is keyed
+    /// only by the backend (and, for sqlite, the client), so it takes no
+    /// [`DebugHandle`]: sqlite upserts one row per prefix into `prefix_billing`;
+    /// the folder backend overwrites a single `prefix_billing.json` snapshot.
+    pub async fn record_prefix_billing(&self, rows: &[PrefixBilling]) {
+        match self {
+            DebugBackend::Sqlite3(db) => {
+                if let Err(e) = db.upsert_prefix_billing(rows).await {
+                    tracing::warn!("Fail to record prefix billing: {}", e);
+                }
+            }
+            DebugBackend::Folder(fb) => {
+                let path = fb.folder().join("prefix_billing.json");
+                if let Err(e) = write_json_snapshot(&path, &rows).await {
+                    tracing::warn!("Fail to write prefix billing json: {}", e);
+                }
+            }
+        }
+    }
 }
 
 /// True when the env var content asks for the SQLite backend.
@@ -1114,5 +1206,74 @@ mod sqlite_tests {
             .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn prefix_billing_upsert_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("debug.sqlite3");
+        let db = Sqlite3DebugDB::open(path.to_str().unwrap()).await.unwrap();
+        let cid = db.client_id().unwrap();
+
+        let usage = |i, o| TokenUsage {
+            input_tokens: i,
+            output_tokens: o,
+            cache_tokens: 0,
+            reasoning_tokens: 0,
+        };
+
+        db.upsert_prefix_billing(&[
+            PrefixBilling {
+                prefix: "planner".into(),
+                tokens: usage(10, 5),
+                cost_usd: 1.5,
+            },
+            PrefixBilling {
+                prefix: String::new(), // calls made with no prefix
+                tokens: usage(3, 0),
+                cost_usd: 0.25,
+            },
+        ])
+        .await
+        .unwrap();
+
+        let read = |prefix: &'static str| {
+            let pool = db.pool().clone();
+            async move {
+                let row = sqlx::query(
+                    "SELECT input_tokens, output_tokens, cost_usd \
+                     FROM prefix_billing WHERE client_id = ? AND prefix = ?",
+                )
+                .bind(cid)
+                .bind(prefix)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                (
+                    row.get::<i64, _>("input_tokens"),
+                    row.get::<i64, _>("output_tokens"),
+                    row.get::<f64, _>("cost_usd"),
+                )
+            }
+        };
+        assert_eq!(read("planner").await, (10, 5, 1.5));
+        assert_eq!(read("").await, (3, 0, 0.25));
+
+        // Re-upserting the same prefix replaces the row in place (no duplicate).
+        db.upsert_prefix_billing(&[PrefixBilling {
+            prefix: "planner".into(),
+            tokens: usage(20, 9),
+            cost_usd: 3.0,
+        }])
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM prefix_billing WHERE client_id = ?")
+            .bind(cid)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 2); // planner + "" — still two rows
+        assert_eq!(read("planner").await, (20, 9, 3.0));
     }
 }

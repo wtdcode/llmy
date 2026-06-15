@@ -31,7 +31,7 @@ use crate::resp::{
     CreateChatCompletionResponseRaw, CreateChatCompletionStreamResponse, FinishReason,
 };
 
-use crate::debug::{self, DebugBackend, DebugRowContext, DebugUsage};
+use crate::debug::{self, DebugBackend, DebugRowContext, DebugUsage, PrefixBilling};
 pub use crate::filter::{GoogleContentFilter, MiMoContentFilter, NoFilter, OpenAIContentFilter};
 pub use crate::req::{RawExtensibleChatCompletionRequest, RawExtensibleChatRequestMessage};
 pub use crate::resp::{RawExtensibleChatChoice, RawExtensibleChatCompletionResponse};
@@ -673,17 +673,20 @@ impl LLMInner {
             };
 
             // Tight critical section (no `.await` while the std guard is held):
-            // bill the scope tree + prefix bucket, then snapshot root for debug.
-            let root_snapshot = {
+            // bill the scope tree + prefix bucket, then snapshot root and the
+            // per-prefix breakdown for the debug backend.
+            let debug_snapshot = {
                 let mut tree = self.billing.write().unwrap();
                 tree.record(self.node, billing_prefix, &self.model, delta)?;
-                self.debug_backend.as_ref().map(|_| tree.root_snapshot())
+                self.debug_backend
+                    .as_ref()
+                    .map(|_| (tree.root_snapshot(), tree.usage_by_prefix()))
             };
 
-            if let (Some(backend), Some(handle), Some(snapshot)) = (
+            if let (Some(backend), Some(handle), Some((snapshot, prefix_usage))) = (
                 self.debug_backend.as_ref(),
                 dbg_handle.as_ref(),
-                root_snapshot.as_ref(),
+                debug_snapshot.as_ref(),
             ) {
                 let usage_for_debug = DebugUsage {
                     input_without_cached_tokens: input_without_cached as u64,
@@ -694,6 +697,18 @@ impl LLMInner {
                 backend
                     .record_billing(handle, snapshot, &usage_for_debug)
                     .await;
+
+                // Persist the cumulative per-debug_prefix breakdown (cost computed
+                // at this LLM's single model). Not tied to the per-request handle.
+                let prefix_rows: Vec<PrefixBilling> = prefix_usage
+                    .iter()
+                    .map(|(prefix, tokens)| PrefixBilling {
+                        prefix: prefix.clone(),
+                        tokens: *tokens,
+                        cost_usd: tokens.cost(&self.model).to_f64().unwrap_or_default(),
+                    })
+                    .collect();
+                backend.record_prefix_billing(&prefix_rows).await;
             }
             if let Some(est) = estimated_tokens {
                 let actual = usage.prompt_tokens as f64;
