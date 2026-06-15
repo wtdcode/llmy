@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ops::Deref,
     sync::{Arc, RwLock as StdRwLock},
     time::Duration,
@@ -16,7 +17,6 @@ use llmy_types::other::WithOtherFields;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::de::DeserializeOwned;
-use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 
 use crate::req::{
@@ -36,7 +36,7 @@ pub use crate::filter::{GoogleContentFilter, MiMoContentFilter, NoFilter, OpenAI
 pub use crate::req::{RawExtensibleChatCompletionRequest, RawExtensibleChatRequestMessage};
 pub use crate::resp::{RawExtensibleChatChoice, RawExtensibleChatCompletionResponse};
 use crate::{
-    billing::ModelBilling,
+    billing::{BillingTree, NodeId, ROOT, TokenBilling, TokenUsage},
     settings::{LLMSettings, Reasoning},
 };
 
@@ -160,7 +160,7 @@ impl LLM {
         settings: LLMSettings,
         debug_backend: Option<DebugBackend>,
     ) -> Self {
-        let billing = RwLock::new(ModelBilling::new(cap));
+        let billing = Arc::new(StdRwLock::new(BillingTree::new(cap)));
 
         let endpoint = config.endpoint_url().to_string();
         let azure_deployment = config.azure_deployment().map(|s| s.to_string());
@@ -192,15 +192,15 @@ impl LLM {
 
         LLM {
             llm: Arc::new(LLMInner {
+                node: ROOT,
                 client: LLMClient::new(config),
                 model,
                 billing,
-                debug_backend,
+                debug_backend: debug_backend.map(Arc::new),
                 endpoint,
                 azure_deployment,
-                cap,
                 default_settings: settings,
-                content_filter: StdRwLock::new(content_filter),
+                content_filter: Arc::new(StdRwLock::new(content_filter)),
             }),
         }
     }
@@ -224,6 +224,62 @@ impl LLM {
         };
         Ok(Self::new(config, model, cap, settings, backend))
     }
+
+    /// A handle pointing back at the root scope (the whole-LLM budget), sharing
+    /// the same underlying client and billing tree.
+    pub fn root(&self) -> LLM {
+        LLM {
+            llm: Arc::new(self.llm.rescope(ROOT)),
+        }
+    }
+
+    /// Open a child billing scope under this handle's current node. The child's
+    /// `cap` is clamped to the parent's remaining budget (and, if `None`, equals
+    /// it). Returns a new `LLM` (sharing the underlying client and billing tree)
+    /// that can be passed anywhere an `LLM` is expected; every call made through
+    /// it bills the child scope, bubbling up to root.
+    pub fn scope(&self, name: Option<String>, cap: Option<Decimal>) -> LLM {
+        let child = {
+            let mut tree = self.llm.billing.write().unwrap();
+            tree.alloc_child(self.llm.node, name, cap)
+        };
+        LLM {
+            llm: Arc::new(self.llm.rescope(child)),
+        }
+    }
+
+    /// Snapshot of this handle's current scope: usage, spend, and the cap that
+    /// bounds it (its own if set, otherwise the global cap).
+    pub fn node_snapshot(&self) -> TokenBilling {
+        self.llm
+            .billing
+            .read()
+            .unwrap()
+            .node_snapshot(self.llm.node)
+    }
+
+    /// This handle's current-scope accumulated token usage (shorthand for
+    /// `node_snapshot().tokens`).
+    pub fn usage(&self) -> TokenUsage {
+        self.node_snapshot().tokens
+    }
+
+    /// This handle's current-scope accumulated spend (shorthand for
+    /// `node_snapshot().current`).
+    pub fn cost(&self) -> Decimal {
+        self.node_snapshot().current
+    }
+
+    /// The global per-`debug_prefix` usage breakdown (orthogonal to scopes;
+    /// `""` = calls made with no prefix).
+    pub fn usage_by_prefix(&self) -> BTreeMap<String, TokenUsage> {
+        self.llm.billing.read().unwrap().usage_by_prefix()
+    }
+
+    /// Usage for a single `debug_prefix` bucket.
+    pub fn usage_for_prefix(&self, prefix: &str) -> TokenUsage {
+        self.llm.billing.read().unwrap().usage_for_prefix(prefix)
+    }
 }
 
 impl Deref for LLM {
@@ -236,20 +292,56 @@ impl Deref for LLM {
 
 #[derive(Debug)]
 pub struct LLMInner {
+    /// This handle's current billing scope; defaults to [`ROOT`]. [`LLM::scope`]
+    /// clones the handle with a different node while sharing everything else via
+    /// `Arc`, so billing reads `self.node` with zero parameter threading.
+    node: NodeId,
     pub client: LLMClient,
     pub model: OpenAIModel,
-    pub billing: RwLock<ModelBilling>,
-    pub debug_backend: Option<DebugBackend>,
+    pub billing: Arc<StdRwLock<BillingTree>>,
+    pub debug_backend: Option<Arc<DebugBackend>>,
     pub endpoint: String,
     pub azure_deployment: Option<String>,
-    pub cap: Decimal,
     pub default_settings: LLMSettings,
-    content_filter: StdRwLock<Box<dyn OpenAIContentFilter>>,
+    content_filter: Arc<StdRwLock<Box<dyn OpenAIContentFilter>>>,
+}
+
+impl Drop for LLMInner {
+    fn drop(&mut self) {
+        // Each `scope()` builds a distinct `Arc<LLMInner>`, so its refcount tracks
+        // how many handles point at that scope. When the last one drops we land
+        // here and auto-close the scope: prune its node (logging its final usage)
+        // and re-parent its children to keep the chain to root intact. Root is
+        // never pruned. Best-effort and panic-free, as required in `Drop`.
+        if self.node != ROOT
+            && let Ok(mut tree) = self.billing.write()
+        {
+            tree.remove(self.node);
+        }
+    }
 }
 
 impl LLMInner {
-    pub async fn billing_snapshot(&self) -> ModelBilling {
-        self.billing.read().await.clone()
+    /// Flat snapshot of the whole-LLM (root) billing totals.
+    pub fn billing_snapshot(&self) -> TokenBilling {
+        self.billing.read().unwrap().root_snapshot()
+    }
+
+    /// Clone this handle pointing at a different scope `node`. The mutable shared
+    /// state (`billing` tree, `content_filter`) is shared via `Arc`; the rest is
+    /// cheap config.
+    fn rescope(&self, node: NodeId) -> LLMInner {
+        LLMInner {
+            node,
+            client: self.client.clone(),
+            model: self.model.clone(),
+            billing: self.billing.clone(),
+            debug_backend: self.debug_backend.clone(),
+            endpoint: self.endpoint.clone(),
+            azure_deployment: self.azure_deployment.clone(),
+            default_settings: self.default_settings.clone(),
+            content_filter: self.content_filter.clone(),
+        }
     }
 
     /// Replace the content filter applied to every request and response. Defaults to
@@ -273,14 +365,22 @@ impl LLMInner {
     }
 
     fn debug_row_context(&self, cache_key: Option<&str>) -> DebugRowContext {
+        // The debug DB stores USD as a SQLite REAL column; SQLite has no native
+        // decimal type, so collapse to f64 only at this boundary. The cap logged
+        // is the global budget (matching the root-level `current_usage_usd`).
+        let cap_usd = self
+            .billing
+            .read()
+            .unwrap()
+            .cap()
+            .to_f64()
+            .unwrap_or_default();
         DebugRowContext {
             model_name: self.model.model_id_str().to_string(),
             endpoint: self.endpoint.clone(),
             azure_deployment: self.azure_deployment.clone(),
             cache_key: cache_key.map(|s| s.to_string()),
-            // The debug DB stores USD as a SQLite REAL column; SQLite has no
-            // native decimal type, so collapse to f64 only at this boundary.
-            cap_usd: self.cap.to_f64().unwrap_or_default(),
+            cap_usd,
         }
     }
 
@@ -385,6 +485,9 @@ impl LLMInner {
                 .await
             {
                 Ok(r) => return Ok(r),
+                // A billing/cap error is deterministic — retrying can't recover it
+                // (and would keep tripping the pre-flight check), so fail fast.
+                Err(e @ LLMYError::Billing { .. }) => return Err(e),
                 Err(e) => {
                     tracing::warn!("Having an error {} during {} retry", e, idx);
                     last = Some(Err(e));
@@ -414,6 +517,9 @@ impl LLMInner {
                 .await
             {
                 Ok(r) => return Ok(r),
+                // A billing/cap error is deterministic — retrying can't recover it
+                // (and would keep tripping the pre-flight check), so fail fast.
+                Err(e @ LLMYError::Billing { .. }) => return Err(e),
                 Err(e) => {
                     tracing::warn!("Having an error {} during {} retry", e, idx);
                     last = Some(Err(e));
@@ -467,7 +573,14 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        // Fail fast: if we're already over budget, don't issue the request.
+        self.billing.read().unwrap().check_cap(self.node)?;
+
         self.apply_filter_input(&mut req);
+
+        // Keep the raw prefix (None => "") for the per-prefix billing dimension,
+        // before it gets defaulted to "llm" for the debug backend below.
+        let billing_prefix = debug_prefix;
 
         let use_stream = self.default_settings.llm_stream;
         let debug_prefix = if let Some(debug_prefix) = debug_prefix {
@@ -539,15 +652,12 @@ impl LLMInner {
         }
 
         let output_tokens = if let Some(usage) = &resp.usage {
-            let mut billing = self.billing.write().await;
-
             let cached = usage
                 .prompt_tokens_details
                 .as_ref()
                 .and_then(|v| v.cached_tokens)
                 .unwrap_or_default();
             let input_without_cached = usage.prompt_tokens - cached;
-            billing.input_tokens(&self.model, input_without_cached as _, cached as _)?;
             let reasoning = usage
                 .completion_tokens_details
                 .as_ref()
@@ -555,13 +665,26 @@ impl LLMInner {
                 .unwrap_or_default() as u64;
             let output_without_reasoning = usage.completion_tokens as u64 - reasoning;
 
-            billing.output_tokens(&self.model, output_without_reasoning, reasoning)?;
+            let delta = TokenUsage {
+                input_tokens: usage.prompt_tokens as u64,
+                cache_tokens: cached as u64,
+                output_tokens: usage.completion_tokens as u64,
+                reasoning_tokens: reasoning,
+            };
 
-            if let (Some(backend), Some(handle)) =
-                (self.debug_backend.as_ref(), dbg_handle.as_ref())
-            {
-                let billing_clone = billing.clone();
-                drop(billing);
+            // Tight critical section (no `.await` while the std guard is held):
+            // bill the scope tree + prefix bucket, then snapshot root for debug.
+            let root_snapshot = {
+                let mut tree = self.billing.write().unwrap();
+                tree.record(self.node, billing_prefix, &self.model, delta)?;
+                self.debug_backend.as_ref().map(|_| tree.root_snapshot())
+            };
+
+            if let (Some(backend), Some(handle), Some(snapshot)) = (
+                self.debug_backend.as_ref(),
+                dbg_handle.as_ref(),
+                root_snapshot.as_ref(),
+            ) {
                 let usage_for_debug = DebugUsage {
                     input_without_cached_tokens: input_without_cached as u64,
                     cached_tokens: cached as u64,
@@ -569,7 +692,7 @@ impl LLMInner {
                     reasoning_tokens: reasoning,
                 };
                 backend
-                    .record_billing(handle, &billing_clone, &usage_for_debug)
+                    .record_billing(handle, snapshot, &usage_for_debug)
                     .await;
             }
             if let Some(est) = estimated_tokens {
@@ -598,15 +721,16 @@ impl LLMInner {
             .duration_since(now)
             .map(|v| v.as_secs_f64())
             .unwrap_or_default();
+        let billing_snapshot = self.billing.read().unwrap().root_snapshot();
         tracing::info!(
             "Usage: {}, Speed: {:.2} tok/s (client={:?})",
-            &self.billing.read().await,
+            billing_snapshot,
             if delta.is_normal() && delta.is_sign_positive() {
                 output_tokens as f64 / delta
             } else {
                 0.0f64
             },
-            self.debug_backend.as_ref().map(|v| v.client_id()).flatten()
+            self.debug_backend.as_ref().and_then(|v| v.client_id())
         );
         Ok(resp)
     }
@@ -957,6 +1081,59 @@ mod tests {
         raw.model = "mimo-v2.5-pro".to_string();
         raw.messages = vec![WithOtherFields::new(user)];
         RawExtensibleChatCompletionRequest::new(raw)
+    }
+
+    fn test_llm() -> LLM {
+        // No network is touched by construction or by scope/usage/drop.
+        let config = SupportedConfig::new("http://localhost:0", "test-key");
+        let model = OpenAIModel::from_str("captest,1000000,1000000").unwrap();
+        LLM::new(
+            config,
+            model,
+            rust_decimal::dec!(100),
+            test_settings(None),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn over_cap_returns_billing_through_retry_without_network() {
+        // A negative cap means "already over budget": the pre-flight check_cap in
+        // complete_extensible rejects before any network call, and the retry loop
+        // must surface that Billing error (breaking instead of looping/hanging).
+        let config = SupportedConfig::new("http://localhost:0", "k");
+        let model = OpenAIModel::from_str("captest,1000000,1000000").unwrap();
+        let llm = LLM::new(
+            config,
+            model,
+            rust_decimal::dec!(-1),
+            test_settings(None),
+            None,
+        );
+        let req = user_request("hi");
+        let err = llm
+            .complete_extensible_once_with_retry(&req, None, Some(Duration::from_secs(5)), Some(8))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LLMYError::Billing { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn dropping_a_scope_auto_prunes_its_node() {
+        let llm = test_llm();
+        let count = || llm.llm.billing.read().unwrap().node_count();
+        let before = count(); // just root
+        {
+            let sub = llm.scope(Some("sub".into()), None);
+            assert_eq!(count(), before + 1);
+            // A clone of the same scope shares the node; only the last drop prunes.
+            let clone = sub.clone();
+            assert_eq!(count(), before + 1);
+            drop(clone);
+            assert_eq!(count(), before + 1);
+        }
+        // Last handle to the scope is gone => node pruned.
+        assert_eq!(count(), before);
     }
 
     #[test]

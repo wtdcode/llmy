@@ -123,6 +123,10 @@ pub mod tokenizer {
 /// Common llmy error type shared across agent, tool, and client layers.
 pub use llmy_types::error::LLMYError;
 
+/// Re-export of `rust_decimal` (the `Decimal` type used by the billing API), so
+/// downstream can name it without depending on the crate directly.
+pub use llmy_client::rust_decimal;
+
 /// Raw `async-openai` re-export, kept only for transport plumbing (`Client`,
 /// `OpenAIConfig`, `AzureConfig`, errors). All chat-completion request/response
 /// types are now mirrored under [`client::req`] and [`client::resp`] with

@@ -17,7 +17,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions},
 };
 
-use crate::billing::ModelBilling;
+use crate::billing::TokenBilling;
 use crate::req::{
     ChatCompletionMessageToolCalls, ChatCompletionMessageToolCallsRaw,
     ChatCompletionRequestAssistantMessageContent,
@@ -797,7 +797,7 @@ impl Sqlite3DebugDB {
     async fn update_billing(
         &self,
         row_id: i64,
-        billing: &ModelBilling,
+        billing: &TokenBilling,
         usage: &DebugUsage,
     ) -> Result<(), LLMYError> {
         sqlx::query(
@@ -963,7 +963,7 @@ impl DebugBackend {
     pub async fn record_billing(
         &self,
         handle: &DebugHandle,
-        billing: &ModelBilling,
+        billing: &TokenBilling,
         usage: &DebugUsage,
     ) {
         match (self, handle) {
@@ -1088,7 +1088,7 @@ mod sqlite_tests {
         let resp = dummy_resp();
         db.update_response(id, &req, &resp).await.unwrap();
 
-        let billing = ModelBilling::new(rust_decimal::dec!(10.0));
+        let billing = TokenBilling::new(rust_decimal::dec!(10.0));
         let usage = DebugUsage {
             input_without_cached_tokens: 7,
             cached_tokens: 3,

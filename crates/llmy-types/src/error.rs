@@ -29,8 +29,15 @@ pub enum LLMYError {
     OpenAI(#[from] OpenAIError),
     #[error("json error: {0}")]
     STDJSON(#[from] serde_json::Error),
-    #[error("billing error: reach cap {0}, current {1}")]
-    Billing(Decimal, Decimal),
+    #[error("billing error: scope {scope:?} (#{node}) reached cap {cap}, current {current}")]
+    Billing {
+        cap: Decimal,
+        current: Decimal,
+        /// The id of the scope node whose cap was exceeded (0 = root).
+        node: u64,
+        /// The name of that scope, if it was given one.
+        scope: Option<String>,
+    },
     #[error("incorrect tool call for tool {0} with args {1} given schema {2:?}")]
     IncorrectToolCall(String, String, schemars::Schema),
     #[error("toolcall {0} has nested error: {1}")]

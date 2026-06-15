@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use llmy_client::{billing::ModelBilling, client::LLM, model::ModelConfig, settings::LLMSettings};
+use llmy_client::{billing::TokenBilling, client::LLM, model::ModelConfig, settings::LLMSettings};
 use llmy_harness::Agent;
 
 #[derive(Debug)]
@@ -74,7 +74,7 @@ pub(crate) async fn run_chat_command(
             print_command_output(&rendered, is_tty);
         }
         ChatCommand::Tokens => {
-            let billing = llm.billing_snapshot().await;
+            let billing = llm.billing_snapshot();
             let approx_context_tokens = agent.approx_context_tokens(&llm.model.config);
             print_command_output(
                 &format_token_usage(&billing, approx_context_tokens, &llm.model.config),
@@ -98,7 +98,7 @@ fn print_command_output(output: &str, is_tty: bool) {
 }
 
 fn format_token_usage(
-    billing: &ModelBilling,
+    billing: &TokenBilling,
     approx_context_tokens: Option<usize>,
     model: &ModelConfig,
 ) -> String {
@@ -151,7 +151,7 @@ fn format_token_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llmy_client::billing::{ModelBilling, TokenUsage};
+    use llmy_client::billing::{TokenBilling, TokenUsage};
     use std::str::FromStr;
 
     #[test]
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn format_token_usage_renders_cached_and_reasoning_breakdown() {
         let rendered = format_token_usage(
-            &ModelBilling {
+            &TokenBilling {
                 tokens: TokenUsage {
                     input_tokens: 120,
                     output_tokens: 45,
