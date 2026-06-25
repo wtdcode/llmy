@@ -1,35 +1,15 @@
-use std::fmt::Debug;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use llmy_types::other::WithOtherFields;
 use regex::Regex;
 use serde_json::{Map, Value};
 
+use super::OpenAIContentFilter;
 use crate::req::{
     ChatCompletionMessageToolCallRaw, ChatCompletionMessageToolCalls,
-    ChatCompletionMessageToolCallsRaw, FunctionCallRaw, RawExtensibleChatCompletionRequest,
+    ChatCompletionMessageToolCallsRaw, FunctionCallRaw,
 };
 use crate::resp::{FinishReason, RawExtensibleChatCompletionResponse};
-
-pub trait OpenAIContentFilter: Send + Sync + Debug {
-    fn filter_input(&self, _req: &mut RawExtensibleChatCompletionRequest) {}
-    fn filter_output(&self, _resp: &mut RawExtensibleChatCompletionResponse) {}
-}
-
-#[derive(Default, Debug)]
-pub struct NoFilter;
-
-impl OpenAIContentFilter for NoFilter {}
-
-/// Strips fields that Google's OpenAI-compatible chat completion endpoint rejects.
-#[derive(Default, Debug)]
-pub struct GoogleContentFilter;
-
-impl OpenAIContentFilter for GoogleContentFilter {
-    fn filter_input(&self, req: &mut RawExtensibleChatCompletionRequest) {
-        req.prompt_cache_key = None;
-    }
-}
 
 /// Salvages mimo's malformed `<tool_call><function=NAME>...</function></tool_call>` content
 /// when the model returned `finish_reason: tool_calls` but emitted no actual `tool_calls`.
@@ -133,31 +113,7 @@ impl OpenAIContentFilter for MiMoContentFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn build_resp(
-        content: Option<&str>,
-        finish: FinishReason,
-    ) -> RawExtensibleChatCompletionResponse {
-        let body = serde_json::json!({
-            "id": "chatcmpl-test",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content,
-                },
-                "finish_reason": match finish {
-                    FinishReason::ToolCalls => "tool_calls",
-                    FinishReason::Stop => "stop",
-                    _ => "stop",
-                }
-            }],
-            "created": 1,
-            "model": "mimo-v2.5",
-            "object": "chat.completion"
-        });
-        serde_json::from_value(body).unwrap()
-    }
+    use crate::filters::build_resp;
 
     #[test]
     fn salvages_single_tool_call_with_string_and_numeric_args() {
@@ -274,32 +230,6 @@ mod tests {
     fn does_not_modify_when_parse_fails() {
         let filter = MiMoContentFilter::new();
         let content = "this is plain text, no tool call markup at all";
-        let mut resp = build_resp(Some(content), FinishReason::ToolCalls);
-        filter.filter_output(&mut resp);
-
-        assert_eq!(resp.choices[0].message.content.as_deref(), Some(content));
-        assert!(resp.choices[0].message.tool_calls.is_none());
-    }
-
-    #[test]
-    fn google_filter_strips_prompt_cache_key() {
-        let filter = GoogleContentFilter;
-        let mut req: RawExtensibleChatCompletionRequest =
-            serde_json::from_value(serde_json::json!({
-                "model": "google/gemini-2.5-pro",
-                "messages": [{"role": "user", "content": "hi"}],
-                "prompt_cache_key": "some-key"
-            }))
-            .unwrap();
-        assert_eq!(req.prompt_cache_key.as_deref(), Some("some-key"));
-        filter.filter_input(&mut req);
-        assert!(req.prompt_cache_key.is_none());
-    }
-
-    #[test]
-    fn no_filter_is_a_noop() {
-        let filter = NoFilter;
-        let content = "<tool_call><function=a></function></tool_call>";
         let mut resp = build_resp(Some(content), FinishReason::ToolCalls);
         filter.filter_output(&mut resp);
 

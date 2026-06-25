@@ -94,6 +94,9 @@ pub struct LLMSettings {
     pub llm_stream: bool,
     pub top_p: Option<f32>,
     pub reasoning_effort: Option<Reasoning>,
+    /// When a typed/JSON completion fails to deserialize, retry the parse after
+    /// stripping a markdown code fence from the content (see `MarkdownTagFilter`).
+    pub auto_strip: bool,
 }
 
 impl LLMSettings {

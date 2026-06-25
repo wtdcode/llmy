@@ -6,7 +6,7 @@ pub mod billing;
 pub mod client;
 pub mod context;
 pub mod debug;
-pub mod filter;
+pub mod filters;
 pub mod model;
 pub mod req;
 pub mod resp;

@@ -86,7 +86,17 @@ macro_rules! make_openai_args {
                 long = concat!($long, "reasoning-effort"),
                 env = concat!($prefix, "LLM_REASONING_EFFORT"),
             )]
-            pub reasoning_effort: Option<Reasoning>
+            pub reasoning_effort: Option<Reasoning>,
+
+            /// On a typed/JSON deserialize failure, retry the parse after stripping
+            /// a markdown code fence (```json ... ```) from the content.
+            #[arg(
+                long = concat!($long, "llm-auto-strip"),
+                env = concat!($prefix, "LLM_AUTO_STRIP"),
+                default_value_t = true,
+                value_parser = clap::builder::BoolishValueParser::new()
+            )]
+            pub auto_strip: bool
         }
 
         impl $struct_name {
@@ -100,7 +110,8 @@ macro_rules! make_openai_args {
                     llm_tool_choice: self.llm_tool_choice.clone(),
                     llm_stream: self.llm_stream,
                     top_p: self.top_p,
-                    reasoning_effort: self.reasoning_effort.clone()
+                    reasoning_effort: self.reasoning_effort.clone(),
+                    auto_strip: self.auto_strip,
                 }
             }
 

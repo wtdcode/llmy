@@ -32,7 +32,9 @@ use crate::resp::{
 };
 
 use crate::debug::{self, DebugBackend, DebugRowContext, DebugUsage, PrefixBilling};
-pub use crate::filter::{GoogleContentFilter, MiMoContentFilter, NoFilter, OpenAIContentFilter};
+pub use crate::filters::{
+    GoogleContentFilter, MarkdownTagFilter, MiMoContentFilter, NoFilter, OpenAIContentFilter,
+};
 pub use crate::req::{RawExtensibleChatCompletionRequest, RawExtensibleChatRequestMessage};
 pub use crate::resp::{RawExtensibleChatChoice, RawExtensibleChatCompletionResponse};
 use crate::{
@@ -408,9 +410,9 @@ impl LLMInner {
         .await
     }
 
-    /// Like [`Self::prompt_once_with_retry`], but a response whose first-choice
-    /// content fails to deserialize into `T` is treated as a transient failure
-    /// and retried (up to `settings.llm_retry`).
+    /// Like [`Self::prompt_once_with_retry`], but deserializes the first-choice
+    /// content into `T` (retried up to `settings.llm_retry` on failure) and returns
+    /// the parsed value.
     pub async fn prompt_once_with_retry_typed<T: DeserializeOwned>(
         &self,
         sys_msg: &str,
@@ -418,7 +420,7 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
-    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+    ) -> Result<T, LLMYError> {
         let sys = ChatCompletionRequestSystemMessageRaw::new_text(sys_msg);
         let user = ChatCompletionRequestUserMessageRaw::new_text(user_msg);
         self.prompt_messages_once_typed::<T>(
@@ -434,7 +436,10 @@ impl LLMInner {
         .await
     }
 
-    // Note only consider the `content` of the first choice
+    /// Prompt and deserialize the first choice's content into `T`. The typed path
+    /// parses (and returns) `T` directly, so there is no second deserialize here;
+    /// a malformed response is retried, and (when `auto_strip` is set) a markdown
+    /// code fence is stripped before parsing.
     pub async fn prompt_json_with_retry<T: DeserializeOwned>(
         &self,
         sys_msg: &str,
@@ -442,19 +447,9 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
-    ) -> Result<Option<T>, LLMYError> {
-        // The typed prompt already retries until the content parses as `T`, so by
-        // the time we get here the first-choice content is known to deserialize
-        // (or be absent); this final parse is just to hand back the value.
-        let msg = self
-            .prompt_once_with_retry_typed::<T>(sys_msg, user_msg, debug_prefix, cache_key, settings)
-            .await?;
-        Ok(msg
-            .choices
-            .first()
-            .and_then(|v| v.inner.message.content.as_ref())
-            .map(|k| serde_json::from_str::<T>(k))
-            .transpose()?)
+    ) -> Result<T, LLMYError> {
+        self.prompt_once_with_retry_typed::<T>(sys_msg, user_msg, debug_prefix, cache_key, settings)
+            .await
     }
 
     pub async fn complete_once_with_retry(
@@ -499,15 +494,16 @@ impl LLMInner {
     }
 
     /// Like [`Self::complete_extensible_once_with_retry`], but each attempt also
-    /// requires the first-choice content to deserialize into `T`; a malformed
-    /// response is retried like any other error (reusing the same `retry` budget).
+    /// deserializes the first-choice content into `T` (with markdown auto-strip);
+    /// a malformed response is retried like any other error, and the parsed `T` is
+    /// returned directly.
     pub async fn complete_extensible_once_with_retry_typed<T: DeserializeOwned>(
         &self,
         req: &RawExtensibleChatCompletionRequest,
         debug_prefix: Option<&str>,
         timeout: Option<Duration>,
         retry: Option<u64>,
-    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+    ) -> Result<T, LLMYError> {
         let retry = retry.unwrap_or(u64::MAX);
 
         let mut last = None;
@@ -516,7 +512,7 @@ impl LLMInner {
                 .complete_extensible_typed::<T>(req.clone(), debug_prefix, timeout)
                 .await
             {
-                Ok(r) => return Ok(r),
+                Ok(value) => return Ok(value),
                 // A billing/cap error is deterministic — retrying can't recover it
                 // (and would keep tripping the pre-flight check), so fail fast.
                 Err(e @ LLMYError::Billing { .. }) => return Err(e),
@@ -541,30 +537,48 @@ impl LLMInner {
             .await
     }
 
-    /// A single completion attempt that additionally requires the first-choice
-    /// content to deserialize into `T`, surfacing a malformed response as an
-    /// error so the caller's retry loop re-issues it. The retry itself lives in
-    /// [`Self::complete_extensible_once_with_retry_typed`].
+    /// Deserialize the first-choice content into `T`. On a JSON parse error — and
+    /// only when `auto_strip` is enabled — retry the parse after stripping a
+    /// markdown code fence (the common ` ```json {…} ``` ` wrapper) from the
+    /// content. Absent content is an error.
+    fn parse_first_choice<T: DeserializeOwned>(
+        &self,
+        resp: &RawExtensibleChatCompletionResponse,
+    ) -> Result<T, LLMYError> {
+        let content = resp
+            .choices
+            .first()
+            .and_then(|c| c.inner.message.content.as_deref())
+            .ok_or_else(|| {
+                eyre!("completion has no content to deserialize into the requested type")
+            })?;
+        match serde_json::from_str::<T>(content) {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                if self.default_settings.auto_strip
+                    && let Some(stripped) = crate::filters::strip_markdown_fence(content)
+                {
+                    return Ok(serde_json::from_str::<T>(&stripped)?);
+                }
+                Err(err.into())
+            }
+        }
+    }
+
+    /// A single completion attempt that deserializes the first-choice content into
+    /// `T` and returns it (so callers don't deserialize a second time). A malformed
+    /// response surfaces as an error so the caller's retry loop re-issues it; the
+    /// retry itself lives in [`Self::complete_extensible_once_with_retry_typed`].
     pub async fn complete_extensible_typed<T: DeserializeOwned>(
         &self,
         req: RawExtensibleChatCompletionRequest,
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
-    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+    ) -> Result<T, LLMYError> {
         let resp = self
             .complete_extensible(req, debug_prefix, timeout_overwrite)
             .await?;
-        // Gate success on the first-choice content deserializing into `T`: a
-        // malformed response becomes an error so the caller's retry loop re-issues
-        // it. Absent content is not an error (mirrors `prompt_json_with_retry`).
-        if let Some(content) = resp
-            .choices
-            .first()
-            .and_then(|c| c.inner.message.content.as_ref())
-        {
-            serde_json::from_str::<T>(content)?;
-        }
-        Ok(resp)
+        self.parse_first_choice::<T>(&resp)
     }
 
     pub async fn complete_extensible(
@@ -995,8 +1009,9 @@ impl LLMInner {
             .await
     }
 
-    /// Like [`Self::prompt_messages_once`], but a response whose first-choice
-    /// content fails to deserialize into `T` is retried (up to `settings.llm_retry`).
+    /// Like [`Self::prompt_messages_once`], but deserializes the first-choice
+    /// content into `T` (retrying on failure up to `settings.llm_retry`) and
+    /// returns the parsed value.
     pub async fn prompt_messages_once_typed<T: DeserializeOwned>(
         &self,
         messages: Vec<ChatCompletionRequestMessageRaw>,
@@ -1004,7 +1019,7 @@ impl LLMInner {
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
         tools: Option<Vec<ChatCompletionTools>>,
-    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+    ) -> Result<T, LLMYError> {
         let settings = settings.unwrap_or_else(|| self.default_settings.clone());
         let timeout = settings.timeout();
         let retry = settings.llm_retry;
@@ -1085,6 +1100,7 @@ mod tests {
             llm_stream: false,
             top_p: None,
             reasoning_effort,
+            auto_strip: true,
         }
     }
 
@@ -1098,17 +1114,49 @@ mod tests {
         RawExtensibleChatCompletionRequest::new(raw)
     }
 
-    fn test_llm() -> LLM {
-        // No network is touched by construction or by scope/usage/drop.
+    fn test_llm_with(settings: LLMSettings) -> LLM {
+        // No network is touched by construction or by scope/usage/parse helpers.
         let config = SupportedConfig::new("http://localhost:0", "test-key");
         let model = OpenAIModel::from_str("captest,1000000,1000000").unwrap();
-        LLM::new(
-            config,
-            model,
-            rust_decimal::dec!(100),
-            test_settings(None),
-            None,
-        )
+        LLM::new(config, model, rust_decimal::dec!(100), settings, None)
+    }
+
+    fn test_llm() -> LLM {
+        test_llm_with(test_settings(None))
+    }
+
+    #[test]
+    fn parse_first_choice_parses_plain_json() {
+        let llm = test_llm();
+        let resp = crate::filters::build_resp(Some(r#"{"a": 2}"#), FinishReason::Stop);
+        let v: serde_json::Value = llm.parse_first_choice(&resp).unwrap();
+        assert_eq!(v["a"], 2);
+    }
+
+    #[test]
+    fn parse_first_choice_auto_strips_markdown_fence() {
+        let llm = test_llm(); // auto_strip = true
+        let resp = crate::filters::build_resp(Some("```json\n{\"a\": 1}\n```"), FinishReason::Stop);
+        let v: serde_json::Value = llm.parse_first_choice(&resp).unwrap();
+        assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn parse_first_choice_without_auto_strip_errors_on_fenced_json() {
+        let mut settings = test_settings(None);
+        settings.auto_strip = false;
+        let llm = test_llm_with(settings);
+        let resp = crate::filters::build_resp(Some("```json\n{\"a\": 1}\n```"), FinishReason::Stop);
+        let parsed: Result<serde_json::Value, _> = llm.parse_first_choice(&resp);
+        assert!(matches!(parsed, Err(LLMYError::STDJSON(_))));
+    }
+
+    #[test]
+    fn parse_first_choice_errors_when_no_content() {
+        let llm = test_llm();
+        let resp = crate::filters::build_resp(None, FinishReason::Stop);
+        let parsed: Result<serde_json::Value, _> = llm.parse_first_choice(&resp);
+        assert!(parsed.is_err());
     }
 
     #[tokio::test]
