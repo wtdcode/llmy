@@ -109,6 +109,11 @@ impl ModelConfig {
     pub fn count_tokens(&self, text: &str) -> Option<usize> {
         self.encoding().map(|enc| count_tokens(text, enc))
     }
+
+    /// Lossy counting tokens, fallback to simple len // 4 if no encoder is available
+    pub fn count_tokens_lossy(&self, text: &str) -> usize {
+        self.count_tokens(text).unwrap_or_else(|| text.len() / 4)
+    }
 }
 
 // ---------------------------------------------------------------------------
