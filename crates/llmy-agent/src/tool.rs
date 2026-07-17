@@ -299,6 +299,12 @@ impl ToolBox {
         self.tools.insert(tool.name(), Arc::new(tool));
     }
 
+    /// Removes the tool registered under `name`, returning `true` if one was
+    /// present. The inverse of [`Self::add_dyn_tool`].
+    pub fn remove_tool(&mut self, name: &str) -> bool {
+        self.tools.remove(name).is_some()
+    }
+
     /// Invokes a single tool by name with the given JSON-encoded arguments.
     ///
     /// Returns `None` if no tool with that name is registered. Otherwise

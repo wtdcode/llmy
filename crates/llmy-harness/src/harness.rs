@@ -181,6 +181,15 @@ impl Agent {
         format!("Enabled tools ({}):\n- {}", tools.len(), tools.join("\n- "))
     }
 
+    /// Mutable access to the agent's toolbox, for attaching or detaching
+    /// tools at runtime (e.g. `agent.tools_mut().extend(bundle)` or
+    /// `agent.tools_mut().remove_tool("read_file")`). Only the toolbox
+    /// changes; the conversation context is untouched, so the next step sees
+    /// the new tool set with history intact.
+    pub fn tools_mut(&mut self) -> &mut ToolBox {
+        &mut self.tools
+    }
+
     pub fn approx_context_tokens(&self, model: &ModelConfig) -> Option<usize> {
         model.count_tokens(&self.render_context())
     }
@@ -764,6 +773,26 @@ mod tests {
         assert_eq!(
             agent.render_tools(false),
             "No tools are enabled for this chat."
+        );
+    }
+
+    #[test]
+    fn tools_mut_changes_toolbox_without_touching_context() {
+        let mut tools = ToolBox::new();
+        tools.add_tool(ZebraTool);
+        tools.add_tool(AlphaTool);
+        let mut agent = Agent::new("base system prompt".to_string(), tools, "cache".to_string());
+        agent.push_user_message("use the tools".to_string());
+
+        let context_before = agent.render_context();
+
+        assert!(agent.tools_mut().remove_tool("zebra_tool"));
+        assert!(!agent.tools_mut().remove_tool("zebra_tool"));
+
+        assert_eq!(agent.render_context(), context_before);
+        assert_eq!(
+            agent.render_tools(false),
+            "Enabled tools (1):\n- alpha_tool"
         );
     }
 
