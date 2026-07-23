@@ -219,24 +219,31 @@ impl Agent {
         }
     }
 
-    /// Restores a previously captured [`AgentSnapshot`], overwriting the current
-    /// conversation state. Tools, config, and system prompt are left untouched.
+    /// Builds an agent from a previously captured [`AgentSnapshot`], mirroring
+    /// [`Self::new_with_config`] but seeding the conversation from the snapshot
+    /// instead of starting empty.
     ///
-    /// The checkpoint stack is cleared: a restore is a jump, so the linear
-    /// [`Self::revert_step`] history no longer applies. Take a [`Self::snapshot`]
-    /// first if you want a return point.
-    pub fn restore(&mut self, snapshot: &AgentSnapshot) {
-        self.apply_snapshot(snapshot.clone());
-        self.checkpoints.clear();
-    }
-
-    /// Overwrites the conversation state without touching the checkpoint stack.
-    /// Shared by [`Self::restore`] and [`Self::revert_step`]: the former clears
-    /// the stack afterwards and the latter must not, so they cannot delegate to
-    /// one another.
-    fn apply_snapshot(&mut self, snapshot: AgentSnapshot) {
-        self.context = snapshot.context;
-        self.last_step = snapshot.last_step;
+    /// The snapshot carries conversation state only, so tools, config, and the
+    /// system prompt are supplied fresh here — restore onto whatever capabilities
+    /// you like. The checkpoint stack starts empty, as with any new agent.
+    pub fn restore(
+        snapshot: AgentSnapshot,
+        system_prompt: String,
+        tools: ToolBox,
+        cache_key: String,
+        config: AgentConfig,
+    ) -> Self {
+        Self {
+            base_system_prompt: system_prompt.clone(),
+            system_prompt,
+            tools,
+            context: snapshot.context,
+            checkpoints: vec![],
+            last_step: snapshot.last_step,
+            cache_key,
+            memory: None,
+            config,
+        }
     }
 
     pub fn config(&self) -> &AgentConfig {
@@ -445,9 +452,10 @@ impl Agent {
             .pop()
             .ok_or_else(|| eyre!("no checkpoints to revert"))?;
 
-        // Note: unlike `restore`, this must NOT clear the stack — popping one
-        // checkpoint per call is what makes multi-step revert work.
-        self.apply_snapshot(snapshot);
+        // Pop exactly one checkpoint per call and leave the rest of the stack in
+        // place — that is what makes multi-step revert work.
+        self.context = snapshot.context;
+        self.last_step = snapshot.last_step;
         Ok(())
     }
 
@@ -1038,8 +1046,14 @@ mod tests {
         agent.push_user_message("third, after the snapshot".to_string());
         assert_ne!(agent.render_context(), before);
 
-        agent.restore(&snapshot);
-        assert_eq!(agent.render_context(), before);
+        let restored = Agent::restore(
+            snapshot,
+            "base system prompt".to_string(),
+            ToolBox::new(),
+            "cache".to_string(),
+            AgentConfig::default(),
+        );
+        assert_eq!(restored.render_context(), before);
     }
 
     #[test]
@@ -1056,9 +1070,14 @@ mod tests {
         let json = serde_json::to_string(&agent.snapshot()).unwrap();
         let restored: AgentSnapshot = serde_json::from_str(&json).unwrap();
 
-        agent.push_user_message("changed".to_string());
-        agent.restore(&restored);
-        assert_eq!(agent.render_context(), before);
+        let rebuilt = Agent::restore(
+            restored,
+            "base system prompt".to_string(),
+            ToolBox::new(),
+            "cache".to_string(),
+            AgentConfig::default(),
+        );
+        assert_eq!(rebuilt.render_context(), before);
     }
 
     #[tokio::test]
@@ -1089,31 +1108,46 @@ mod tests {
     }
 
     #[test]
-    fn restore_truncates_the_checkpoint_stack() {
+    fn restore_starts_with_an_empty_checkpoint_stack() {
         let mut agent = Agent::new(
             "base system prompt".to_string(),
             ToolBox::new(),
             "cache".to_string(),
         );
         let snapshot = agent.snapshot();
+        // Even if the source agent had recorded steps, a restore is a jump, not a
+        // continuation of the undo history — the rebuilt agent begins fresh.
         agent.checkpoints = vec![agent.snapshot(), agent.snapshot()];
         assert!(!agent.checkpoints.is_empty());
 
-        agent.restore(&snapshot);
-        assert!(agent.checkpoints.is_empty());
+        let restored = Agent::restore(
+            snapshot,
+            "base system prompt".to_string(),
+            ToolBox::new(),
+            "cache".to_string(),
+            AgentConfig::default(),
+        );
+        assert!(restored.checkpoints.is_empty());
     }
 
     #[test]
-    fn restore_leaves_the_toolbox_untouched() {
+    fn restore_carries_no_tools_from_the_snapshot() {
         let mut tools = ToolBox::new();
         tools.add_tool(ZebraTool);
         let mut agent = Agent::new("base system prompt".to_string(), tools, "cache".to_string());
         agent.push_user_message("use the tool".to_string());
 
+        // The snapshot captures conversation only; tools are supplied at restore
+        // time, so rebuilding onto an empty toolbox drops the source's tool —
+        // proof that capabilities never ride along inside a snapshot.
         let snapshot = agent.snapshot();
-        let tools_before = agent.render_tools(false);
-
-        agent.restore(&snapshot);
-        assert_eq!(agent.render_tools(false), tools_before);
+        let restored = Agent::restore(
+            snapshot,
+            "base system prompt".to_string(),
+            ToolBox::new(),
+            "cache".to_string(),
+            AgentConfig::default(),
+        );
+        assert_ne!(agent.render_tools(false), restored.render_tools(false));
     }
 }
