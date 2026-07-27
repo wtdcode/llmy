@@ -6,6 +6,9 @@
 //! ([`StepResult::Toolcalled`]). Higher-level loops (see `llmy-harness`)
 //! drive these steps until a `Stop` is observed.
 
+use llmy_types::error::GeneralToolCall;
+use serde::{Deserialize, Serialize};
+
 /// The result of running one agent step.
 #[derive(Debug, Clone)]
 pub enum StepResult {
@@ -40,5 +43,76 @@ impl StepResult {
     /// Returns `true` if the model finished its turn with a final message.
     pub fn did_stop(&self) -> bool {
         matches!(self, Self::Stop(_))
+    }
+}
+
+/// An observable event emitted while a step executes the model's tool calls.
+///
+/// A single step can run several tool calls. [`StepResult`] plus the messages
+/// appended to the conversation are enough to *drive* the loop, but they hide
+/// *what happened* to each individual tool — information a host application
+/// often wants to observe (logging, UI, telemetry). The harness'
+/// `step_with_events` returns these events alongside the [`StepResult`], one
+/// per tool call in call order, so failures are visible even when a tool
+/// aborts the step.
+///
+/// Every variant carries the originating [`GeneralToolCall`] so events can be
+/// correlated back to the exact request the model issued. The type is
+/// [`Serialize`]/[`Deserialize`] so events can be forwarded out of process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AgentEvent {
+    /// A tool ran to completion; `output` is the text returned to the model.
+    ToolCallCompleted {
+        call: GeneralToolCall,
+        output: String,
+    },
+    /// A tool ran but returned an error. This is the failure that also aborts
+    /// the step (the step returns `Err` after emitting this event); `error` is
+    /// the rendered error.
+    ToolCallFailed {
+        call: GeneralToolCall,
+        error: String,
+    },
+    /// The model's arguments did not conform to the tool's schema. The step
+    /// asks the model to retry instead of aborting; `error` describes the
+    /// mismatch.
+    ToolCallInvalidArguments {
+        call: GeneralToolCall,
+        error: String,
+    },
+    /// The model requested a tool that is not registered in the toolbox.
+    ToolCallNotFound { call: GeneralToolCall },
+}
+
+/// The events emitted during a single step, in tool-call order.
+pub type AgentEvents = Vec<AgentEvent>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_event_round_trips_through_json() {
+        let call = GeneralToolCall {
+            tool_id: "id-1".to_string(),
+            tool_name: "alpha_tool".to_string(),
+            tool_args: "{}".to_string(),
+        };
+        let event = AgentEvent::ToolCallCompleted {
+            call: call.clone(),
+            output: "hello".to_string(),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let restored: AgentEvent = serde_json::from_str(&json).unwrap();
+
+        match restored {
+            AgentEvent::ToolCallCompleted { call: got, output } => {
+                assert_eq!(got.tool_id, call.tool_id);
+                assert_eq!(got.tool_name, call.tool_name);
+                assert_eq!(output, "hello");
+            }
+            other => panic!("expected ToolCallCompleted, got {other:?}"),
+        }
     }
 }

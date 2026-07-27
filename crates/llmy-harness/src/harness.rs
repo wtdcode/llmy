@@ -1,5 +1,5 @@
 use color_eyre::eyre::eyre;
-use llmy_agent::{LLMYError, StepResult, Tool, tool::ToolBox};
+use llmy_agent::{AgentEvent, AgentEvents, LLMYError, StepResult, Tool, tool::ToolBox};
 use llmy_agent_tools::memory::{
     AgentMemory, AgentMemoryContent, AgentMemoryContext, UpdateMemoryTool, WriteMemoryTool,
 };
@@ -222,8 +222,14 @@ impl Agent {
         ));
     }
 
-    pub async fn step(
+    /// Runs one step, appending one [`AgentEvent`] per executed tool call to
+    /// `events`, in the model's call order. Kept private so the `?`-based
+    /// control flow stays simple; [`Self::step_with_events`] owns the `events`
+    /// buffer and pairs it with the result (so events survive even when a tool
+    /// failure returns `Err`), and [`Self::step`] discards it.
+    async fn step_inner(
         &mut self,
+        events: &mut AgentEvents,
         llm: &LLM,
         debug_prefix: Option<&str>,
         settings: Option<LLMSettings>,
@@ -279,48 +285,19 @@ impl Agent {
                             return Err(eyre!("no tool calls but give tool call reason").into());
                         }
                     } else {
-                        let calls = self.invoke_tool_calls(calls, &config).await;
-
-                        for (call, tool_out) in calls.into_iter() {
-                            if let Some(tool_out) = tool_out {
-                                match tool_out {
-                                    Ok(tool_out) => {
-                                        out.push(tool_out);
-                                    }
-                                    Err(LLMYError::IncorrectToolCall(_, _, e)) => {
-                                        tracing::warn!(
-                                            "Incorrect tool call detected for {}, schema is {:?}, we will ask LLM to retry.",
-                                            call,
-                                            &e
-                                        );
-                                        let tool_msg = ChatCompletionRequestToolMessageRaw {
-                                            content: ChatCompletionRequestToolMessageContent::Text(
-                                                format!(
-                                                    "Tool call to {} does not conform to schema {:?}",
-                                                    call, e
-                                                ),
-                                            ),
-                                            tool_call_id: call.tool_id.clone(),
-                                        };
-                                        out.push(ChatCompletionRequestMessageRaw::Tool(
-                                            WithOtherFields::new(tool_msg),
-                                        ));
-                                    }
-                                    Err(e) => return Err(e),
-                                }
-                            } else {
-                                tracing::warn!("Tool call {} is not defined", call);
-                                let tool_msg = ChatCompletionRequestToolMessageRaw {
-                                    content: ChatCompletionRequestToolMessageContent::Text(
-                                        format!("The tool of {} is not defined", call),
-                                    ),
-                                    tool_call_id: call.tool_id.clone(),
-                                };
-                                out.push(ChatCompletionRequestMessageRaw::Tool(
-                                    WithOtherFields::new(tool_msg),
-                                ));
-                            }
+                        let outcomes = self.invoke_tool_calls(calls, &config).await;
+                        let (mut tool_events, tool_messages, first_error) =
+                            Self::tool_outcomes_to_events_and_messages(outcomes);
+                        events.append(&mut tool_events);
+                        // A hard tool failure aborts the step, but only *after*
+                        // every outcome has been recorded as an event above, so
+                        // the events returned alongside the `Err` still describe
+                        // what each tool did — including calls that ran
+                        // successfully next to the failing one.
+                        if let Some(error) = first_error {
+                            return Err(error);
                         }
+                        out = tool_messages;
                     }
 
                     (StepResult::Toolcalled(assistant_content.clone()), out)
@@ -358,19 +335,155 @@ impl Agent {
         Ok(step_result)
     }
 
+    /// Runs one step and returns both its result and the [`AgentEvent`]s
+    /// emitted while executing the model's tool calls.
+    ///
+    /// The events are returned *alongside* the `Result` rather than inside the
+    /// `Ok` variant on purpose: a tool that fails hard makes the step return
+    /// `Err` without ever producing a [`StepResult`], and callers still want
+    /// to see which tool failed. Pairing the events with the outcome keeps
+    /// them observable on both the success and failure paths.
+    pub async fn step_with_events(
+        &mut self,
+        llm: &LLM,
+        debug_prefix: Option<&str>,
+        settings: Option<LLMSettings>,
+    ) -> (Result<StepResult, LLMYError>, AgentEvents) {
+        let mut events = AgentEvents::new();
+        let result = self
+            .step_inner(&mut events, llm, debug_prefix, settings)
+            .await;
+        (result, events)
+    }
+
+    /// Runs one step, discarding the per-tool events. Equivalent to
+    /// [`Self::step_with_events`] followed by dropping the events; kept so
+    /// existing callers that do not care about events are unaffected.
+    pub async fn step(
+        &mut self,
+        llm: &LLM,
+        debug_prefix: Option<&str>,
+        settings: Option<LLMSettings>,
+    ) -> Result<StepResult, LLMYError> {
+        self.step_with_events(llm, debug_prefix, settings).await.0
+    }
+
+    /// Runs the requested tool calls, returning each raw result paired with
+    /// its originating call, in the model's original call order. Success arms
+    /// carry the tool's `String` output so `step_inner` can both emit an
+    /// [`AgentEvent`] and build the tool message from it; `None` means the tool
+    /// was not registered. The tool messages are assembled in `step_inner`
+    /// rather than here so the raw output is available for the event.
+    ///
+    /// The concurrent `invoke_many` resolves tools in completion order, so the
+    /// outcomes are re-sorted back to call order to keep the emitted events and
+    /// appended messages deterministic (audit logs, UI). Correlation is by
+    /// `tool_id`, which is unique within a single model response.
     async fn invoke_tool_calls(
         &self,
         calls: Vec<GeneralToolCall>,
         config: &AgentConfig,
-    ) -> Vec<(
-        GeneralToolCall,
-        Option<Result<ChatCompletionRequestMessageRaw, LLMYError>>,
-    )> {
-        if config.sequential_tool_call {
-            self.tools.agent_invoke_many_sequential(calls).await
+    ) -> Vec<(GeneralToolCall, Option<Result<String, LLMYError>>)> {
+        let call_order: Vec<String> = calls.iter().map(|c| c.tool_id.clone()).collect();
+        let mut outcomes = if config.sequential_tool_call {
+            self.tools.invoke_many_sequential(calls).await
         } else {
-            self.tools.agent_invoke_many(calls).await
+            self.tools.invoke_many(calls).await
+        };
+        outcomes.sort_by_key(|(call, _)| {
+            call_order
+                .iter()
+                .position(|id| id == &call.tool_id)
+                .unwrap_or(usize::MAX)
+        });
+        outcomes
+    }
+
+    /// Converts the raw per-call tool outcomes into the [`AgentEvent`]s to
+    /// report and the tool messages to append to the conversation, plus the
+    /// first hard tool failure encountered (if any).
+    ///
+    /// Every outcome yields exactly one event, even when an earlier call
+    /// failed: a hard failure is *recorded* here and returned so the caller can
+    /// abort the step, but it never short-circuits the remaining events.
+    /// [`LLMYError::IncorrectToolCall`] is soft (the model is asked to retry, so
+    /// it still produces a tool message); any other tool error is hard and
+    /// produces no message.
+    fn tool_outcomes_to_events_and_messages(
+        outcomes: Vec<(GeneralToolCall, Option<Result<String, LLMYError>>)>,
+    ) -> (
+        AgentEvents,
+        Vec<ChatCompletionRequestMessageRaw>,
+        Option<LLMYError>,
+    ) {
+        let mut events = AgentEvents::new();
+        let mut messages = Vec::new();
+        let mut first_error = None;
+
+        for (call, tool_out) in outcomes {
+            if let Some(tool_out) = tool_out {
+                match tool_out {
+                    Ok(tool_out) => {
+                        events.push(AgentEvent::ToolCallCompleted {
+                            call: call.clone(),
+                            output: tool_out.clone(),
+                        });
+                        let tool_msg = ChatCompletionRequestToolMessageRaw {
+                            content: ChatCompletionRequestToolMessageContent::Text(tool_out),
+                            tool_call_id: call.tool_id.clone(),
+                        };
+                        messages.push(ChatCompletionRequestMessageRaw::Tool(
+                            WithOtherFields::new(tool_msg),
+                        ));
+                    }
+                    Err(LLMYError::IncorrectToolCall(_, _, e)) => {
+                        tracing::warn!(
+                            "Incorrect tool call detected for {}, schema is {:?}, we will ask LLM to retry.",
+                            call,
+                            &e
+                        );
+                        events.push(AgentEvent::ToolCallInvalidArguments {
+                            call: call.clone(),
+                            error: format!("arguments do not conform to schema {e:?}"),
+                        });
+                        let tool_msg = ChatCompletionRequestToolMessageRaw {
+                            content: ChatCompletionRequestToolMessageContent::Text(format!(
+                                "Tool call to {} does not conform to schema {:?}",
+                                call, e
+                            )),
+                            tool_call_id: call.tool_id.clone(),
+                        };
+                        messages.push(ChatCompletionRequestMessageRaw::Tool(
+                            WithOtherFields::new(tool_msg),
+                        ));
+                    }
+                    Err(e) => {
+                        events.push(AgentEvent::ToolCallFailed {
+                            call: call.clone(),
+                            error: e.to_string(),
+                        });
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
+            } else {
+                tracing::warn!("Tool call {} is not defined", call);
+                events.push(AgentEvent::ToolCallNotFound { call: call.clone() });
+                let tool_msg = ChatCompletionRequestToolMessageRaw {
+                    content: ChatCompletionRequestToolMessageContent::Text(format!(
+                        "The tool of {} is not defined",
+                        call
+                    )),
+                    tool_call_id: call.tool_id.clone(),
+                };
+                messages.push(ChatCompletionRequestMessageRaw::Tool(WithOtherFields::new(
+                    tool_msg,
+                )));
+            }
         }
+
+        (events, messages, first_error)
     }
 
     pub async fn step_with_user(
@@ -612,6 +725,9 @@ mod tests {
         events: Arc<Mutex<Vec<String>>>,
     }
 
+    #[derive(Debug, Clone)]
+    struct FailingTool;
+
     impl Tool for ZebraTool {
         type ARGUMENTS = ();
         const NAME: &str = "zebra_tool";
@@ -653,6 +769,16 @@ mod tests {
         async fn invoke(&self, _arguments: Self::ARGUMENTS) -> Result<String, LLMYError> {
             self.events.lock().await.push("fast".to_string());
             Ok("fast".to_string())
+        }
+    }
+
+    impl Tool for FailingTool {
+        type ARGUMENTS = ();
+        const NAME: &str = "failing_tool";
+        const DESCRIPTION: Option<&str> = Some("test tool that always fails");
+
+        async fn invoke(&self, _arguments: Self::ARGUMENTS) -> Result<String, LLMYError> {
+            Err(eyre!("boom").into())
         }
     }
 
@@ -717,6 +843,122 @@ mod tests {
                 "fast".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn invoke_tool_calls_surfaces_raw_outcomes_for_events() {
+        let mut tools = ToolBox::new();
+        tools.add_tool(AlphaTool);
+        tools.add_tool(FailingTool);
+        let config = AgentConfig::default();
+        let agent = Agent::new_with_config(
+            "base system prompt".to_string(),
+            tools,
+            "cache".to_string(),
+            config.clone(),
+        );
+
+        let results = agent
+            .invoke_tool_calls(
+                vec![
+                    tool_call("alpha_tool", "ok-id"),
+                    tool_call("failing_tool", "fail-id"),
+                    tool_call("missing_tool", "missing-id"),
+                ],
+                &config,
+            )
+            .await;
+
+        // Tools run concurrently, so correlate by the call's tool_id rather
+        // than position — these are the three outcomes `step_inner` turns into
+        // ToolCallCompleted / ToolCallFailed / ToolCallNotFound events.
+        let outcome = |id: &str| {
+            results
+                .iter()
+                .find(|(call, _)| call.tool_id == id)
+                .map(|(_, out)| out)
+        };
+
+        match outcome("ok-id") {
+            Some(Some(Ok(output))) => assert_eq!(output.as_str(), "ok"),
+            other => panic!("expected completed output, got {other:?}"),
+        }
+        match outcome("fail-id") {
+            Some(Some(Err(_))) => {}
+            other => panic!("expected failure, got {other:?}"),
+        }
+        match outcome("missing-id") {
+            Some(None) => {}
+            other => panic!("expected not-found, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invoke_tool_calls_restores_call_order_after_concurrent_completion() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolBox::new();
+        // Slow first, fast second. Run concurrently the fast tool finishes
+        // first, so only the call-order re-sort can put `slow` back in front.
+        tools.add_tool(SlowRecordingTool {
+            events: events.clone(),
+        });
+        tools.add_tool(FastRecordingTool {
+            events: events.clone(),
+        });
+        let config = AgentConfig {
+            sequential_tool_call: false,
+            allow_empty_tool_calls: false,
+        };
+        let agent = Agent::new_with_config(
+            "base system prompt".to_string(),
+            tools,
+            "cache".to_string(),
+            config.clone(),
+        );
+
+        let results = agent
+            .invoke_tool_calls(
+                vec![
+                    tool_call("slow_recording_tool", "slow"),
+                    tool_call("fast_recording_tool", "fast"),
+                ],
+                &config,
+            )
+            .await;
+
+        let ids: Vec<&str> = results.iter().map(|(c, _)| c.tool_id.as_str()).collect();
+        assert_eq!(ids, vec!["slow", "fast"]);
+    }
+
+    #[test]
+    fn tool_outcomes_record_every_event_even_after_a_hard_failure() {
+        // Outcomes arrive already in call order (see `invoke_tool_calls`); the
+        // hard failure sits in the middle, with a successful call after it.
+        let outcomes = vec![
+            (tool_call("alpha_tool", "a"), Some(Ok("out-a".to_string()))),
+            (
+                tool_call("failing_tool", "b"),
+                Some(Err(eyre!("boom").into())),
+            ),
+            (tool_call("gamma_tool", "c"), Some(Ok("out-c".to_string()))),
+            (tool_call("missing_tool", "d"), None),
+        ];
+
+        let (events, messages, first_error) =
+            Agent::tool_outcomes_to_events_and_messages(outcomes);
+
+        // One event per outcome, in order — crucially the success *after* the
+        // failure (index 2) is still reported instead of being dropped.
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0], AgentEvent::ToolCallCompleted { .. }));
+        assert!(matches!(events[1], AgentEvent::ToolCallFailed { .. }));
+        assert!(matches!(events[2], AgentEvent::ToolCallCompleted { .. }));
+        assert!(matches!(events[3], AgentEvent::ToolCallNotFound { .. }));
+
+        // The hard failure is surfaced so the step can abort...
+        assert!(first_error.is_some());
+        // ...but it contributes no tool message; the other three do.
+        assert_eq!(messages.len(), 3);
     }
 
     #[test]
