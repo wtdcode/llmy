@@ -246,6 +246,42 @@ impl Agent {
         }
     }
 
+    /// Builds a memory-enabled agent from a previously captured
+    /// [`AgentSnapshot`], mirroring [`Self::with_memory_config`] but seeding the
+    /// conversation from the snapshot instead of starting empty.
+    ///
+    /// The memory context is a live shared handle, so — like the toolbox — it
+    /// never rides along inside a snapshot and is supplied fresh here. Use this
+    /// instead of [`Self::restore`] for agents built with memory, otherwise the
+    /// memory tools and the memory-rendered system prompt are silently dropped.
+    pub async fn restore_with_memory_config(
+        snapshot: AgentSnapshot,
+        system_prompt: String,
+        mut tools: ToolBox,
+        cache_key: String,
+        memory: &AgentMemoryContext,
+        criteria: &AgentMemorySystemPromptCriteria,
+        config: AgentConfig,
+    ) -> Self {
+        tools.extend(memory.tool_box());
+        let guard = memory.memory.read().await;
+        let rendered_system_prompt = criteria.render_system_prompt(&system_prompt, &guard);
+        Self {
+            base_system_prompt: system_prompt,
+            system_prompt: rendered_system_prompt,
+            tools,
+            context: snapshot.context,
+            checkpoints: vec![],
+            last_step: snapshot.last_step,
+            cache_key,
+            memory: Some(AgentMemoryRuntime {
+                context: memory.clone(),
+                criteria: criteria.clone(),
+            }),
+            config,
+        }
+    }
+
     pub fn config(&self) -> &AgentConfig {
         &self.config
     }
@@ -1054,6 +1090,43 @@ mod tests {
             AgentConfig::default(),
         );
         assert_eq!(restored.render_context(), before);
+    }
+
+    #[tokio::test]
+    async fn restore_with_memory_keeps_the_agent_memory_enabled() {
+        let memory = AgentMemoryContext::new_without_search(AgentMemory::default());
+        let criteria = AgentMemorySystemPromptCriteria::default();
+        let mut agent = Agent::with_memory_config(
+            "base system prompt".to_string(),
+            ToolBox::new(),
+            "cache".to_string(),
+            &memory,
+            &criteria,
+            AgentConfig::default(),
+        )
+        .await;
+        agent.push_user_message("first".to_string());
+
+        let before = agent.render_context();
+        let tools_before = agent.render_tools(false);
+        assert!(tools_before.contains(<WriteMemoryTool as Tool>::NAME));
+
+        let restored = Agent::restore_with_memory_config(
+            agent.snapshot(),
+            "base system prompt".to_string(),
+            ToolBox::new(),
+            "cache".to_string(),
+            &memory,
+            &criteria,
+            AgentConfig::default(),
+        )
+        .await;
+
+        // The conversation comes back, memory-rendered system prompt included...
+        assert_eq!(restored.render_context(), before);
+        // ...along with the capabilities a plain `restore` would have dropped.
+        assert_eq!(restored.render_tools(false), tools_before);
+        assert!(restored.render_memory().await.is_some());
     }
 
     #[test]
