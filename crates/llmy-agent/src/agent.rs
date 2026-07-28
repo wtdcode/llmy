@@ -6,8 +6,10 @@
 //! ([`StepResult::Toolcalled`]). Higher-level loops (see `llmy-harness`)
 //! drive these steps until a `Stop` is observed.
 
+use serde::{Deserialize, Serialize};
+
 /// The result of running one agent step.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StepResult {
     /// The model produced a final assistant message and did not request any
     /// further tool calls. The wrapped string is that assistant message.

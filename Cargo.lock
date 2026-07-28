@@ -2501,6 +2501,7 @@ dependencies = [
  "llmy-agent-tools",
  "llmy-client",
  "llmy-types",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
