@@ -66,9 +66,11 @@ pub enum AgentEvent {
         call: GeneralToolCall,
         output: String,
     },
-    /// A tool ran but returned an error. This is the failure that also aborts
-    /// the step (the step returns `Err` after emitting this event); `error` is
-    /// the rendered error.
+    /// A tool ran but failed. This is a *hard* failure: the step aborts and
+    /// returns `Err` — but only after every outcome has been recorded, so a
+    /// single step can emit several of these. The step's `Err` is the first one
+    /// in call order; for any others `error` (the rendered error) is all that
+    /// survives.
     ToolCallFailed {
         call: GeneralToolCall,
         error: String,
