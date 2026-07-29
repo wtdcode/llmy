@@ -369,37 +369,28 @@ impl LLMInner {
         guard.filter_input(req);
     }
 
-    /// Give a request that came without a `prompt_cache_key` the one that best
-    /// matches what this client has already sent, so consecutive turns of a
-    /// conversation keep landing on the machine holding their cached prefix.
+    /// Take the auto cache key for one logical request: the key whose prompt
+    /// prefix best matches what this client has already sent, so consecutive
+    /// turns of a conversation keep landing on the machine holding their cached
+    /// prefix.
     ///
-    /// The returned claim must be confirmed once the request is answered, and
-    /// dropped otherwise — see [`CacheKeyClaim`]. A caller-supplied key is never
-    /// second-guessed.
-    #[must_use = "an unconfirmed claim is abandoned on drop"]
-    fn apply_auto_cache_key(
-        &self,
-        req: &mut RawExtensibleChatCompletionRequest,
-    ) -> Option<CacheKeyClaim> {
+    /// The claim is handed (cloned) to every attempt of that request, settled by
+    /// whichever one lands, and abandoned when the caller drops the last clone.
+    /// A caller-supplied key is never second-guessed.
+    fn auto_cache_key(&self, req: &RawExtensibleChatCompletionRequest) -> Option<CacheKeyClaim> {
         if req.prompt_cache_key.is_some() {
             return None;
         }
-        let claim = self.cache_keys.select(req, self.model.cache_policy())?;
-        tracing::debug!("auto prompt cache key {}", claim.key());
-        req.prompt_cache_key = Some(claim.key().to_string());
-        Some(claim)
+        self.cache_keys.select(req, &self.model)
     }
 
-    /// Clone `req` with its auto cache key already resolved, so a retry loop
-    /// picks (and charges for) one key rather than one per attempt. The claim
-    /// spans every attempt: a retry is the same logical request.
-    fn with_auto_cache_key(
-        &self,
-        req: &RawExtensibleChatCompletionRequest,
-    ) -> (RawExtensibleChatCompletionRequest, Option<CacheKeyClaim>) {
-        let mut req = req.clone();
-        let claim = self.apply_auto_cache_key(&mut req);
-        (req, claim)
+    /// Cached prompt tokens the provider reported, or zero if it reported none.
+    fn reported_cached_tokens(resp: &RawExtensibleChatCompletionResponse) -> u64 {
+        resp.usage
+            .as_ref()
+            .and_then(|usage| usage.prompt_tokens_details.as_ref())
+            .and_then(|details| details.cached_tokens)
+            .unwrap_or_default() as u64
     }
 
     /// Snapshot of the auto cache key policy in force for this client.
@@ -518,22 +509,22 @@ impl LLMInner {
         retry: Option<u64>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
         let retry = retry.unwrap_or(u64::MAX);
-        // Resolve the auto cache key once, not per attempt: it charges the key's
-        // request budget, and a retry is the same logical request.
-        let (req, mut claim) = self.with_auto_cache_key(req);
+        // One claim for the whole logical request; every attempt gets a clone,
+        // and giving up drops the last one, which abandons it.
+        let claim = self.auto_cache_key(req);
 
         let mut last = None;
         for idx in 0..retry {
+            // Selection paid for the first send; a retry is extra traffic on the
+            // same key and costs another slot of its budget.
+            if let (true, Some(claim)) = (idx > 0, claim.as_ref()) {
+                claim.charge_resend();
+            }
             match self
-                .complete_extensible(req.clone(), debug_prefix, timeout)
+                .complete_extensible_attempt(req.clone(), claim.clone(), debug_prefix, timeout)
                 .await
             {
-                Ok(r) => {
-                    if let Some(claim) = claim.take() {
-                        claim.confirm();
-                    }
-                    return Ok(r);
-                }
+                Ok(r) => return Ok(r),
                 // A billing/cap error is deterministic — retrying can't recover it
                 // (and would keep tripping the pre-flight check), so fail fast.
                 Err(e @ LLMYError::Billing { .. }) => return Err(e),
@@ -559,21 +550,24 @@ impl LLMInner {
         retry: Option<u64>,
     ) -> Result<T, LLMYError> {
         let retry = retry.unwrap_or(u64::MAX);
-        // Resolve the auto cache key once — see the note in the untyped variant.
-        let (req, mut claim) = self.with_auto_cache_key(req);
+        // One claim for the whole logical request — see the untyped variant.
+        let claim = self.auto_cache_key(req);
 
         let mut last = None;
         for idx in 0..retry {
+            if let (true, Some(claim)) = (idx > 0, claim.as_ref()) {
+                claim.charge_resend();
+            }
             match self
-                .complete_extensible_typed::<T>(req.clone(), debug_prefix, timeout)
+                .complete_extensible_typed_attempt::<T>(
+                    req.clone(),
+                    claim.clone(),
+                    debug_prefix,
+                    timeout,
+                )
                 .await
             {
-                Ok(value) => {
-                    if let Some(claim) = claim.take() {
-                        claim.confirm();
-                    }
-                    return Ok(value);
-                }
+                Ok(value) => return Ok(value),
                 // A billing/cap error is deterministic — retrying can't recover it
                 // (and would keep tripping the pre-flight check), so fail fast.
                 Err(e @ LLMYError::Billing { .. }) => return Err(e),
@@ -636,22 +630,57 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
     ) -> Result<T, LLMYError> {
+        let claim = self.auto_cache_key(&req);
+        self.complete_extensible_typed_attempt::<T>(req, claim, debug_prefix, timeout_overwrite)
+            .await
+    }
+
+    /// One attempt of a typed logical request; see
+    /// [`Self::complete_extensible_attempt`] for how `given_claim` travels.
+    async fn complete_extensible_typed_attempt<T: DeserializeOwned>(
+        &self,
+        req: RawExtensibleChatCompletionRequest,
+        given_claim: Option<CacheKeyClaim>,
+        debug_prefix: Option<&str>,
+        timeout_overwrite: Option<Duration>,
+    ) -> Result<T, LLMYError> {
         let resp = self
-            .complete_extensible(req, debug_prefix, timeout_overwrite)
+            .complete_extensible_attempt(req, given_claim, debug_prefix, timeout_overwrite)
             .await?;
         self.parse_first_choice::<T>(&resp)
     }
 
     pub async fn complete_extensible(
         &self,
+        req: RawExtensibleChatCompletionRequest,
+        debug_prefix: Option<&str>,
+        timeout_overwrite: Option<Duration>,
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        // A one-shot call is a logical request of exactly one attempt, so the
+        // claim is taken and dropped here — abandoned if the call does not land.
+        let claim = self.auto_cache_key(&req);
+        self.complete_extensible_attempt(req, claim, debug_prefix, timeout_overwrite)
+            .await
+    }
+
+    /// One attempt of a logical request, carrying that request's cache key
+    /// claim — see [`Self::auto_cache_key`]. The attempt only ever uses the
+    /// claim it is given; it never takes one of its own, so retrying cannot cost
+    /// a second claim or a second slot of the key's request budget.
+    async fn complete_extensible_attempt(
+        &self,
         mut req: RawExtensibleChatCompletionRequest,
+        given_claim: Option<CacheKeyClaim>,
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
         // Fail fast: if we're already over budget, don't issue the request.
         self.billing.read().unwrap().check_cap(self.node)?;
 
-        let cache_claim = self.apply_auto_cache_key(&mut req);
+        if let Some(claim) = given_claim.as_ref() {
+            tracing::debug!("auto prompt cache key {}", claim.key());
+            req.prompt_cache_key = Some(claim.key().to_string());
+        }
         self.apply_filter_input(&mut req);
 
         // Keep the raw prefix (None => "") for the per-prefix billing dimension,
@@ -719,14 +748,15 @@ impl LLMInner {
                     let err = format!("{:?}", e);
                     backend.record_error(handle, &err).await;
                 }
-                // `cache_claim` drops here: the prompt was never cached.
+                // This attempt's clone drops here without settling; the caller
+                // still holds the claim for a retry, or drops it to abandon.
                 return Err(e);
             }
         };
         // The provider answered, so it really did cache this prompt's prefixes.
-        // Settle before the billing check below, which can still bail out.
-        if let Some(claim) = cache_claim {
-            claim.confirm();
+        // Settle before the billing record below, which can still bail out.
+        if let Some(claim) = given_claim.as_ref() {
+            claim.confirm(Self::reported_cached_tokens(&resp));
         }
         self.apply_filter_output(&mut resp);
         if let (Some(backend), Some(handle)) = (self.debug_backend.as_ref(), dbg_handle.as_ref()) {
@@ -1489,8 +1519,9 @@ mod tests {
 
     /// Resolve a key for `req` and settle it, i.e. a request that was answered.
     fn landed(llm: &LLM, req: &mut RawExtensibleChatCompletionRequest) {
-        if let Some(claim) = llm.apply_auto_cache_key(req) {
-            claim.confirm();
+        if let Some(claim) = llm.auto_cache_key(req) {
+            req.prompt_cache_key = Some(claim.key().to_string());
+            claim.confirm(0);
         }
     }
 
@@ -1530,9 +1561,12 @@ mod tests {
 
         // Claim taken, then dropped unconfirmed — the request failed, so nothing
         // was cached and the prefix must not point anywhere.
-        let mut failed = user_request("hello");
-        drop(llm.apply_auto_cache_key(&mut failed));
-        let stale = failed.prompt_cache_key.clone().expect("auto key");
+        let failed = user_request("hello");
+        let stale = llm
+            .auto_cache_key(&failed)
+            .expect("auto key")
+            .key()
+            .to_string();
 
         let mut retry = user_request("hello");
         landed(&llm, &mut retry);
@@ -1545,18 +1579,43 @@ mod tests {
 
         // Two sub-agents fan out from the same prefix at once. Neither has an
         // answer yet, but the second must still land on the first one's machine.
-        let mut first = user_request("shared");
-        let first_claim = llm.apply_auto_cache_key(&mut first).expect("auto key");
-        let mut second = extended("shared", "branch");
-        let second_claim = llm.apply_auto_cache_key(&mut second).expect("auto key");
-        assert_eq!(second.prompt_cache_key, first.prompt_cache_key);
+        let first = user_request("shared");
+        let first_claim = llm.auto_cache_key(&first).expect("auto key");
+        let second = extended("shared", "branch");
+        let second_claim = llm.auto_cache_key(&second).expect("auto key");
+        assert_eq!(second_claim.key(), first_claim.key());
 
         // The first one failing must not strand the second, which is still going.
+        let shared_key = first_claim.key().to_string();
         drop(first_claim);
         let mut third = extended("shared", "other branch");
         landed(&llm, &mut third);
-        assert_eq!(third.prompt_cache_key, first.prompt_cache_key);
-        second_claim.confirm();
+        assert_eq!(third.prompt_cache_key.as_deref(), Some(&*shared_key));
+        second_claim.confirm(0);
+    }
+
+    #[test]
+    fn retries_share_one_claim() {
+        // One request per key per minute, so taking a second claim would be
+        // forced onto a fresh key and show up immediately.
+        let llm = test_llm_with(LLMSettings {
+            cache_key_rpm: 1,
+            ..test_settings(None)
+        });
+
+        // What a retry loop owns: one claim, cloned into every attempt.
+        let req = user_request("hello");
+        let claim = llm.auto_cache_key(&req).expect("auto key");
+        for _ in 0..3 {
+            let attempt = claim.clone();
+            assert_eq!(attempt.key(), claim.key());
+        }
+        claim.confirm(0);
+
+        // A caller-supplied key short-circuits selection entirely.
+        let mut given = user_request("hello");
+        given.prompt_cache_key = Some("mine".into());
+        assert!(llm.auto_cache_key(&given).is_none());
     }
 
     #[test]

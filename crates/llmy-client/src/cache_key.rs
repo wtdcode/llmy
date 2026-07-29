@@ -26,11 +26,12 @@
 use std::collections::hash_map::{DefaultHasher, Entry};
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hasher;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use crate::debug::completion_to_string;
-use crate::model::CachePolicy;
+use crate::model::{CachePolicy, OpenAIModel};
 use crate::req::{PromptCacheMode, RawExtensibleChatCompletionRequest};
 
 /// Rolling hash of a prompt prefix. A collision only ever costs a suboptimal
@@ -47,6 +48,16 @@ const RATE_WINDOW: Duration = Duration::from_secs(60);
 /// than ~15 requests/minute on a single key spills over to more machines and
 /// costs you hit rate. So that is the default ceiling before we spread out.
 pub const DEFAULT_MAX_RPM: u32 = 15;
+
+/// Below this share of the expected prefix actually coming back cached, routing
+/// is not buying what it should and the prompt shape is the likely culprit — a
+/// prefix that moves between turns, a timestamp in the system prompt, a toolbox
+/// rebuilt per request.
+const CACHE_HIT_WARN_RATIO: f64 = 0.70;
+
+/// OpenAI only caches prompts from this length up, so a shorter prefix coming
+/// back uncached is normal and not worth complaining about.
+const MIN_CACHEABLE_TOKENS: u64 = 1024;
 
 /// Default idle lifetime of a key.
 ///
@@ -114,13 +125,21 @@ impl KeyState {
     }
 }
 
-/// A prefix claimed by requests that have not landed yet.
-#[derive(Debug)]
-struct InFlight {
+/// A prompt prefix claimed for a key: how big it is, and how far along the claim
+/// has got.
+#[derive(Debug, Clone, Copy)]
+struct Claim {
     key: KeyId,
-    /// How many in-flight requests are holding this claim. Refcounted so one
-    /// failing sibling cannot strand another that is still going.
+    /// Prompt tokens this prefix covers, measured once when it is first claimed
+    /// so a later match reads the number rather than re-counting it.
+    tokens: u64,
+    /// Requests still in flight behind this claim. Refcounted so one sibling
+    /// failing cannot strand another that is still going.
     holders: u32,
+    /// Whether a request carrying this prefix has actually been answered. Until
+    /// then the claim is provisional — visible to concurrent siblings so a
+    /// fan-out converges on one key, but gone again if nothing lands.
+    settled: bool,
 }
 
 /// Per-client registry mapping prompt prefixes to the cache key that owns them.
@@ -132,13 +151,9 @@ struct InFlight {
 pub struct CacheKeyRegistry {
     config: CacheKeyConfig,
     keys: HashMap<KeyId, KeyState>,
-    /// Settled claims: this prefix really was sent under this key and answered.
-    /// One prefix to one key — whoever settles it first owns it until that key
+    /// One prefix to one key — whoever claims it first owns it until that key
     /// expires, so a lineage keeps its original key as it grows.
-    by_prefix: HashMap<PrefixHash, KeyId>,
-    /// Claims held by requests still in flight. Looked up alongside `by_prefix`
-    /// so concurrent siblings converge, but never promoted until confirmed.
-    in_flight: HashMap<PrefixHash, InFlight>,
+    claims: HashMap<PrefixHash, Claim>,
     next_id: KeyId,
     pid: u32,
 }
@@ -148,8 +163,7 @@ impl CacheKeyRegistry {
         Self {
             config,
             keys: HashMap::new(),
-            by_prefix: HashMap::new(),
-            in_flight: HashMap::new(),
+            claims: HashMap::new(),
             next_id: 0,
             pid: std::process::id(),
         }
@@ -167,13 +181,13 @@ impl CacheKeyRegistry {
     fn select(
         &mut self,
         req: &RawExtensibleChatCompletionRequest,
-        policy: CachePolicy,
-    ) -> Option<(String, KeyId, Vec<PrefixHash>)> {
+        model: &OpenAIModel,
+    ) -> Option<(String, KeyId, Vec<PrefixHash>, u64)> {
         if !self.config.enabled {
             return None;
         }
-        let chain = prefix_chain(req);
-        let claimable = cache_points(req, policy, chain.len());
+        let blocks = prompt_blocks(req);
+        let claimable = cache_points(req, model.cache_policy(), blocks.len());
 
         let now = Instant::now();
         self.expire(now);
@@ -181,88 +195,112 @@ impl CacheKeyRegistry {
         // Longest link first: the deepest shared prefix is the biggest cache
         // hit. A key that is out of budget is skipped, so we fall through to the
         // next-best (shorter) prefix rather than piling onto one machine.
+        //
+        // Whatever the matched prefix was measured at when it was claimed is
+        // what we are betting comes back as a cache read; a fresh key bets on
+        // nothing.
         let max_rpm = self.config.max_rpm;
         let mut chosen = None;
-        for hash in chain.iter().rev() {
-            let Some(id) = self.claimant(hash) else {
+        for block in blocks.iter().rev() {
+            let Some(&claim) = self.claims.get(&block.hash) else {
                 continue;
             };
-            let Some(state) = self.keys.get_mut(&id) else {
+            let Some(state) = self.keys.get_mut(&claim.key) else {
                 continue;
             };
             if state.has_budget(now, max_rpm) {
-                chosen = Some(id);
+                chosen = Some(claim);
                 break;
             }
         }
 
-        let id = match chosen {
-            Some(id) => id,
-            None => self.mint(now),
+        let (id, expected_cached_tokens) = match chosen {
+            Some(claim) => (claim.key, claim.tokens),
+            None => (self.mint(now), 0),
         };
 
-        // Only real cache points, or a key would advertise cached content that
-        // was never stored.
+        // Only real cache points get claimed, or a key would advertise cached
+        // content that was never stored.
         let mut held = Vec::with_capacity(claimable.len());
-        for hash in claimable.iter().filter_map(|link| chain.get(*link)) {
-            if self.by_prefix.contains_key(hash) {
-                continue; // already settled, by us or by an earlier lineage
+        // Blocks `[0, priced)` are already accounted for in `tokens`. Prefixes
+        // somebody else already measured are adopted wholesale, so a growing
+        // conversation only ever tokenizes the messages it just added.
+        let mut priced = 0usize;
+        let mut tokens = 0u64;
+
+        for link in claimable {
+            let Some(block) = blocks.get(link) else {
+                continue;
+            };
+            match self.claims.get(&block.hash) {
+                Some(claim) => {
+                    tokens = claim.tokens;
+                }
+                None => {
+                    for unpriced in &blocks[priced..=link] {
+                        tokens += model.config.count_tokens_lossy(&unpriced.text) as u64;
+                    }
+                }
             }
-            match self.in_flight.entry(*hash) {
-                Entry::Occupied(mut held_by) => {
-                    // A sibling already has it in flight. Join it only if we are
-                    // on the same key; otherwise leave their claim alone.
-                    if held_by.get().key == id {
-                        held_by.get_mut().holders += 1;
-                        held.push(*hash);
+            priced = link + 1;
+
+            match self.claims.entry(block.hash) {
+                Entry::Occupied(mut claimed) => {
+                    // Already settled, or in flight under a different key: either
+                    // way it belongs to someone else, so leave it alone.
+                    if !claimed.get().settled && claimed.get().key == id {
+                        claimed.get_mut().holders += 1;
+                        held.push(block.hash);
                     }
                 }
                 Entry::Vacant(slot) => {
-                    slot.insert(InFlight {
+                    slot.insert(Claim {
                         key: id,
+                        tokens,
                         holders: 1,
+                        settled: false,
                     });
-                    held.push(*hash);
+                    held.push(block.hash);
                 }
             }
         }
 
         let state = self.keys.get_mut(&id)?;
         state.record_send(now);
-        Some((state.key.clone(), id, held))
+        Some((state.key.clone(), id, held, expected_cached_tokens))
     }
 
-    /// The key currently claiming `hash`, settled or in flight.
-    fn claimant(&self, hash: &PrefixHash) -> Option<KeyId> {
-        self.by_prefix
-            .get(hash)
-            .copied()
-            .or_else(|| self.in_flight.get(hash).map(|held| held.key))
+    /// Charge one request against a key's budget. The provider counts total
+    /// traffic per key, so every send costs a slot — including a retry, which is
+    /// real extra traffic on the same machine.
+    fn charge(&mut self, key: KeyId) {
+        if let Some(state) = self.keys.get_mut(&key) {
+            state.record_send(Instant::now());
+        }
     }
 
     /// Settle the claims of a request that landed: those prefixes really were
-    /// sent under `id` and answered.
-    fn confirm(&mut self, id: KeyId, held: &[PrefixHash]) {
+    /// sent and answered, so later requests may route by them.
+    fn confirm(&mut self, held: &[PrefixHash]) {
         for hash in held {
-            self.by_prefix.entry(*hash).or_insert(id);
-            self.release(hash);
+            if let Some(claim) = self.claims.get_mut(hash) {
+                claim.settled = true;
+                claim.holders = claim.holders.saturating_sub(1);
+            }
         }
     }
 
-    /// Drop the claims of a request that never landed.
+    /// Drop the claims of a request that never landed — unless a sibling settled
+    /// them meanwhile, or is still going.
     fn abandon(&mut self, held: &[PrefixHash]) {
         for hash in held {
-            self.release(hash);
-        }
-    }
-
-    fn release(&mut self, hash: &PrefixHash) {
-        let Entry::Occupied(mut held) = self.in_flight.entry(*hash) else {
-            return;
-        };
-        held.get_mut().holders = held.get().holders.saturating_sub(1);
-        if held.get().holders == 0 {
-            held.remove();
+            let Entry::Occupied(mut claim) = self.claims.entry(*hash) else {
+                continue;
+            };
+            claim.get_mut().holders = claim.get().holders.saturating_sub(1);
+            if claim.get().holders == 0 && !claim.get().settled {
+                claim.remove();
+            }
         }
     }
 
@@ -290,9 +328,7 @@ impl CacheKeyRegistry {
         self.keys.retain(|_, state| !state.expired(now, ttl));
         if self.keys.len() != before {
             let live = &self.keys;
-            self.by_prefix.retain(|_, id| live.contains_key(id));
-            self.in_flight
-                .retain(|_, held| live.contains_key(&held.key));
+            self.claims.retain(|_, claim| live.contains_key(&claim.key));
         }
     }
 }
@@ -322,19 +358,21 @@ impl CacheKeys {
     pub fn select(
         &self,
         req: &RawExtensibleChatCompletionRequest,
-        policy: CachePolicy,
+        model: &OpenAIModel,
     ) -> Option<CacheKeyClaim> {
-        let (key, id, held) = self
+        let (key, id, held, expected_cached_tokens) = self
             .0
             .write()
             .expect("cache keys poisoned")
-            .select(req, policy)?;
-        Some(CacheKeyClaim {
+            .select(req, model)?;
+        Some(CacheKeyClaim(Arc::new(HeldClaim {
             keys: self.clone(),
             key,
             id,
             held,
-        })
+            expected_cached_tokens,
+            settled: AtomicBool::new(false),
+        })))
     }
 }
 
@@ -344,47 +382,130 @@ impl CacheKeys {
         self.0.read().unwrap().keys.len()
     }
     fn settled(&self) -> usize {
-        self.0.read().unwrap().by_prefix.len()
+        self.0
+            .read()
+            .unwrap()
+            .claims
+            .values()
+            .filter(|claim| claim.settled)
+            .count()
     }
     fn in_flight(&self) -> usize {
-        self.0.read().unwrap().in_flight.len()
+        self.0
+            .read()
+            .unwrap()
+            .claims
+            .values()
+            .filter(|claim| claim.holders > 0)
+            .count()
     }
 }
 
 /// A cache key, plus the prefix claims the request carrying it holds until it
 /// lands.
 ///
-/// [`Self::confirm`] settles them: those prefixes really were sent under this
-/// key and answered, so later requests may route by them. Dropping unconfirmed
-/// abandons them instead — a failed request, an early return or a panic never
-/// leaves a prefix pointing at a key with nothing cached behind it.
+/// Cheap to clone, like a semaphore permit: one logical request takes a claim
+/// and hands a clone to each of its attempts. [`Self::confirm`] settles it —
+/// those prefixes really were sent under this key and answered, so later
+/// requests may route by them — and is idempotent, so whichever attempt lands
+/// first settles it. When the *last* clone drops unconfirmed the claim is
+/// abandoned instead, so a request that never lands, an early return or a panic
+/// leaves no prefix pointing at a key with nothing behind it.
+///
+/// Note this refcount is per logical request. The registry keeps its own count
+/// per prefix, because *different* concurrent requests can share a prefix while
+/// holding separate claims.
+#[derive(Debug, Clone)]
+pub struct CacheKeyClaim(Arc<HeldClaim>);
+
 #[derive(Debug)]
-pub struct CacheKeyClaim {
+struct HeldClaim {
     keys: CacheKeys,
     key: String,
     id: KeyId,
     held: Vec<PrefixHash>,
+    /// Tokens the matched prefix covers — what we are betting the provider will
+    /// serve from cache. Zero when this key is fresh and nothing is expected.
+    expected_cached_tokens: u64,
+    settled: AtomicBool,
 }
 
 impl CacheKeyClaim {
     /// The `prompt_cache_key` to send.
     pub fn key(&self) -> &str {
-        &self.key
+        &self.0.key
     }
 
-    /// Settle the claims — call once the request has been answered.
-    pub fn confirm(mut self) {
-        // Emptied first, so the `Drop` that follows has nothing to abandon.
-        let held = std::mem::take(&mut self.held);
-        if let Ok(mut registry) = self.keys.0.write() {
-            registry.confirm(self.id, &held);
+    /// Tokens the matched prefix covers, i.e. what routing to this key is
+    /// betting comes back as a cache read.
+    pub fn expected_cached_tokens(&self) -> u64 {
+        self.0.expected_cached_tokens
+    }
+
+    /// Charge one more request against this key's budget.
+    ///
+    /// The *first* send is already paid for by the selection that handed out
+    /// this claim — picking a key and taking its slot happen under one lock, so
+    /// a fan-out cannot all grab the same last slot. Later sends are retries,
+    /// which the provider counts as traffic on the key just the same, so the
+    /// retry loop charges them here.
+    pub fn charge_resend(&self) {
+        if let Ok(mut registry) = self.0.keys.0.write() {
+            registry.charge(self.0.id);
+        }
+    }
+
+    /// Settle the claims — call once the request has been answered — and report
+    /// how the bet went against the `cached_tokens` the provider reported.
+    ///
+    /// Idempotent: later calls, from a retry that also landed or another clone,
+    /// do nothing.
+    pub fn confirm(&self, cached_tokens: u64) {
+        if self.0.settled.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.0.report(cached_tokens);
+        if let Ok(mut registry) = self.0.keys.0.write() {
+            registry.confirm(&self.0.held);
         }
     }
 }
 
-impl Drop for CacheKeyClaim {
+impl HeldClaim {
+    /// Compare what the matched prefix promised against what came back, so a
+    /// prompt whose prefix is quietly unstable shows up in the logs instead of
+    /// just costing money.
+    fn report(&self, cached_tokens: u64) {
+        // Nothing was expected (fresh key), or the prefix is too short for the
+        // provider to cache at all — either way there is no bet to grade.
+        if self.expected_cached_tokens < MIN_CACHEABLE_TOKENS {
+            return;
+        }
+        let hit_rate = cached_tokens as f64 / self.expected_cached_tokens as f64;
+        if hit_rate < CACHE_HIT_WARN_RATIO {
+            tracing::warn!(
+                "prompt cache key {} expected ~{} cached tokens but got {} ({:.0}%); \
+                 the prompt prefix may not be stable across requests",
+                self.key,
+                self.expected_cached_tokens,
+                cached_tokens,
+                hit_rate * 100.0
+            );
+        } else {
+            tracing::debug!(
+                "prompt cache key {}: {}/{} prefix tokens cached ({:.0}%)",
+                self.key,
+                cached_tokens,
+                self.expected_cached_tokens,
+                hit_rate * 100.0
+            );
+        }
+    }
+}
+
+impl Drop for HeldClaim {
     fn drop(&mut self) {
-        if self.held.is_empty() {
+        if self.settled.load(Ordering::Relaxed) || self.held.is_empty() {
             return;
         }
         // Best-effort and panic-free, as required in `Drop`.
@@ -398,10 +519,17 @@ impl Drop for CacheKeyClaim {
 // Reading a request's cache shape
 // ---------------------------------------------------------------------------
 
-/// Roll a request up into one hash per prompt block: the tool definitions first
-/// — they head the rendered prompt, and changing them invalidates everything
-/// after — then one per message. Link `i` covers the prefix `0..=i`, so two
-/// requests share a link exactly when they share that stretch of prompt.
+/// One block of the rendered prompt: its text, and the rolling hash of the whole
+/// prefix ending at it.
+struct Block {
+    hash: PrefixHash,
+    text: String,
+}
+
+/// Split a request into prompt blocks: the tool definitions first — they head
+/// the rendered prompt, and changing them invalidates everything after — then
+/// one per message. Block `i`'s hash covers the prefix `0..=i`, so two requests
+/// share a hash exactly when they share that stretch of prompt.
 ///
 /// Blocks are hashed as the **prompt text** they render to, via
 /// [`completion_to_string`], not as the JSON we happen to hold. What the
@@ -411,26 +539,36 @@ impl Drop for CacheKeyClaim {
 /// into, a vendor extension field — must not look like a different conversation.
 /// The bias is deliberate: a false match only wastes a lookup on the wrong
 /// machine, while a false miss throws away a real cache hit.
-fn prefix_chain(req: &RawExtensibleChatCompletionRequest) -> Vec<PrefixHash> {
-    let mut chain = Vec::with_capacity(req.messages.len() + 1);
+///
+/// The rendered text is kept rather than dropped, so pricing a newly claimed
+/// prefix does not have to render it a second time.
+fn prompt_blocks(req: &RawExtensibleChatCompletionRequest) -> Vec<Block> {
+    let mut blocks = Vec::with_capacity(req.messages.len() + 1);
     // One hasher fed block by block. `Hasher::finish` reads the running value
-    // without resetting it, so link `i` comes out as the hash of the whole
-    // prefix `0..=i` for a single pass over the prompt.
+    // without resetting it, so block `i` comes out carrying the hash of the
+    // whole prefix `0..=i` for a single pass over the prompt.
     let mut hasher = DefaultHasher::new();
 
     // Tool definitions go into the prompt as their schemas, so hash them so.
     let tools = serde_json::to_string(&req.tools).unwrap_or_default();
     hasher.write(tools.as_bytes());
-    chain.push(hasher.finish());
+    blocks.push(Block {
+        hash: hasher.finish(),
+        text: tools,
+    });
 
     for message in req.messages.iter() {
-        hasher.write(completion_to_string(message).as_bytes());
-        chain.push(hasher.finish());
+        let text = completion_to_string(message);
+        hasher.write(text.as_bytes());
+        blocks.push(Block {
+            hash: hasher.finish(),
+            text,
+        });
     }
-    chain
+    blocks
 }
 
-/// Which links of [`prefix_chain`] the provider will really store a cache entry
+/// Which links of [`prompt_blocks`] the provider will really store a cache entry
 /// at — the only ones a key may claim. Lookup can match on *any* shared prefix,
 /// but claiming one that never becomes an entry would have a key advertise
 /// content that was never cached.
@@ -484,6 +622,7 @@ mod tests {
         CreateChatCompletionRequestRaw, PromptCacheOptionsRaw,
     };
     use llmy_types::other::WithOtherFields;
+    use std::str::FromStr;
 
     fn request(messages: &[&str]) -> RawExtensibleChatCompletionRequest {
         RawExtensibleChatCompletionRequest::new(CreateChatCompletionRequestRaw {
@@ -504,19 +643,32 @@ mod tests {
     }
 
     fn chain_of(messages: &[&str]) -> Vec<PrefixHash> {
-        prefix_chain(&request(messages))
+        hashes(&request(messages))
     }
 
-    /// Select under the transparent-prefix policy, the common case.
+    fn hashes(req: &RawExtensibleChatCompletionRequest) -> Vec<PrefixHash> {
+        prompt_blocks(req).into_iter().map(|b| b.hash).collect()
+    }
+
+    /// A model whose cache is the transparent prefix kind, the common case.
+    fn prefix_model() -> OpenAIModel {
+        OpenAIModel::from_str("openai/gpt-4o").expect("built-in model")
+    }
+
+    fn breakpoint_model() -> OpenAIModel {
+        OpenAIModel::from_str("openai/gpt-5.6-sol").expect("built-in model")
+    }
+
     fn select(keys: &CacheKeys, messages: &[&str]) -> Option<CacheKeyClaim> {
-        keys.select(&request(messages), CachePolicy::PartialPrefix)
+        keys.select(&request(messages), &prefix_model())
     }
 
-    /// A request that was sent *and* answered.
+    /// A request that was sent *and* answered. These prompts are far below the
+    /// cacheable minimum, so nothing is expected back and nothing is graded.
     fn sent(keys: &CacheKeys, messages: &[&str]) -> Option<String> {
         let claim = select(keys, messages)?;
         let key = claim.key().to_string();
-        claim.confirm();
+        claim.confirm(0);
         Some(key)
     }
 
@@ -551,13 +703,13 @@ mod tests {
         extended.messages[0]
             .other
             .insert("vendor_hint".into(), serde_json::json!(1));
-        assert_eq!(prefix_chain(&extended), baseline);
+        assert_eq!(hashes(&extended), baseline);
 
         // Neither is the array form the promotion produces.
         let mut promoted = request(&["a"]);
         promoted.messages[0].toggle_cache_breakpoint(true);
         promoted.messages[0].toggle_cache_breakpoint(false);
-        assert_eq!(prefix_chain(&promoted), baseline);
+        assert_eq!(hashes(&promoted), baseline);
 
         // Changing the prompt itself, of course, does move it.
         assert_ne!(chain_of(&["b"]), baseline);
@@ -569,11 +721,11 @@ mod tests {
         marked.messages[0].toggle_cache_breakpoint(true);
         // A breakpoint marks where to cut the cache, not what is in it — and it
         // promotes the content to an array, which must not matter either.
-        assert_eq!(prefix_chain(&marked), chain_of(&["a"]));
+        assert_eq!(hashes(&marked), chain_of(&["a"]));
 
         let mut with_tools = request(&["a"]);
         with_tools.tools = Some(vec![]);
-        assert_ne!(prefix_chain(&with_tools)[0], chain_of(&["a"])[0]);
+        assert_ne!(hashes(&with_tools)[0], chain_of(&["a"])[0]);
     }
 
     #[test]
@@ -627,6 +779,41 @@ mod tests {
     }
 
     #[test]
+    fn a_matched_prefix_reports_the_size_it_was_claimed_at() {
+        let keys = keys();
+        let model = prefix_model();
+        // A prompt long enough to actually be worth measuring.
+        let head = "lorem ipsum dolor sit amet ".repeat(64);
+        let turn1 = request(&[&head]);
+
+        // Turn 1 is a fresh key: nothing is expected back from it.
+        let claim = keys.select(&turn1, &model).unwrap();
+        assert_eq!(claim.expected_cached_tokens(), 0);
+        claim.confirm(0);
+
+        // Turn 2 matches turn 1's prefix, so the expectation is exactly what that
+        // prefix was measured at when it was claimed — read back, not recomputed.
+        let turn2 = request(&[&head, "and a follow-up"]);
+        let claim = keys.select(&turn2, &model).unwrap();
+        let expected = claim.expected_cached_tokens();
+        assert!(expected > 0);
+        assert_eq!(
+            expected,
+            model
+                .config
+                .count_tokens_lossy(&format!("null{}", completion_to_string(&turn1.messages[0])))
+                as u64,
+            "should be the tools block plus the first message"
+        );
+        claim.confirm(expected);
+
+        // Turn 3 matches turn 2's longer prefix, so it expects strictly more.
+        let turn3 = request(&[&head, "and a follow-up", "more"]);
+        let claim = keys.select(&turn3, &model).unwrap();
+        assert!(claim.expected_cached_tokens() > expected);
+    }
+
+    #[test]
     fn an_abandoned_claim_settles_nothing() {
         let keys = keys();
         // Selected, never answered: the prefix was never cached anywhere, so it
@@ -659,9 +846,29 @@ mod tests {
         drop(first);
         assert_eq!(select(&keys, &["a", "z"]).unwrap().key(), key);
 
-        second.confirm();
-        third.confirm();
+        second.confirm(0);
+        third.confirm(0);
         assert!(keys.settled() > 0);
+    }
+
+    #[test]
+    fn a_retry_costs_another_slot_of_the_key_s_budget() {
+        // The provider counts total traffic per key, so a retried request is two
+        // requests on that key, not one.
+        let keys = CacheKeys::new(CacheKeyConfig {
+            max_rpm: 2,
+            ..CacheKeyConfig::default()
+        });
+
+        let claim = select(&keys, &["a"]).unwrap();
+        let key = claim.key().to_string();
+        claim.charge_resend(); // one attempt failed and was re-sent
+        claim.confirm(0);
+
+        // Two sends spent the whole minute's budget, so the next request finds
+        // the prefix but no room and spreads to another machine.
+        assert_ne!(sent(&keys, &["a"]).unwrap(), key);
+        assert_eq!(keys.key_count(), 2);
     }
 
     #[test]
@@ -727,25 +934,25 @@ mod tests {
         let mut turn1 = request(&["head", "u1"]);
         turn1.messages[0].toggle_cache_breakpoint(true);
         turn1.prompt_cache_options = Some(PromptCacheOptionsRaw::explicit());
-        let claim = keys.select(&turn1, CachePolicy::Breakpoint).unwrap();
+        let claim = keys.select(&turn1, &breakpoint_model()).unwrap();
         let key = claim.key().to_string();
-        claim.confirm();
+        claim.confirm(0);
 
         // Turn 2 keeps the same head, so it hits that entry and the same key,
         // even though nothing else about the request matches.
         let mut turn2 = request(&["head", "u1", "a1", "u2"]);
         turn2.messages[0].toggle_cache_breakpoint(true);
         turn2.prompt_cache_options = Some(PromptCacheOptionsRaw::explicit());
-        let claim = keys.select(&turn2, CachePolicy::Breakpoint).unwrap();
+        let claim = keys.select(&turn2, &breakpoint_model()).unwrap();
         assert_eq!(claim.key(), key);
-        claim.confirm();
+        claim.confirm(0);
         assert_eq!(keys.key_count(), 1);
 
         // A different head shares no cache point, so it gets its own machine.
         let mut other = request(&["other-head", "u1"]);
         other.messages[0].toggle_cache_breakpoint(true);
         other.prompt_cache_options = Some(PromptCacheOptionsRaw::explicit());
-        let claim = keys.select(&other, CachePolicy::Breakpoint).unwrap();
+        let claim = keys.select(&other, &breakpoint_model()).unwrap();
         assert_ne!(claim.key(), key);
     }
 }
