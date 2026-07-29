@@ -33,6 +33,13 @@ pub struct ChatArgs {
     #[arg(long)]
     system: Option<String>,
 
+    /// Fixed `prompt_cache_key` for this conversation. Leave unset to let the
+    /// client pick one per prompt prefix (see `--llm-auto-cache-key`), which is
+    /// usually what you want — one constant key shared by every process is the
+    /// pile-up the provider's per-key traffic guidance warns about.
+    #[arg(long, env = "LLM_CHAT_CACHE_KEY")]
+    cache_key: Option<String>,
+
     /// Enable basic file tools for the agent. If omitted, plain chat mode is used.
     #[arg(long, value_name = "ROOT", num_args = 0..=1, default_missing_value = ".")]
     agent_files: Option<PathBuf>,
@@ -127,11 +134,7 @@ async fn build_agent(
     tools: ToolBox,
 ) -> color_eyre::Result<Agent> {
     if !args.memory {
-        return Ok(Agent::new(
-            system_prompt,
-            tools,
-            "llmy-cli-chat".to_string(),
-        ));
+        return Ok(Agent::new(system_prompt, tools, args.cache_key.clone()));
     }
 
     let memory = AgentMemoryContext::new(
@@ -143,7 +146,7 @@ async fn build_agent(
     Ok(Agent::with_memory(
         system_prompt,
         tools,
-        "llmy-cli-chat".to_string(),
+        args.cache_key.clone(),
         &memory,
         &criteria,
     )
@@ -162,11 +165,7 @@ async fn build_agent(
              `--features memory-embed-search`"
         ));
     }
-    Ok(Agent::new(
-        system_prompt,
-        tools,
-        "llmy-cli-chat".to_string(),
-    ))
+    Ok(Agent::new(system_prompt, tools, args.cache_key.clone()))
 }
 
 #[cfg(feature = "memory-embed-search")]

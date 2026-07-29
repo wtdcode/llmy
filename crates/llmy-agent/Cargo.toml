@@ -21,3 +21,26 @@ rmcp = {workspace = true, features = ["server", "transport-io", "transport-strea
 llmy-agent-derive.workspace = true
 llmy-client.workspace = true
 llmy-types.workspace = true
+
+[features]
+default = ["rustls"]
+
+# --- TLS backend -------------------------------------------------------
+#
+# Cargo features are additive, so `rustls` is only *default*, never
+# exclusive. To build against native-tls you must turn the default off:
+#
+#     llmy = { version = "0.18", default-features = false, features = ["native-tls"] }
+#
+# Asking for both leaves both stacks linked in, which builds but is
+# almost certainly not what you want.
+
+# `rmcp` here is server-side only (axum/hyper), so it needs no TLS backend
+# of its own; the client-side transport lives in `llmy-agent-tools`.
+rustls = ["llmy-client/rustls", "llmy-types/rustls"]
+native-tls = ["llmy-client/native-tls", "llmy-types/native-tls"]
+native-tls-vendored = [
+    "llmy-client/native-tls-vendored",
+    "llmy-types/native-tls-vendored",
+]
+

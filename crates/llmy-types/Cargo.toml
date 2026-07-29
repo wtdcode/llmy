@@ -19,6 +19,23 @@ rmcp = { workspace = true, features = ["server", "client"] }
 tokio.workspace = true
 rust_decimal = { workspace = true }
 
+[features]
+default = ["rustls"]
+
+# --- TLS backend -------------------------------------------------------
+#
+# Cargo features are additive, so `rustls` is only *default*, never
+# exclusive. To build against native-tls you must turn the default off:
+#
+#     llmy = { version = "0.18", default-features = false, features = ["native-tls"] }
+#
+# Asking for both leaves both stacks linked in, which builds but is
+# almost certainly not what you want.
+
+rustls = ["async-openai/rustls"]
+native-tls = ["async-openai/native-tls"]
+native-tls-vendored = ["async-openai/native-tls-vendored"]
+
 [dev-dependencies]
 similar-asserts = "2"
 rand = "0.10"

@@ -20,7 +20,12 @@ macro_rules! make_openai_args {
             #[arg(long = concat!($long, "azure-openai-endpoint"), env = concat!($prefix, "AZURE_OPENAI_ENDPOINT"))]
             pub azure_openai_endpoint: Option<String>,
 
-            #[arg(long = concat!($long, "openai-key"), env = concat!($prefix, "OPENAI_API_KEY"))]
+            // `hide_env_values` so `--help` does not print the key it picked up.
+            #[arg(
+                long = concat!($long, "openai-key"),
+                env = concat!($prefix, "OPENAI_API_KEY"),
+                hide_env_values = true,
+            )]
             pub openai_key: Option<String>,
 
             #[arg(long = concat!($long, "azure-deployment"), env = concat!($prefix, "AZURE_API_DEPLOYMENT"))]

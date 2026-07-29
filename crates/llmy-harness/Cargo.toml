@@ -22,7 +22,39 @@ llmy-types.workspace = true
 [features]
 # Off by default — when off, no `fastembed` dependency at all, so the
 # harness builds on musl.
-default = []
+default = ["rustls"]
+
+# --- TLS backend -------------------------------------------------------
+#
+# Cargo features are additive, so `rustls` is only *default*, never
+# exclusive. To build against native-tls you must turn the default off:
+#
+#     llmy = { version = "0.18", default-features = false, features = ["native-tls"] }
+#
+# Asking for both leaves both stacks linked in, which builds but is
+# almost certainly not what you want.
+
+rustls = [
+    "async-openai/rustls",
+    "llmy-agent-tools/rustls",
+    "llmy-agent/rustls",
+    "llmy-client/rustls",
+    "llmy-types/rustls",
+]
+native-tls = [
+    "async-openai/native-tls",
+    "llmy-agent-tools/native-tls",
+    "llmy-agent/native-tls",
+    "llmy-client/native-tls",
+    "llmy-types/native-tls",
+]
+native-tls-vendored = [
+    "async-openai/native-tls-vendored",
+    "llmy-agent-tools/native-tls-vendored",
+    "llmy-agent/native-tls-vendored",
+    "llmy-client/native-tls-vendored",
+    "llmy-types/native-tls-vendored",
+]
 
 # Expose the local embedding utilities (`SimilarityModel`, `Embeding`)
 # without enabling the in-memory search/cache code path. Pulls in `fastembed`.
@@ -31,7 +63,7 @@ embed = ["llmy-agent-tools/embed"]
 # Embedding-backed memory search inside `AgentMemoryContext`. Implies `embed`.
 memory-embed-search = ["llmy-agent-tools/memory-embed-search", "embed"]
 
-# Granular TLS toggles forwarded from `llmy-agent-tools`.
+# Granular per-backend toggles forwarded from `llmy-agent-tools`.
 hf-hub-rustls-tls = ["llmy-agent-tools/hf-hub-rustls-tls"]
 hf-hub-native-tls = ["llmy-agent-tools/hf-hub-native-tls"]
 ort-download-binaries-rustls-tls = ["llmy-agent-tools/ort-download-binaries-rustls-tls"]

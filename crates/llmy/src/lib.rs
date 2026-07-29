@@ -22,7 +22,8 @@
 //! let agent = Agent::new(
 //!     "You are a helpful assistant.".to_string(),
 //!     tools,
-//!     "docs-example".to_string(),
+//!     // No fixed prompt cache key: the client picks one per prompt prefix.
+//!     None,
 //! );
 //!
 //! let _ = agent;
@@ -63,7 +64,7 @@
 //!     Ok(Agent::with_memory(
 //!         "You are a helpful assistant.".to_string(),
 //!         ToolBox::new(),
-//!         "docs-memory-example".to_string(),
+//!         None,
 //!         &memory,
 //!         &AgentMemorySystemPromptCriteria::default(),
 //!     )

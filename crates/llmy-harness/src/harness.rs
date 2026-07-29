@@ -74,7 +74,9 @@ pub struct Agent {
     context: Vec<RawExtensibleChatRequestMessage>,
     checkpoints: Vec<(Option<StepResult>, Vec<RawExtensibleChatRequestMessage>)>,
     last_step: Option<StepResult>,
-    cache_key: String,
+    /// Fixed `prompt_cache_key` for this conversation. `None` leaves the choice
+    /// to the client, which picks one per prompt prefix.
+    cache_key: Option<String>,
     memory: Option<AgentMemoryRuntime>,
     config: AgentConfig,
     /// Request-wide prompt cache mode. `None` (the default) omits
@@ -86,14 +88,14 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(system_prompt: String, tools: ToolBox, cache_key: String) -> Self {
+    pub fn new(system_prompt: String, tools: ToolBox, cache_key: Option<String>) -> Self {
         Self::new_with_config(system_prompt, tools, cache_key, AgentConfig::default())
     }
 
     pub fn new_with_config(
         system_prompt: String,
         tools: ToolBox,
-        cache_key: String,
+        cache_key: Option<String>,
         config: AgentConfig,
     ) -> Self {
         Self {
@@ -114,7 +116,7 @@ impl Agent {
     pub async fn with_memory(
         system_prompt: String,
         tools: ToolBox,
-        cache_key: String,
+        cache_key: Option<String>,
         memory: &AgentMemoryContext,
         criteria: &AgentMemorySystemPromptCriteria,
     ) -> Self {
@@ -132,7 +134,7 @@ impl Agent {
     pub async fn with_memory_config(
         system_prompt: String,
         mut tools: ToolBox,
-        cache_key: String,
+        cache_key: Option<String>,
         memory: &AgentMemoryContext,
         criteria: &AgentMemorySystemPromptCriteria,
         config: AgentConfig,
@@ -335,7 +337,7 @@ impl Agent {
         let current_context = self.context.clone();
         let messages = self.conversation_context();
         let tools = (self.tools.len() != 0).then(|| self.tools.openai_objects());
-        let cache_key = (!self.cache_key.is_empty()).then_some(self.cache_key.as_str());
+        let cache_key = self.cache_key.as_deref();
         let settings = settings.unwrap_or_else(|| llm.default_settings.clone());
         let timeout = settings.timeout();
         let retry = settings.llm_retry;
@@ -532,11 +534,9 @@ impl Agent {
         let compact_user_prompt = render_compact_user_prompt(&history_text);
         let compact_debug_prefix = debug_prefix.map(|prefix| format!("{prefix}-compact"));
         let compact_settings = compact_settings(settings, memory_enabled);
-        let compact_cache_key = if self.cache_key.is_empty() {
-            String::new()
-        } else {
-            format!("{}-compact", self.cache_key)
-        };
+        // Compaction is a different prompt shape, so it gets its own key when
+        // one was pinned at all.
+        let compact_cache_key = self.cache_key.as_ref().map(|key| format!("{key}-compact"));
 
         let mut compact_agent = match &self.memory {
             Some(memory) => {
@@ -774,7 +774,7 @@ mod tests {
         let agent = Agent::new(
             "base system prompt".to_string(),
             ToolBox::new(),
-            "cache".to_string(),
+            Some("cache".to_string()),
         );
 
         assert_eq!(agent.config(), &AgentConfig::default());
@@ -797,7 +797,7 @@ mod tests {
         let agent = Agent::new_with_config(
             "base system prompt".to_string(),
             tools,
-            "cache".to_string(),
+            Some("cache".to_string()),
             config.clone(),
         );
 
@@ -827,7 +827,7 @@ mod tests {
         let mut agent = Agent::new(
             "base system prompt".to_string(),
             ToolBox::new(),
-            "cache".to_string(),
+            Some("cache".to_string()),
         );
         agent.push_user_message("implement compaction".to_string());
 
@@ -843,7 +843,11 @@ mod tests {
         tools.add_tool(ZebraTool);
         tools.add_tool(AlphaTool);
 
-        let agent = Agent::new("base system prompt".to_string(), tools, "cache".to_string());
+        let agent = Agent::new(
+            "base system prompt".to_string(),
+            tools,
+            Some("cache".to_string()),
+        );
 
         assert_eq!(
             agent.render_tools(false),
@@ -857,7 +861,11 @@ mod tests {
         tools.add_tool(ZebraTool);
         tools.add_tool(AlphaTool);
 
-        let agent = Agent::new("base system prompt".to_string(), tools, "cache".to_string());
+        let agent = Agent::new(
+            "base system prompt".to_string(),
+            tools,
+            Some("cache".to_string()),
+        );
 
         assert_eq!(
             agent.render_tools(true),
@@ -870,7 +878,7 @@ mod tests {
         let agent = Agent::new(
             "base system prompt".to_string(),
             ToolBox::new(),
-            "cache".to_string(),
+            Some("cache".to_string()),
         );
 
         assert_eq!(
@@ -884,7 +892,11 @@ mod tests {
         let mut tools = ToolBox::new();
         tools.add_tool(ZebraTool);
         tools.add_tool(AlphaTool);
-        let mut agent = Agent::new("base system prompt".to_string(), tools, "cache".to_string());
+        let mut agent = Agent::new(
+            "base system prompt".to_string(),
+            tools,
+            Some("cache".to_string()),
+        );
         agent.push_user_message("use the tools".to_string());
 
         let context_before = agent.render_context();
@@ -904,7 +916,7 @@ mod tests {
         let mut agent = Agent::new(
             "base system prompt".to_string(),
             ToolBox::new(),
-            "cache".to_string(),
+            Some("cache".to_string()),
         );
         agent.push_user_message("implement compaction".to_string());
 
@@ -922,7 +934,7 @@ mod tests {
         let agent = Agent::new(
             "base system prompt".to_string(),
             ToolBox::new(),
-            "cache".to_string(),
+            Some("cache".to_string()),
         );
 
         assert_eq!(agent.render_memory().await, None);
@@ -1015,7 +1027,7 @@ mod tests {
         let mut agent = Agent::new(
             "base system prompt".to_string(),
             ToolBox::new(),
-            "cache".to_string(),
+            Some("cache".to_string()),
         );
         agent.push_user_message("first message".to_string());
 
@@ -1075,7 +1087,7 @@ mod tests {
         let agent = Agent::with_memory(
             "base system prompt".to_string(),
             ToolBox::new(),
-            "cache".to_string(),
+            Some("cache".to_string()),
             &memory,
             &criteria,
         )
@@ -1139,7 +1151,7 @@ mod tests {
     }
 
     fn cache_test_agent() -> Agent {
-        let mut agent = Agent::new("system".to_string(), ToolBox::new(), "k".to_string());
+        let mut agent = Agent::new("system".to_string(), ToolBox::new(), Some("k".to_string()));
         agent.push_user_message("first".to_string());
         agent.push_user_message("second".to_string());
         agent

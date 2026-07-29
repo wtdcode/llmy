@@ -53,7 +53,7 @@ pub const DEFAULT_MAX_RPM: u32 = 15;
 /// is not buying what it should and the prompt shape is the likely culprit — a
 /// prefix that moves between turns, a timestamp in the system prompt, a toolbox
 /// rebuilt per request.
-const CACHE_HIT_WARN_RATIO: f64 = 0.70;
+const CACHE_HIT_WARN_RATIO: f64 = 0.50;
 
 /// OpenAI only caches prompts from this length up, so a shorter prefix coming
 /// back uncached is normal and not worth complaining about.

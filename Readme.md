@@ -530,6 +530,51 @@ Notes:
 - `name` is optional; if omitted, the struct name is converted to `snake_case`, for example `ReadFileTool -> read_file_tool`.
 - The generated impl works with either `llmy_agent::Tool` or `llmy::agent::Tool`.
 
+## Cargo Features
+
+### TLS backend
+
+`rustls` is the default. Cargo features are additive, so selecting native-tls
+means turning the default off rather than adding to it:
+
+```toml
+# rustls (default)
+llmy = "0.18"
+
+# native-tls, linking the system OpenSSL
+llmy = { version = "0.18", default-features = false, features = ["native-tls"] }
+
+# native-tls, compiling OpenSSL from source (static / musl-friendly)
+llmy = { version = "0.18", default-features = false, features = ["native-tls-vendored"] }
+```
+
+Enabling both leaves both stacks linked in. It builds, but is almost certainly
+not what you want.
+
+The switch covers every TLS user in the graph: `async-openai` (the OpenAI HTTP
+client), `rmcp` (the streamable-HTTP MCP client), and — when `embed` is on —
+`hf-hub` and the `ort` binary download. `sqlx` is SQLite-only here and links no
+TLS at all.
+
+### Embeddings
+
+Off by default, because they pull in `fastembed` + `ort-sys`, which has no musl
+support.
+
+| Feature | Effect |
+| --- | --- |
+| `embed` | Exposes `llmy::ebmed` (`SimilarityModel`, `Embeding`). No memory search. |
+| `memory-embed-search` | Embedding-backed `search_memory` in `AgentMemoryContext`. Implies `embed`. |
+
+To mix backends — say hf-hub over rustls but the ort download over native-tls —
+use the granular toggles instead: `hf-hub-rustls-tls`, `hf-hub-native-tls`,
+`ort-download-binaries-rustls-tls`, `ort-download-binaries-native-tls`.
+
+> **Caveat.** `embed` links rustls in regardless of backend: `hf-hub` 0.5
+> declares its `ureq` dependency without `default-features = false`, and
+> `ureq`'s default is rustls, so no downstream feature can switch it off. If a
+> rustls-free build is a hard requirement, leave `embed` off.
+
 ## License
 
 MIT
