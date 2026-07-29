@@ -109,12 +109,18 @@ mod tests {
 
     #[test]
     fn leaves_plain_text_untouched() {
-        assert_eq!(filtered("just some prose").as_deref(), Some("just some prose"));
+        assert_eq!(
+            filtered("just some prose").as_deref(),
+            Some("just some prose")
+        );
     }
 
     #[test]
     fn ignores_empty_fence() {
         // Nothing inside the fence => leave the content as-is.
-        assert_eq!(filtered("```json\n\n```").as_deref(), Some("```json\n\n```"));
+        assert_eq!(
+            filtered("```json\n\n```").as_deref(),
+            Some("```json\n\n```")
+        );
     }
 }

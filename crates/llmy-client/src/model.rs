@@ -3,7 +3,7 @@ use std::{fmt, str::FromStr};
 use rust_decimal::{Decimal, dec};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub use llmy_tokenizer::{ModelConfig, ModelId, ModelPricing, ModelTokens};
+pub use llmy_tokenizer::{CachePolicy, ModelConfig, ModelId, ModelPricing, ModelTokens};
 
 #[derive(Debug, Clone)]
 pub struct OpenAIModel {
@@ -82,6 +82,13 @@ impl OpenAIModel {
             input_cache_read: None,
             input_cache_write: None,
         })
+    }
+
+    /// How this model's prompt cache is addressed. Callers use this to decide
+    /// whether marking breakpoints (see
+    /// `RawExtensibleChatRequestMessage::break`) buys them anything.
+    pub fn cache_policy(&self) -> CachePolicy {
+        self.config.cache_policy
     }
 
     pub fn info(&self) -> (u64, u64) {
@@ -197,6 +204,8 @@ fn custom_model(s: &str, pricing: Option<ModelPricing>) -> OpenAIModel {
             max_input_tokens: 0,
             max_tokens: 0,
             pricing,
+            // Unknown model: assume the conservative, do-nothing-required policy.
+            cache_policy: CachePolicy::default(),
         },
         use_full_id: false,
     }
@@ -269,6 +278,35 @@ mod tests {
         assert_eq!(model.model_id_str(), "openrouter/some-foo");
         assert_eq!(model.owner(), Some("openrouter"));
         assert_eq!(model.model_name(), "some-foo");
+    }
+
+    #[test]
+    fn cache_policy_comes_from_the_registry() {
+        // Breakpoint-addressed caches: OpenAI from GPT-5.6 on, and Anthropic.
+        for id in ["openai/gpt-5.6-sol", "anthropic/claude-opus-4.5"] {
+            let model = OpenAIModel::from_str(id).unwrap();
+            assert_eq!(model.cache_policy(), CachePolicy::Breakpoint, "{id}");
+            assert!(model.cache_policy().needs_breakpoints(), "{id}");
+        }
+        // Everything else caches the longest matching prefix transparently.
+        for id in ["openai/gpt-5.5", "openai/gpt-4o", "google/gemini-2.5-pro"] {
+            let model = OpenAIModel::from_str(id).unwrap();
+            assert_eq!(model.cache_policy(), CachePolicy::PartialPrefix, "{id}");
+            assert!(!model.cache_policy().needs_breakpoints(), "{id}");
+        }
+    }
+
+    #[test]
+    fn unknown_models_default_to_partial_prefix_caching() {
+        let model = OpenAIModel::from_str("openrouter/some-foo,1,2").unwrap();
+        assert_eq!(model.cache_policy(), CachePolicy::PartialPrefix);
+    }
+
+    #[test]
+    fn custom_pricing_keeps_the_registered_cache_policy() {
+        // Overriding prices must not silently downgrade the caching model.
+        let model = OpenAIModel::from_str("gpt-5.6-sol,5,30,0.5,6.25").unwrap();
+        assert_eq!(model.cache_policy(), CachePolicy::Breakpoint);
     }
 
     #[test]

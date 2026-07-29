@@ -66,6 +66,41 @@ pub struct ModelTokens {
     pub per_array_of_objects: i32,
 }
 
+/// How a model's prompt cache is addressed — i.e. what a caller has to do to
+/// get a cache hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CachePolicy {
+    /// The provider transparently caches the longest matching prefix of the
+    /// prompt. There is nothing to declare on the request, and writes are
+    /// normally free. This is classic OpenAI prompt caching, and the default.
+    #[default]
+    PartialPrefix,
+    /// Caching happens only at breakpoints the caller declares (OpenAI's
+    /// `prompt_cache_breakpoint` from GPT-5.6 on, Anthropic's `cache_control`).
+    /// Writes are billed at [`ModelPricing::input_cache_write`].
+    Breakpoint,
+}
+
+impl CachePolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PartialPrefix => "partial_prefix",
+            Self::Breakpoint => "breakpoint",
+        }
+    }
+
+    /// Whether the caller has to mark cache breakpoints to get a cache hit.
+    pub fn needs_breakpoints(&self) -> bool {
+        matches!(self, Self::Breakpoint)
+    }
+}
+
+impl std::fmt::Display for CachePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ModelPricing {
     /// Per-token USD price for uncached input.
@@ -91,11 +126,19 @@ pub struct ModelConfig {
     pub max_input_tokens: u64,
     pub max_tokens: u64,
     pub pricing: Option<ModelPricing>,
+    /// How this model's prompt cache is addressed. Defaults to
+    /// [`CachePolicy::PartialPrefix`] for models that don't declare one.
+    pub cache_policy: CachePolicy,
 }
 
 impl ModelConfig {
     pub fn encoding(&self) -> Option<Encoding> {
         Encoding::from_str(&self.encoding)
+    }
+
+    /// How this model's prompt cache is addressed.
+    pub fn cache_policy(&self) -> CachePolicy {
+        self.cache_policy
     }
 
     pub fn max_input(&self) -> u64 {

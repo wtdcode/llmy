@@ -666,22 +666,28 @@ impl LLMInner {
         }
 
         let output_tokens = if let Some(usage) = &resp.usage {
-            let cached = usage
-                .prompt_tokens_details
-                .as_ref()
+            let prompt_details = usage.prompt_tokens_details.as_ref();
+            let cached = prompt_details
                 .and_then(|v| v.cached_tokens)
                 .unwrap_or_default();
-            let input_without_cached = usage.prompt_tokens - cached;
+            // GPT-5.6+ only; absent (=> 0) on every earlier model.
+            let cache_write = prompt_details
+                .and_then(|v| v.cache_write_tokens)
+                .unwrap_or_default();
+            // Saturating: a provider reporting inconsistent counts must not panic.
+            let input_without_cached = usage.prompt_tokens.saturating_sub(cached);
             let reasoning = usage
                 .completion_tokens_details
                 .as_ref()
                 .and_then(|v| v.reasoning_tokens)
                 .unwrap_or_default() as u64;
-            let output_without_reasoning = usage.completion_tokens as u64 - reasoning;
+            let output_without_reasoning =
+                (usage.completion_tokens as u64).saturating_sub(reasoning);
 
             let delta = TokenUsage {
                 input_tokens: usage.prompt_tokens as u64,
                 cache_tokens: cached as u64,
+                cache_write_tokens: cache_write as u64,
                 output_tokens: usage.completion_tokens as u64,
                 reasoning_tokens: reasoning,
             };
@@ -705,6 +711,7 @@ impl LLMInner {
                 let usage_for_debug = DebugUsage {
                     input_without_cached_tokens: input_without_cached as u64,
                     cached_tokens: cached as u64,
+                    cache_write_tokens: cache_write as u64,
                     output_without_reasoning_tokens: output_without_reasoning,
                     reasoning_tokens: reasoning,
                 };

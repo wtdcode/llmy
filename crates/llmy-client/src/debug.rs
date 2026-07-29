@@ -204,10 +204,7 @@ pub(crate) async fn rewrite_json<T: Serialize + Debug>(
 /// Overwrite `path` with the pretty-printed JSON of `t` (truncating any prior
 /// content). Used for snapshots that are continuously refreshed in place, like
 /// the per-prefix billing summary.
-pub(crate) async fn write_json_snapshot<T: Serialize>(
-    path: &Path,
-    t: &T,
-) -> Result<(), LLMYError> {
+pub(crate) async fn write_json_snapshot<T: Serialize>(path: &Path, t: &T) -> Result<(), LLMYError> {
     let s = serde_json::to_string_pretty(t)?;
     let mut fp = tokio::fs::OpenOptions::new()
         .create(true)
@@ -428,6 +425,9 @@ pub struct DebugRowContext {
 pub struct DebugUsage {
     pub input_without_cached_tokens: u64,
     pub cached_tokens: u64,
+    /// Prompt tokens written to cache (GPT-5.6+). A *subset* of
+    /// `input_without_cached_tokens`, billed at the model's cache-write rate.
+    pub cache_write_tokens: u64,
     pub output_without_reasoning_tokens: u64,
     pub reasoning_tokens: u64,
 }
@@ -511,6 +511,7 @@ pub struct LLMDebugRow {
     pub raw_resp: Option<String>,
     pub input_without_cached_tokens: Option<i64>,
     pub cached_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
     pub output_without_reasoning_tokens: Option<i64>,
     pub reasoning_tokens: Option<i64>,
     pub resp_text_content: Option<String>,
@@ -534,6 +535,7 @@ impl LLMDebugRow {
             raw_resp: row.try_get("raw_resp")?,
             input_without_cached_tokens: row.try_get("input_without_cached_tokens")?,
             cached_tokens: row.try_get("cached_tokens")?,
+            cache_write_tokens: row.try_get("cache_write_tokens")?,
             output_without_reasoning_tokens: row.try_get("output_without_reasoning_tokens")?,
             reasoning_tokens: row.try_get("reasoning_tokens")?,
             resp_text_content: row.try_get("resp_text_content")?,
@@ -561,6 +563,7 @@ CREATE TABLE IF NOT EXISTS llm_debug (
     raw_resp TEXT,
     input_without_cached_tokens INTEGER,
     cached_tokens INTEGER,
+    cache_write_tokens INTEGER,
     output_without_reasoning_tokens INTEGER,
     reasoning_tokens INTEGER,
     resp_text_content TEXT,
@@ -577,6 +580,7 @@ CREATE TABLE IF NOT EXISTS prefix_billing (
     prefix TEXT NOT NULL,
     input_tokens INTEGER NOT NULL,
     cached_tokens INTEGER NOT NULL,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL,
     reasoning_tokens INTEGER NOT NULL,
     cost_usd REAL NOT NULL,
@@ -588,8 +592,11 @@ CREATE TABLE IF NOT EXISTS prefix_billing (
 /// Best-effort migrations applied after `SCHEMA_SQL`. Each statement is
 /// executed individually and its error is swallowed if it indicates the
 /// migration is already in place (e.g. duplicate column).
-const MIGRATIONS_SQL: &[&str] =
-    &["ALTER TABLE llm_debug ADD COLUMN debug_prefix TEXT NOT NULL DEFAULT 'llm'"];
+const MIGRATIONS_SQL: &[&str] = &[
+    "ALTER TABLE llm_debug ADD COLUMN debug_prefix TEXT NOT NULL DEFAULT 'llm'",
+    "ALTER TABLE llm_debug ADD COLUMN cache_write_tokens INTEGER",
+    "ALTER TABLE prefix_billing ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0",
+];
 
 /// SQLite-backed debug store. [`Sqlite3DebugDB::open`] inserts a fresh
 /// `client` row and binds the resulting id to this handle so all future
@@ -844,6 +851,7 @@ impl Sqlite3DebugDB {
             r#"UPDATE llm_debug
                SET input_without_cached_tokens = ?,
                    cached_tokens = ?,
+                   cache_write_tokens = ?,
                    output_without_reasoning_tokens = ?,
                    reasoning_tokens = ?,
                    current_usage_usd = ?,
@@ -852,6 +860,7 @@ impl Sqlite3DebugDB {
         )
         .bind(usage.input_without_cached_tokens as i64)
         .bind(usage.cached_tokens as i64)
+        .bind(usage.cache_write_tokens as i64)
         .bind(usage.output_without_reasoning_tokens as i64)
         .bind(usage.reasoning_tokens as i64)
         // SQLite stores USD as REAL; convert the exact Decimal to f64 only at
@@ -873,12 +882,13 @@ impl Sqlite3DebugDB {
         for row in rows {
             sqlx::query(
                 r#"INSERT INTO prefix_billing
-                     (client_id, prefix, input_tokens, cached_tokens,
+                     (client_id, prefix, input_tokens, cached_tokens, cache_write_tokens,
                       output_tokens, reasoning_tokens, cost_usd)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(client_id, prefix) DO UPDATE SET
                      input_tokens = excluded.input_tokens,
                      cached_tokens = excluded.cached_tokens,
+                     cache_write_tokens = excluded.cache_write_tokens,
                      output_tokens = excluded.output_tokens,
                      reasoning_tokens = excluded.reasoning_tokens,
                      cost_usd = excluded.cost_usd"#,
@@ -887,12 +897,19 @@ impl Sqlite3DebugDB {
             .bind(&row.prefix)
             .bind(row.tokens.input_tokens as i64)
             .bind(row.tokens.cache_tokens as i64)
+            .bind(row.tokens.cache_write_tokens as i64)
             .bind(row.tokens.output_tokens as i64)
             .bind(row.tokens.reasoning_tokens as i64)
             .bind(row.cost_usd)
             .execute(&self.pool)
             .await
-            .map_err(|e| eyre!("failed to upsert prefix_billing for {:?}: {}", row.prefix, e))?;
+            .map_err(|e| {
+                eyre!(
+                    "failed to upsert prefix_billing for {:?}: {}",
+                    row.prefix,
+                    e
+                )
+            })?;
         }
         Ok(())
     }
@@ -1184,6 +1201,7 @@ mod sqlite_tests {
         let usage = DebugUsage {
             input_without_cached_tokens: 7,
             cached_tokens: 3,
+            cache_write_tokens: 2,
             output_without_reasoning_tokens: 5,
             reasoning_tokens: 1,
         };
@@ -1195,6 +1213,7 @@ mod sqlite_tests {
         assert_eq!(row.debug_prefix, "test");
         assert_eq!(row.cache_key.as_deref(), Some("cache-key-1"));
         assert_eq!(row.cached_tokens, Some(3));
+        assert_eq!(row.cache_write_tokens, Some(2));
         assert_eq!(row.reasoning_tokens, Some(1));
         assert_eq!(row.resp_text_content.as_deref(), Some("world"));
         assert!(row.full_conversation.contains("world"));
@@ -1219,6 +1238,7 @@ mod sqlite_tests {
             input_tokens: i,
             output_tokens: o,
             cache_tokens: 0,
+            cache_write_tokens: 0,
             reasoning_tokens: 0,
         };
 
@@ -1268,12 +1288,124 @@ mod sqlite_tests {
         .await
         .unwrap();
 
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM prefix_billing WHERE client_id = ?")
-            .bind(cid)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM prefix_billing WHERE client_id = ?")
+                .bind(cid)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         assert_eq!(count, 2); // planner + "" — still two rows
         assert_eq!(read("planner").await, (20, 9, 3.0));
+    }
+
+    /// A database created before `cache_write_tokens` existed must gain the
+    /// column on open, in both tables, without losing its rows.
+    #[tokio::test]
+    async fn opening_a_pre_cache_write_db_migrates_it() {
+        const LEGACY_SCHEMA: &str = r#"
+CREATE TABLE client (id INTEGER PRIMARY KEY AUTOINCREMENT);
+CREATE TABLE llm_debug (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id INTEGER NOT NULL,
+    debug_prefix TEXT NOT NULL DEFAULT 'llm',
+    model_name TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    azure_deployment TEXT,
+    cache_key TEXT,
+    raw_req TEXT NOT NULL,
+    raw_resp TEXT,
+    input_without_cached_tokens INTEGER,
+    cached_tokens INTEGER,
+    output_without_reasoning_tokens INTEGER,
+    reasoning_tokens INTEGER,
+    resp_text_content TEXT,
+    full_conversation TEXT NOT NULL,
+    current_usage_usd REAL NOT NULL,
+    cap_usd REAL NOT NULL,
+    timestamp INTEGER NOT NULL
+);
+CREATE TABLE prefix_billing (
+    client_id INTEGER NOT NULL,
+    prefix TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    cached_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    reasoning_tokens INTEGER NOT NULL,
+    cost_usd REAL NOT NULL,
+    PRIMARY KEY (client_id, prefix)
+);
+INSERT INTO client DEFAULT VALUES;
+INSERT INTO prefix_billing VALUES (1, 'planner', 10, 2, 5, 1, 1.5);
+"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite3");
+        {
+            let opts = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = SqlitePool::connect_with(opts).await.unwrap();
+            for stmt in LEGACY_SCHEMA.split(';').filter(|s| !s.trim().is_empty()) {
+                sqlx::query(stmt).execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+        }
+
+        // Opening runs SCHEMA_SQL (all no-ops) then the ALTER TABLE migrations.
+        let db = Sqlite3DebugDB::open(path.to_str().unwrap()).await.unwrap();
+
+        // The pre-existing row survives and defaults the new column to 0.
+        let legacy: i64 = sqlx::query_scalar(
+            "SELECT cache_write_tokens FROM prefix_billing WHERE client_id = 1 AND prefix = 'planner'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(legacy, 0);
+
+        // ...and both tables now accept the new column.
+        db.upsert_prefix_billing(&[PrefixBilling {
+            prefix: "worker".into(),
+            tokens: TokenUsage {
+                input_tokens: 8,
+                output_tokens: 2,
+                cache_tokens: 1,
+                cache_write_tokens: 4,
+                reasoning_tokens: 0,
+            },
+            cost_usd: 0.5,
+        }])
+        .await
+        .unwrap();
+
+        let id = db
+            .insert_request(
+                "test",
+                &DebugRowContext {
+                    model_name: "gpt-test".into(),
+                    endpoint: "openai".into(),
+                    azure_deployment: None,
+                    cache_key: None,
+                    cap_usd: 10.0,
+                },
+                &dummy_req(),
+            )
+            .await
+            .unwrap();
+        db.update_billing(
+            id,
+            &TokenBilling::new(rust_decimal::dec!(10.0)),
+            &DebugUsage {
+                input_without_cached_tokens: 7,
+                cached_tokens: 1,
+                cache_write_tokens: 4,
+                output_without_reasoning_tokens: 2,
+                reasoning_tokens: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let row = db.get_row(id).await.unwrap().expect("row missing");
+        assert_eq!(row.cache_write_tokens, Some(4));
     }
 }

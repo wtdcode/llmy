@@ -102,10 +102,13 @@ fn format_token_usage(
     approx_context_tokens: Option<usize>,
     model: &ModelConfig,
 ) -> String {
+    // Cache reads and cache writes are disjoint slices of the prompt; what is
+    // left is plain uncached input. The three add up to `input_tokens`.
     let uncached_input_tokens = billing
         .tokens
         .input_tokens
-        .saturating_sub(billing.tokens.cache_tokens);
+        .saturating_sub(billing.tokens.cache_tokens)
+        .saturating_sub(billing.tokens.cache_write_tokens);
     let non_reasoning_output_tokens = billing
         .tokens
         .output_tokens
@@ -131,8 +134,11 @@ fn format_token_usage(
         String::new(),
         "Session token usage:".to_string(),
         format!(
-            "input_tokens: total={} uncached={} cached={}",
-            billing.tokens.input_tokens, uncached_input_tokens, billing.tokens.cache_tokens
+            "input_tokens: total={} uncached={} cached={} cache_write={}",
+            billing.tokens.input_tokens,
+            uncached_input_tokens,
+            billing.tokens.cache_tokens,
+            billing.tokens.cache_write_tokens
         ),
         format!(
             "output_tokens: total={} response={} reasoning={}",
@@ -240,6 +246,7 @@ mod tests {
                     input_tokens: 120,
                     output_tokens: 45,
                     cache_tokens: 20,
+                    cache_write_tokens: 12,
                     reasoning_tokens: 5,
                 },
                 current: rust_decimal::dec!(0.0123),
@@ -255,7 +262,7 @@ mod tests {
         assert!(rendered.contains("Current context estimate:"));
         assert!(rendered.contains("approx_context_tokens: 512"));
         assert!(rendered.contains("Session token usage:"));
-        assert!(rendered.contains("input_tokens: total=120 uncached=100 cached=20"));
+        assert!(rendered.contains("input_tokens: total=120 uncached=88 cached=20 cache_write=12"));
         assert!(rendered.contains("output_tokens: total=45 response=40 reasoning=5"));
         assert!(rendered.contains("estimated_cost_usd: 0.0123 / 10"));
     }

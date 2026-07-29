@@ -11,14 +11,20 @@ use serde::{Deserialize, Serialize};
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Input tokens served *from* the cache.
     pub cache_tokens: u64,
+    /// Input tokens written *to* the cache (GPT-5.6+). Disjoint from
+    /// `cache_tokens`; both are subsets of `input_tokens`. Defaulted on
+    /// deserialize so snapshots written before this field existed still load.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
 }
 
 impl Display for TokenUsage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
-            "Usage(inputs={}({}/{:.2}% cached), outputs={}({}/{:.2}% reasoning))",
+            "Usage(inputs={}({}/{:.2}% cached, {} written), outputs={}({}/{:.2}% reasoning))",
             self.input_tokens,
             self.cache_tokens,
             if self.input_tokens == 0 {
@@ -26,6 +32,7 @@ impl Display for TokenUsage {
             } else {
                 100f64 * self.cache_tokens as f64 / self.input_tokens as f64
             },
+            self.cache_write_tokens,
             self.output_tokens,
             self.reasoning_tokens,
             if self.output_tokens == 0 {
@@ -40,12 +47,21 @@ impl Display for TokenUsage {
 impl TokenUsage {
     pub fn input_cost(&self, model: &OpenAIModel) -> Decimal {
         let pricing = model.pricing();
-        let input_without_cache = self.input_tokens.saturating_sub(self.cache_tokens);
-        // A model without a dedicated cache-read price bills cached tokens at the
-        // normal input rate (not free) — matches the original billing logic.
-        let cache_price = pricing.input_cache_read.unwrap_or(pricing.input);
-        Decimal::from(input_without_cache) * pricing.input
-            + Decimal::from(self.cache_tokens) * cache_price
+        // Cache reads and cache writes are disjoint subsets of the prompt; what
+        // is left over is plain uncached input.
+        let uncached = self
+            .input_tokens
+            .saturating_sub(self.cache_tokens)
+            .saturating_sub(self.cache_write_tokens);
+        // A model without a dedicated cache-read/-write price bills those tokens
+        // at the normal input rate (not free) — matches the original billing
+        // logic. A price of `Some(0)` does mean free (classic OpenAI caching,
+        // where writes cost nothing).
+        let cache_read_price = pricing.input_cache_read.unwrap_or(pricing.input);
+        let cache_write_price = pricing.input_cache_write.unwrap_or(pricing.input);
+        Decimal::from(uncached) * pricing.input
+            + Decimal::from(self.cache_tokens) * cache_read_price
+            + Decimal::from(self.cache_write_tokens) * cache_write_price
     }
     pub fn output_cost(&self, model: &OpenAIModel) -> Decimal {
         let pricing = model.pricing();
@@ -60,15 +76,19 @@ impl TokenUsage {
         let (input_tokens, o1) = self.input_tokens.overflowing_add(rhs.input_tokens);
         let (output_tokens, o2) = self.output_tokens.overflowing_add(rhs.output_tokens);
         let (cache_tokens, o3) = self.cache_tokens.overflowing_add(rhs.cache_tokens);
-        let (reasoning_tokens, o4) = self.reasoning_tokens.overflowing_add(rhs.reasoning_tokens);
+        let (cache_write_tokens, o4) = self
+            .cache_write_tokens
+            .overflowing_add(rhs.cache_write_tokens);
+        let (reasoning_tokens, o5) = self.reasoning_tokens.overflowing_add(rhs.reasoning_tokens);
         (
             Self {
                 input_tokens,
                 output_tokens,
                 cache_tokens,
+                cache_write_tokens,
                 reasoning_tokens,
             },
-            o1 || o2 || o3 || o4,
+            o1 || o2 || o3 || o4 || o5,
         )
     }
 
@@ -78,15 +98,19 @@ impl TokenUsage {
         let (input_tokens, o1) = self.input_tokens.overflowing_sub(rhs.input_tokens);
         let (output_tokens, o2) = self.output_tokens.overflowing_sub(rhs.output_tokens);
         let (cache_tokens, o3) = self.cache_tokens.overflowing_sub(rhs.cache_tokens);
-        let (reasoning_tokens, o4) = self.reasoning_tokens.overflowing_sub(rhs.reasoning_tokens);
+        let (cache_write_tokens, o4) = self
+            .cache_write_tokens
+            .overflowing_sub(rhs.cache_write_tokens);
+        let (reasoning_tokens, o5) = self.reasoning_tokens.overflowing_sub(rhs.reasoning_tokens);
         (
             Self {
                 input_tokens,
                 output_tokens,
                 cache_tokens,
+                cache_write_tokens,
                 reasoning_tokens,
             },
-            o1 || o2 || o3 || o4,
+            o1 || o2 || o3 || o4 || o5,
         )
     }
 
@@ -106,6 +130,9 @@ impl TokenUsage {
             input_tokens: self.input_tokens.saturating_add(rhs.input_tokens),
             output_tokens: self.output_tokens.saturating_add(rhs.output_tokens),
             cache_tokens: self.cache_tokens.saturating_add(rhs.cache_tokens),
+            cache_write_tokens: self
+                .cache_write_tokens
+                .saturating_add(rhs.cache_write_tokens),
             reasoning_tokens: self.reasoning_tokens.saturating_add(rhs.reasoning_tokens),
         }
     }
@@ -116,6 +143,9 @@ impl TokenUsage {
             input_tokens: self.input_tokens.saturating_sub(rhs.input_tokens),
             output_tokens: self.output_tokens.saturating_sub(rhs.output_tokens),
             cache_tokens: self.cache_tokens.saturating_sub(rhs.cache_tokens),
+            cache_write_tokens: self
+                .cache_write_tokens
+                .saturating_sub(rhs.cache_write_tokens),
             reasoning_tokens: self.reasoning_tokens.saturating_sub(rhs.reasoning_tokens),
         }
     }
@@ -454,11 +484,12 @@ impl BillingTree {
 mod tests {
     use super::*;
 
-    fn usage(input: u64, output: u64, cache: u64, reasoning: u64) -> TokenUsage {
+    fn usage(input: u64, output: u64, cache: u64, cache_write: u64, reasoning: u64) -> TokenUsage {
         TokenUsage {
             input_tokens: input,
             output_tokens: output,
             cache_tokens: cache,
+            cache_write_tokens: cache_write,
             reasoning_tokens: reasoning,
         }
     }
@@ -471,7 +502,7 @@ mod tests {
         let model = OpenAIModel::from_str("billing-test,2,4").unwrap();
         // 100 input tokens, 40 of them cached. Cached tokens must NOT be free:
         // (60 + 40) * 2e-6 = 0.0002.
-        let u = usage(100, 0, 40, 0);
+        let u = usage(100, 0, 40, 0, 0);
         assert_eq!(u.input_cost(&model), rust_decimal::dec!(0.0002));
     }
 
@@ -482,15 +513,62 @@ mod tests {
         // "name,input,output,cache_read" => cached tokens priced at 1e-6.
         let model = OpenAIModel::from_str("billing-test,2,4,1").unwrap();
         // 60 * 2e-6 + 40 * 1e-6 = 0.00016.
-        let u = usage(100, 0, 40, 0);
+        let u = usage(100, 0, 40, 0, 0);
         assert_eq!(u.input_cost(&model), rust_decimal::dec!(0.00016));
     }
 
     #[test]
+    fn input_cost_bills_cache_writes_at_the_write_rate() {
+        use crate::model::OpenAIModel;
+        use std::str::FromStr;
+        // "name,input,output,cache_read,cache_write" — GPT-5.6 shape, where a
+        // write costs 1.25x the uncached input rate.
+        let model = OpenAIModel::from_str("billing-test,5,30,0.5,6.25").unwrap();
+        // 100 prompt tokens: 40 read from cache, 25 written to it, 35 plain.
+        // 35 * 5e-6 + 40 * 0.5e-6 + 25 * 6.25e-6 = 0.00035125.
+        let u = usage(100, 0, 40, 25, 0);
+        assert_eq!(u.input_cost(&model), rust_decimal::dec!(0.00035125));
+    }
+
+    #[test]
+    fn input_cost_without_write_price_bills_writes_at_input_rate() {
+        use crate::model::OpenAIModel;
+        use std::str::FromStr;
+        // No cache-write price advertised => writes are plain input tokens, so
+        // the total is unchanged by how the prompt splits: 100 * 2e-6 = 0.0002.
+        let model = OpenAIModel::from_str("billing-test,2,4").unwrap();
+        assert_eq!(
+            usage(100, 0, 40, 25, 0).input_cost(&model),
+            rust_decimal::dec!(0.0002)
+        );
+    }
+
+    #[test]
+    fn gpt_5_6_writes_cost_1_25x_the_input_rate() {
+        use crate::model::OpenAIModel;
+        use std::str::FromStr;
+        // Pins the registry data: OpenAI bills a GPT-5.6 cache write at 1.25x the
+        // uncached input rate. Earlier models never report writes, so they keep a
+        // zero (free) write price.
+        for id in [
+            "openai/gpt-5.6-sol",
+            "openai/gpt-5.6-terra",
+            "openai/gpt-5.6-luna",
+        ] {
+            let pricing = OpenAIModel::from_str(id).unwrap().pricing();
+            assert_eq!(
+                pricing.input_cache_write,
+                Some(pricing.input * rust_decimal::dec!(1.25)),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
     fn token_usage_add_is_field_wise() {
-        let a = usage(100, 40, 20, 5);
-        let b = usage(30, 10, 8, 2);
-        assert_eq!(a + b, usage(130, 50, 28, 7));
+        let a = usage(100, 40, 20, 12, 5);
+        let b = usage(30, 10, 8, 3, 2);
+        assert_eq!(a + b, usage(130, 50, 28, 15, 7));
         // The diff is the inverse of the sum.
         assert_eq!((a + b) - b, a);
     }
@@ -498,43 +576,59 @@ mod tests {
     #[test]
     #[should_panic(expected = "TokenUsage sub underflowed")]
     fn token_usage_sub_panics_on_underflow() {
-        let _ = usage(10, 0, 0, 0) - usage(50, 3, 1, 1);
+        let _ = usage(10, 0, 0, 0, 0) - usage(50, 3, 1, 0, 1);
     }
 
     #[test]
     #[should_panic(expected = "TokenUsage add overflowed")]
     fn token_usage_add_panics_on_overflow() {
-        let _ = usage(u64::MAX, 0, 0, 0) + usage(1, 0, 0, 0);
+        let _ = usage(u64::MAX, 0, 0, 0, 0) + usage(1, 0, 0, 0, 0);
     }
 
     #[test]
     fn token_usage_saturating_clamps_per_field() {
         // Underflowing fields clamp to 0, the rest subtract normally.
         assert_eq!(
-            usage(10, 100, 0, 5).saturating_sub(usage(50, 30, 1, 2)),
-            usage(0, 70, 0, 3)
+            usage(10, 100, 0, 4, 5).saturating_sub(usage(50, 30, 1, 9, 2)),
+            usage(0, 70, 0, 0, 3)
         );
         // Overflowing fields clamp to u64::MAX.
         assert_eq!(
-            usage(u64::MAX, 1, 0, 0).saturating_add(usage(1, 1, 0, 0)),
-            usage(u64::MAX, 2, 0, 0)
+            usage(u64::MAX, 1, 0, u64::MAX, 0).saturating_add(usage(1, 1, 0, 1, 0)),
+            usage(u64::MAX, 2, 0, u64::MAX, 0)
         );
     }
 
     #[test]
     fn token_usage_overflowing_and_wrapping_agree_with_fields() {
-        let (wrapped, overflowed) = usage(u64::MAX, 0, 0, 0).overflowing_add(usage(1, 0, 0, 0));
+        let (wrapped, overflowed) =
+            usage(u64::MAX, 0, 0, 0, 0).overflowing_add(usage(1, 0, 0, 0, 0));
         assert!(overflowed);
-        assert_eq!(wrapped, usage(0, 0, 0, 0));
+        assert_eq!(wrapped, usage(0, 0, 0, 0, 0));
         assert_eq!(
-            usage(u64::MAX, 5, 0, 0).wrapping_add(usage(1, 0, 0, 0)),
-            usage(0, 5, 0, 0)
+            usage(u64::MAX, 5, 0, 0, 0).wrapping_add(usage(1, 0, 0, 0, 0)),
+            usage(0, 5, 0, 0, 0)
         );
+        // The cache-write field overflows independently of the rest.
+        let (wrapped, overflowed) =
+            usage(0, 0, 0, u64::MAX, 0).overflowing_add(usage(0, 0, 0, 1, 0));
+        assert!(overflowed);
+        assert_eq!(wrapped, usage(0, 0, 0, 0, 0));
 
         // No out-of-range field ⇒ flag is false and the value matches `+`.
-        let a = usage(7, 9, 2, 1);
-        let b = usage(3, 4, 1, 1);
+        let a = usage(7, 9, 2, 1, 1);
+        let b = usage(3, 4, 1, 1, 1);
         assert_eq!(a.overflowing_add(b), (a + b, false));
+    }
+
+    #[test]
+    fn token_usage_deserializes_without_cache_write_field() {
+        // Snapshots written before `cache_write_tokens` existed must still load.
+        let u: TokenUsage = serde_json::from_str(
+            r#"{"input_tokens":10,"output_tokens":4,"cache_tokens":2,"reasoning_tokens":1}"#,
+        )
+        .unwrap();
+        assert_eq!(u, usage(10, 4, 2, 0, 1));
     }
 
     // --- BillingTree -------------------------------------------------------
@@ -546,7 +640,7 @@ mod tests {
     }
 
     fn input(n: u64) -> TokenUsage {
-        usage(n, 0, 0, 0)
+        usage(n, 0, 0, 0, 0)
     }
 
     #[test]

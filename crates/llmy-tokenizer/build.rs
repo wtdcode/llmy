@@ -38,6 +38,25 @@ struct ModelPricing {
     input_cache_write: Option<f64>,
 }
 
+/// Mirrors `llmy_tokenizer::CachePolicy`; absent in the JSON means the classic
+/// transparent prefix cache.
+#[derive(Deserialize, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+enum CachePolicy {
+    #[default]
+    PartialPrefix,
+    Breakpoint,
+}
+
+impl CachePolicy {
+    fn variant(&self) -> &'static str {
+        match self {
+            Self::PartialPrefix => "PartialPrefix",
+            Self::Breakpoint => "Breakpoint",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelConfig {
@@ -48,6 +67,8 @@ struct ModelConfig {
     max_tokens: u64,
     #[serde(default)]
     pricing: Option<ModelPricing>,
+    #[serde(default)]
+    cache_policy: CachePolicy,
 }
 
 // ---------------------------------------------------------------------------
@@ -272,8 +293,10 @@ fn generate_models(data_dir: &Path, out_dir: &str) {
                  max_input_tokens: {mit},\n\
                  max_tokens: {mt},\n\
                  pricing: {pricing},\n\
+                 cache_policy: super::CachePolicy::{cp},\n\
              }}),\n",
             owner = fmt_opt_str(owner),
+            cp = c.cache_policy.variant(),
             mn = model_name,
             enc = c.encoding,
             cm = fmt_f64(c.tokens.content_multiplier),

@@ -249,6 +249,7 @@
       "perNestedObject": 12,
       "perArrayOfObjects": 13
     },
+    "cachePolicy": "breakpoint",
     "name": "Claude 3 Haiku",
     "maxTokens": 4096,
     "pricing": {
@@ -275,6 +276,7 @@
       "perNestedObject": 12,
       "perArrayOfObjects": 13
     },
+    "cachePolicy": "breakpoint",
     "name": "Claude 3 Opus",
     "maxTokens": 4096,
     "pricing": {
@@ -301,6 +303,7 @@
       "perNestedObject": 12,
       "perArrayOfObjects": 13
     },
+    "cachePolicy": "breakpoint",
     "name": "Claude 3.5 Haiku",
     "maxTokens": 8192,
     "pricing": {
@@ -327,6 +330,7 @@
       "perNestedObject": 12,
       "perArrayOfObjects": 13
     },
+    "cachePolicy": "breakpoint",
     "name": "Claude 3.5 Sonnet",
     "maxTokens": 8192,
     "pricing": {
@@ -353,6 +357,7 @@
       "perNestedObject": 12,
       "perArrayOfObjects": 13
     },
+    "cachePolicy": "breakpoint",
     "name": "Claude 3.5 Sonnet (2024-06-20)",
     "maxTokens": 8192,
     "pricing": {
@@ -377,6 +382,7 @@
       "perNestedObject": 12,
       "perArrayOfObjects": 13
     },
+    "cachePolicy": "breakpoint",
     "name": "Claude 3.7 Sonnet",
     "maxTokens": 64000,
     "pricing": {
@@ -403,6 +409,7 @@
       "perNestedObject": 12,
       "perArrayOfObjects": 13
     },
+    "cachePolicy": "breakpoint",
     "name": "Claude Opus 4",
     "maxTokens": 32000,
     "pricing": {
@@ -429,6 +436,7 @@
       "perNestedObject": 12,
       "perArrayOfObjects": 13
     },
+    "cachePolicy": "breakpoint",
     "name": "Claude Opus 4.1",
     "maxTokens": 32000,
     "pricing": {
@@ -455,6 +463,7 @@
       "perNestedObject": 12,
       "perArrayOfObjects": 13
     },
+    "cachePolicy": "breakpoint",
     "name": "Claude Sonnet 4",
     "maxTokens": 64000,
     "pricing": {
@@ -481,6 +490,7 @@
       "perNestedObject": 12,
       "perArrayOfObjects": 13
     },
+    "cachePolicy": "breakpoint",
     "name": "Claude Sonnet 4.5",
     "maxTokens": 64000,
     "pricing": {
@@ -2420,6 +2430,7 @@
       "perArrayOfObjects": 13,
       "contentMultiplier": 1.1
     },
+    "cachePolicy": "breakpoint",
     "name": "Claude Haiku 4.5",
     "maxTokens": 64000,
     "pricing": {
@@ -2593,6 +2604,7 @@
       "perArrayOfObjects": 13,
       "contentMultiplier": 1.1
     },
+    "cachePolicy": "breakpoint",
     "name": "Claude Opus 4.5",
     "maxTokens": 64000,
     "pricing": {
@@ -3146,13 +3158,14 @@
       "perNestedObject": -3,
       "perArrayOfObjects": 1
     },
+    "cachePolicy": "breakpoint",
     "name": "GPT-5.6 Sol",
     "maxTokens": 128000,
     "pricing": {
       "input": 5e-06,
       "output": 3e-05,
       "input_cache_read": 5e-07,
-      "input_cache_write": 0
+      "input_cache_write": 6.25e-06
     },
     "maxInputTokens": 922000
   },
@@ -3172,13 +3185,14 @@
       "perNestedObject": -3,
       "perArrayOfObjects": 1
     },
+    "cachePolicy": "breakpoint",
     "name": "GPT-5.6 Terra",
     "maxTokens": 128000,
     "pricing": {
       "input": 2.5e-06,
       "output": 1.5e-05,
       "input_cache_read": 2.5e-07,
-      "input_cache_write": 0
+      "input_cache_write": 3.125e-06
     },
     "maxInputTokens": 922000
   },
@@ -3198,13 +3212,14 @@
       "perNestedObject": -3,
       "perArrayOfObjects": 1
     },
+    "cachePolicy": "breakpoint",
     "name": "GPT-5.6 Luna",
     "maxTokens": 128000,
     "pricing": {
       "input": 1e-06,
       "output": 6e-06,
       "input_cache_read": 1e-07,
-      "input_cache_write": 0
+      "input_cache_write": 1.25e-06
     },
     "maxInputTokens": 922000
   },

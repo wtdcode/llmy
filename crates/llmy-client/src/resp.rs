@@ -173,8 +173,12 @@ pub type CompletionTokensDetails = WithOtherFields<CompletionTokensDetailsRaw>;
 pub struct PromptTokensDetailsRaw {
     /// Audio input tokens present in the prompt.
     pub audio_tokens: Option<u32>,
-    /// Cached tokens present in the prompt.
+    /// Cached tokens present in the prompt, i.e. read from the cache.
     pub cached_tokens: Option<u32>,
+    /// The unadjusted number of prompt tokens written to cache (GPT-5.6+).
+    /// Disjoint from `cached_tokens`; billed at the model's cache-write rate
+    /// (1.25x the uncached input rate on GPT-5.6).
+    pub cache_write_tokens: Option<u32>,
 }
 pub type PromptTokensDetails = WithOtherFields<PromptTokensDetailsRaw>;
 

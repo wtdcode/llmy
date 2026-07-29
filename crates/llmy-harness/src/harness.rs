@@ -9,11 +9,12 @@ use llmy_client::req::{
     ChatCompletionMessageToolCallsRaw, ChatCompletionRequestMessageRaw,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageRaw,
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageRaw,
-    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageRaw,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageRaw, PromptCacheMode,
+    PromptCacheOptionsRaw,
 };
 use llmy_client::resp::{ChatChoice, FinishReason};
 use llmy_client::{
-    client::{LLM, RawExtensibleChatRequestMessage},
+    client::{LLM, RawExtensibleChatCompletionRequest, RawExtensibleChatRequestMessage},
     model::ModelConfig,
     settings::LLMSettings,
 };
@@ -76,6 +77,12 @@ pub struct Agent {
     cache_key: String,
     memory: Option<AgentMemoryRuntime>,
     config: AgentConfig,
+    /// Request-wide prompt cache mode. `None` (the default) omits
+    /// `prompt_cache_options` entirely, leaving the provider's own default.
+    cache_mode: Option<PromptCacheMode>,
+    /// Whether the synthesized system message carries a cache breakpoint. It is
+    /// not stored in `context`, so it needs its own flag.
+    system_breakpoint: bool,
 }
 
 impl Agent {
@@ -99,6 +106,8 @@ impl Agent {
             cache_key,
             memory: None,
             config,
+            cache_mode: None,
+            system_breakpoint: false,
         }
     }
 
@@ -144,6 +153,8 @@ impl Agent {
                 criteria: criteria.clone(),
             }),
             config,
+            cache_mode: None,
+            system_breakpoint: false,
         }
     }
 
@@ -156,11 +167,102 @@ impl Agent {
     }
 
     pub fn conversation_context(&self) -> Vec<RawExtensibleChatRequestMessage> {
-        std::iter::once(RawExtensibleChatRequestMessage::new(Self::system_message(
-            self.system_prompt.clone(),
-        )))
-        .chain(self.context.clone())
-        .collect()
+        let mut system =
+            RawExtensibleChatRequestMessage::new(Self::system_message(self.system_prompt.clone()));
+        if self.system_breakpoint {
+            system.breakpoint();
+        }
+        std::iter::once(system)
+            .chain(self.context.clone())
+            .collect()
+    }
+
+    /// Mutable access to the stored conversation, so callers can mark a cache
+    /// breakpoint on a specific message:
+    ///
+    /// ```no_run
+    /// # fn mark(agent: &mut llmy_harness::Agent) {
+    /// if let Some(msg) = agent.context_mut().last_mut() {
+    ///     msg.breakpoint();
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// This is the conversation only. The system-prompt message is synthesized
+    /// per request by [`Agent::conversation_context`], so it gets its own switch:
+    /// [`Agent::toggle_system_breakpoint`].
+    pub fn context_mut(&mut self) -> &mut Vec<RawExtensibleChatRequestMessage> {
+        &mut self.context
+    }
+
+    /// Toggle a cache breakpoint on the system-prompt message, which is
+    /// synthesized per request and so cannot be reached via
+    /// [`Agent::context_mut`]. Off by default.
+    ///
+    /// This is usually the breakpoint worth having: the system prompt is the
+    /// stable head of every request.
+    pub fn toggle_system_breakpoint(&mut self, enabled: bool) {
+        self.system_breakpoint = enabled;
+    }
+
+    /// Whether the system-prompt message currently carries a cache breakpoint.
+    pub fn system_breakpoint(&self) -> bool {
+        self.system_breakpoint
+    }
+
+    /// Drop every explicit cache breakpoint, in the conversation and on the
+    /// system prompt.
+    pub fn clear_breakpoints(&mut self) {
+        for message in self.context.iter_mut() {
+            message.toggle_cache_breakpoint(false);
+        }
+        self.system_breakpoint = false;
+    }
+
+    /// Choose how the provider places cache breakpoints for this agent.
+    ///
+    /// `explicit = true` suppresses the implicit breakpoint the API would
+    /// otherwise put on the latest message, so only the ones marked through
+    /// [`Agent::context_mut`] are used for cache reads and writes.
+    /// `explicit = false` restores the provider default (implicit breakpoint
+    /// *plus* the explicit ones).
+    ///
+    /// Until this is called, `prompt_cache_options` is left off the request
+    /// entirely. See [`Agent::breakpoint_mode`].
+    pub fn toggle_breakpoint_implicit(&mut self, explicit: bool) {
+        self.cache_mode = Some(if explicit {
+            PromptCacheMode::Explicit
+        } else {
+            PromptCacheMode::Implicit
+        });
+    }
+
+    /// The prompt cache mode set by [`Agent::toggle_breakpoint_implicit`], or
+    /// `None` while the provider default is in force.
+    pub fn breakpoint_mode(&self) -> Option<PromptCacheMode> {
+        self.cache_mode
+    }
+
+    /// Attach this agent's `prompt_cache_options` to an outgoing request.
+    ///
+    /// Skipped for models that don't address their cache by breakpoint: the
+    /// field is unknown to them, and strict providers reject unknown request
+    /// fields outright.
+    fn apply_cache_options(&self, llm: &LLM, req: &mut RawExtensibleChatCompletionRequest) {
+        let Some(mode) = self.cache_mode else {
+            return;
+        };
+        let policy = llm.model.cache_policy();
+        if !policy.needs_breakpoints() {
+            tracing::warn!(
+                "dropping prompt cache mode {:?}: {} caches by {}, not by breakpoint",
+                mode,
+                llm.model,
+                policy
+            );
+            return;
+        }
+        req.prompt_cache_options = Some(PromptCacheOptionsRaw::with_mode(mode));
     }
 
     pub fn render_context(&self) -> String {
@@ -237,7 +339,8 @@ impl Agent {
         let settings = settings.unwrap_or_else(|| llm.default_settings.clone());
         let timeout = settings.timeout();
         let retry = settings.llm_retry;
-        let req = llm.build_chat_request(messages, cache_key, &settings, tools)?;
+        let mut req = llm.build_chat_request(messages, cache_key, &settings, tools)?;
+        self.apply_cache_options(llm, &mut req);
         let mut resp = llm
             .complete_extensible_once_with_retry(&req, debug_prefix, Some(timeout), Some(retry))
             .await?;
@@ -1002,5 +1105,154 @@ mod tests {
         assert!(snapshot_prompt.contains("title: before compact"));
         assert!(!snapshot_prompt.contains("title: after snapshot"));
         assert!(refreshed_prompt.contains("title: after snapshot"));
+    }
+
+    // --- prompt cache breakpoints ------------------------------------------
+
+    fn cache_test_settings() -> LLMSettings {
+        LLMSettings {
+            llm_temperature: None,
+            llm_presence_penalty: None,
+            llm_prompt_timeout: 1,
+            llm_retry: 0,
+            llm_max_completion_tokens: None,
+            llm_tool_choice: None,
+            llm_stream: false,
+            top_p: None,
+            reasoning_effort: None,
+            auto_strip: false,
+        }
+    }
+
+    /// An LLM pointed at a dead address — these tests never issue a request.
+    fn cache_test_llm(model: &str) -> LLM {
+        LLM::new(
+            llmy_client::client::SupportedConfig::new("http://127.0.0.1:1", "key"),
+            OpenAIModel::from_str(model).expect("built-in model"),
+            llmy_client::rust_decimal::Decimal::ONE,
+            cache_test_settings(),
+            None,
+        )
+    }
+
+    fn cache_test_agent() -> Agent {
+        let mut agent = Agent::new("system".to_string(), ToolBox::new(), "k".to_string());
+        agent.push_user_message("first".to_string());
+        agent.push_user_message("second".to_string());
+        agent
+    }
+
+    fn breakpoint_marked(msg: &RawExtensibleChatRequestMessage) -> bool {
+        serde_json::to_string(msg)
+            .unwrap()
+            .contains("prompt_cache_breakpoint")
+    }
+
+    #[test]
+    fn context_mut_marks_a_breakpoint_on_one_message() {
+        let mut agent = cache_test_agent();
+        assert!(agent.context_mut()[0].breakpoint());
+
+        let ctx = agent.conversation_context();
+        // System prompt is synthesized and unmarked; only message 0 is marked.
+        assert!(!breakpoint_marked(&ctx[0]));
+        assert!(breakpoint_marked(&ctx[1]));
+        assert!(!breakpoint_marked(&ctx[2]));
+    }
+
+    #[test]
+    fn toggle_system_breakpoint_marks_the_synthesized_system_message() {
+        let mut agent = cache_test_agent();
+        assert!(!agent.system_breakpoint());
+        agent.toggle_system_breakpoint(true);
+        assert!(agent.system_breakpoint());
+
+        let ctx = agent.conversation_context();
+        // Only the system message — the conversation is untouched.
+        assert!(breakpoint_marked(&ctx[0]));
+        assert!(!breakpoint_marked(&ctx[1]));
+        assert!(!breakpoint_marked(&ctx[2]));
+
+        agent.toggle_system_breakpoint(false);
+        assert!(!agent.conversation_context().iter().any(breakpoint_marked));
+    }
+
+    #[test]
+    fn clear_breakpoints_removes_every_marker() {
+        let mut agent = cache_test_agent();
+        agent.toggle_system_breakpoint(true);
+        agent.context_mut()[0].breakpoint();
+        agent.context_mut()[1].breakpoint();
+
+        agent.clear_breakpoints();
+        assert!(!agent.system_breakpoint());
+        assert!(!agent.conversation_context().iter().any(breakpoint_marked));
+        // Idempotent.
+        agent.clear_breakpoints();
+        assert!(!agent.conversation_context().iter().any(breakpoint_marked));
+    }
+
+    #[test]
+    fn cache_options_are_absent_until_toggled() {
+        let agent = cache_test_agent();
+        let llm = cache_test_llm("openai/gpt-5.6-sol");
+        assert_eq!(agent.breakpoint_mode(), None);
+
+        let mut req = llm
+            .build_chat_request(
+                agent.conversation_context(),
+                None,
+                &cache_test_settings(),
+                None,
+            )
+            .unwrap();
+        agent.apply_cache_options(&llm, &mut req);
+        assert!(req.prompt_cache_options.is_none());
+    }
+
+    #[test]
+    fn toggle_breakpoint_implicit_sets_the_request_mode() {
+        let llm = cache_test_llm("openai/gpt-5.6-sol");
+        let settings = cache_test_settings();
+
+        for (explicit, expected) in [
+            (true, PromptCacheMode::Explicit),
+            (false, PromptCacheMode::Implicit),
+        ] {
+            let mut agent = cache_test_agent();
+            agent.toggle_breakpoint_implicit(explicit);
+            assert_eq!(agent.breakpoint_mode(), Some(expected));
+
+            let mut req = llm
+                .build_chat_request(agent.conversation_context(), None, &settings, None)
+                .unwrap();
+            agent.apply_cache_options(&llm, &mut req);
+            assert_eq!(
+                req.prompt_cache_options.as_ref().map(|o| o.inner.mode),
+                Some(Some(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn cache_options_are_dropped_for_prefix_cached_models() {
+        // gpt-5.5 caches by matching prefix; `prompt_cache_options` would be an
+        // unknown request field there.
+        let llm = cache_test_llm("openai/gpt-5.5");
+        let mut agent = cache_test_agent();
+        agent.toggle_breakpoint_implicit(true);
+
+        let mut req = llm
+            .build_chat_request(
+                agent.conversation_context(),
+                None,
+                &cache_test_settings(),
+                None,
+            )
+            .unwrap();
+        agent.apply_cache_options(&llm, &mut req);
+        assert!(req.prompt_cache_options.is_none());
+        // The agent still remembers what was asked for.
+        assert_eq!(agent.breakpoint_mode(), Some(PromptCacheMode::Explicit));
     }
 }

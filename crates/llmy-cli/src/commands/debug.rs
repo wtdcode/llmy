@@ -176,6 +176,7 @@ enum JsonlEntry {
 struct BillingEntry {
     input_without_cached_tokens: Option<i64>,
     cached_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
     output_without_reasoning_tokens: Option<i64>,
     reasoning_tokens: Option<i64>,
     current_usage_usd: f64,
@@ -194,6 +195,7 @@ fn build_jsonl(row: &LLMDebugRow) -> color_eyre::Result<String> {
         JsonlEntry::Billing(BillingEntry {
             input_without_cached_tokens: row.input_without_cached_tokens,
             cached_tokens: row.cached_tokens,
+            cache_write_tokens: row.cache_write_tokens,
             output_without_reasoning_tokens: row.output_without_reasoning_tokens,
             reasoning_tokens: row.reasoning_tokens,
             current_usage_usd: row.current_usage_usd,
@@ -225,7 +227,7 @@ pub async fn run_dump_req(args: DumpReqArgs) -> color_eyre::Result<()> {
     Ok(())
 }
 
-const LIST_HEADER: &str = "id\tclient\tts\tmodel\tendpoint\tdeployment\tcache_key\tinput\tcached\toutput\treasoning\tusage_usd\tresp";
+const LIST_HEADER: &str = "id\tclient\tts\tmodel\tendpoint\tdeployment\tcache_key\tinput\tcached\tcache_write\toutput\treasoning\tusage_usd\tresp";
 
 fn format_row_summary(row: &LLMDebugRow) -> String {
     let cache = row.cache_key.as_deref().unwrap_or("-");
@@ -236,7 +238,7 @@ fn format_row_summary(row: &LLMDebugRow) -> String {
         "pending"
     };
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}",
         row.id,
         row.client_id,
         format_timestamp(row.timestamp),
@@ -246,6 +248,7 @@ fn format_row_summary(row: &LLMDebugRow) -> String {
         cache,
         opt_i64(row.input_without_cached_tokens),
         opt_i64(row.cached_tokens),
+        opt_i64(row.cache_write_tokens),
         opt_i64(row.output_without_reasoning_tokens),
         opt_i64(row.reasoning_tokens),
         row.current_usage_usd,
@@ -273,6 +276,7 @@ fn print_row_human(row: &LLMDebugRow) {
         opt_i64(row.input_without_cached_tokens)
     );
     println!("cached_tokens:      {}", opt_i64(row.cached_tokens));
+    println!("cache_write_tokens: {}", opt_i64(row.cache_write_tokens));
     println!(
         "output_tokens:      {}",
         opt_i64(row.output_without_reasoning_tokens)

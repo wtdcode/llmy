@@ -22,7 +22,6 @@ pub trait OpenAIContentFilter: Send + Sync + Debug {
     fn filter_output(&self, _resp: &mut RawExtensibleChatCompletionResponse) {}
 }
 
-
 #[derive(Debug, Default)]
 pub struct OpenAIContentFilterChain {
     pub filters: Vec<Box<dyn OpenAIContentFilter>>,
