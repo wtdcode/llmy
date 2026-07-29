@@ -29,6 +29,11 @@ pub struct ListReqArgs {
     /// Filter to a specific cache key.
     #[arg(long)]
     cache_key: Option<String>,
+
+    /// Filter to a specific debug prefix (the label each call was recorded
+    /// under, e.g. `chat` or `planner`).
+    #[arg(long)]
+    debug_prefix: Option<String>,
 }
 
 pub async fn run_list_req(args: ListReqArgs) -> color_eyre::Result<()> {
@@ -48,7 +53,11 @@ pub async fn run_list_req(args: ListReqArgs) -> color_eyre::Result<()> {
     }
 
     let rows = store
-        .list_filtered(client_id, args.cache_key.as_deref())
+        .list_filtered(
+            client_id,
+            args.cache_key.as_deref(),
+            args.debug_prefix.as_deref(),
+        )
         .await?;
 
     println!("{}", LIST_HEADER);
@@ -100,7 +109,7 @@ pub async fn run_dump_client(args: DumpClientArgs) -> color_eyre::Result<()> {
     };
 
     std::fs::create_dir_all(&args.output)?;
-    let rows = store.list_filtered(Some(client_id), None).await?;
+    let rows = store.list_filtered(Some(client_id), None, None).await?;
     if rows.is_empty() {
         eprintln!("no rows for client_id={} in {}", client_id, args.db);
         return Ok(());

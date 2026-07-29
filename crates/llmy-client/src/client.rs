@@ -376,12 +376,18 @@ impl LLMInner {
     ///
     /// The claim is handed (cloned) to every attempt of that request, settled by
     /// whichever one lands, and abandoned when the caller drops the last clone.
-    /// A caller-supplied key is never second-guessed.
-    fn auto_cache_key(&self, req: &RawExtensibleChatCompletionRequest) -> Option<CacheKeyClaim> {
+    /// A newly minted key carries `debug_prefix` in its name, so the keys in the
+    /// logs and the debug DB say which workload opened them. A caller-supplied
+    /// key is never second-guessed.
+    fn auto_cache_key(
+        &self,
+        req: &RawExtensibleChatCompletionRequest,
+        debug_prefix: Option<&str>,
+    ) -> Option<CacheKeyClaim> {
         if req.prompt_cache_key.is_some() {
             return None;
         }
-        self.cache_keys.select(req, &self.model)
+        self.cache_keys.select(req, &self.model, debug_prefix)
     }
 
     /// Cached prompt tokens the provider reported, or zero if it reported none.
@@ -511,7 +517,7 @@ impl LLMInner {
         let retry = retry.unwrap_or(u64::MAX);
         // One claim for the whole logical request; every attempt gets a clone,
         // and giving up drops the last one, which abandons it.
-        let claim = self.auto_cache_key(req);
+        let claim = self.auto_cache_key(req, debug_prefix);
 
         let mut last = None;
         for idx in 0..retry {
@@ -551,7 +557,7 @@ impl LLMInner {
     ) -> Result<T, LLMYError> {
         let retry = retry.unwrap_or(u64::MAX);
         // One claim for the whole logical request — see the untyped variant.
-        let claim = self.auto_cache_key(req);
+        let claim = self.auto_cache_key(req, debug_prefix);
 
         let mut last = None;
         for idx in 0..retry {
@@ -630,7 +636,7 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
     ) -> Result<T, LLMYError> {
-        let claim = self.auto_cache_key(&req);
+        let claim = self.auto_cache_key(&req, debug_prefix);
         self.complete_extensible_typed_attempt::<T>(req, claim, debug_prefix, timeout_overwrite)
             .await
     }
@@ -658,7 +664,7 @@ impl LLMInner {
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
         // A one-shot call is a logical request of exactly one attempt, so the
         // claim is taken and dropped here — abandoned if the call does not land.
-        let claim = self.auto_cache_key(&req);
+        let claim = self.auto_cache_key(&req, debug_prefix);
         self.complete_extensible_attempt(req, claim, debug_prefix, timeout_overwrite)
             .await
     }
@@ -1519,7 +1525,7 @@ mod tests {
 
     /// Resolve a key for `req` and settle it, i.e. a request that was answered.
     fn landed(llm: &LLM, req: &mut RawExtensibleChatCompletionRequest) {
-        if let Some(claim) = llm.auto_cache_key(req) {
+        if let Some(claim) = llm.auto_cache_key(req, None) {
             req.prompt_cache_key = Some(claim.key().to_string());
             claim.confirm(0);
         }
@@ -1563,7 +1569,7 @@ mod tests {
         // was cached and the prefix must not point anywhere.
         let failed = user_request("hello");
         let stale = llm
-            .auto_cache_key(&failed)
+            .auto_cache_key(&failed, None)
             .expect("auto key")
             .key()
             .to_string();
@@ -1580,9 +1586,9 @@ mod tests {
         // Two sub-agents fan out from the same prefix at once. Neither has an
         // answer yet, but the second must still land on the first one's machine.
         let first = user_request("shared");
-        let first_claim = llm.auto_cache_key(&first).expect("auto key");
+        let first_claim = llm.auto_cache_key(&first, None).expect("auto key");
         let second = extended("shared", "branch");
-        let second_claim = llm.auto_cache_key(&second).expect("auto key");
+        let second_claim = llm.auto_cache_key(&second, None).expect("auto key");
         assert_eq!(second_claim.key(), first_claim.key());
 
         // The first one failing must not strand the second, which is still going.
@@ -1605,7 +1611,7 @@ mod tests {
 
         // What a retry loop owns: one claim, cloned into every attempt.
         let req = user_request("hello");
-        let claim = llm.auto_cache_key(&req).expect("auto key");
+        let claim = llm.auto_cache_key(&req, None).expect("auto key");
         for _ in 0..3 {
             let attempt = claim.clone();
             assert_eq!(attempt.key(), claim.key());
@@ -1615,7 +1621,29 @@ mod tests {
         // A caller-supplied key short-circuits selection entirely.
         let mut given = user_request("hello");
         given.prompt_cache_key = Some("mine".into());
-        assert!(llm.auto_cache_key(&given).is_none());
+        assert!(llm.auto_cache_key(&given, None).is_none());
+    }
+
+    #[test]
+    fn a_minted_key_carries_the_debug_prefix() {
+        let llm = test_llm();
+
+        let planner = llm
+            .auto_cache_key(&user_request("plan this"), Some("planner"))
+            .expect("auto key");
+        assert!(
+            planner.key().contains("planner"),
+            "{} should name the workload that opened it",
+            planner.key()
+        );
+        planner.confirm(0);
+
+        // A blank prefix must not leave a dangling separator in the key.
+        let blank = llm
+            .auto_cache_key(&user_request("something else"), Some("  "))
+            .expect("auto key");
+        assert!(!blank.key().contains("--"), "{}", blank.key());
+        blank.confirm(0);
     }
 
     #[test]

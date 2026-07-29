@@ -182,6 +182,7 @@ impl CacheKeyRegistry {
         &mut self,
         req: &RawExtensibleChatCompletionRequest,
         model: &OpenAIModel,
+        label: Option<&str>,
     ) -> Option<(String, KeyId, Vec<PrefixHash>, u64)> {
         if !self.config.enabled {
             return None;
@@ -216,7 +217,7 @@ impl CacheKeyRegistry {
 
         let (id, expected_cached_tokens) = match chosen {
             Some(claim) => (claim.key, claim.tokens),
-            None => (self.mint(now), 0),
+            None => (self.mint(now, label), 0),
         };
 
         // Only real cache points get claimed, or a key would advertise cached
@@ -304,14 +305,24 @@ impl CacheKeyRegistry {
         }
     }
 
-    fn mint(&mut self, now: Instant) -> KeyId {
+    /// Mint a key, tagged with `label` (the caller's debug prefix) so the keys
+    /// showing up in logs and the debug DB say which workload opened them.
+    ///
+    /// The tag records who *opened* the key, not who uses it: a request under a
+    /// different prefix that shares this one's prompt prefix will reuse it, and
+    /// should — routing follows the prompt, not the label.
+    fn mint(&mut self, now: Instant, label: Option<&str>) -> KeyId {
         self.next_id += 1;
         let id = self.next_id;
+        // The pid keeps concurrent processes off each other's machines.
+        let key = match label.map(str::trim).filter(|l| !l.is_empty()) {
+            Some(label) => format!("llmy-{}-{}-{}", self.pid, label, id),
+            None => format!("llmy-{}-{}", self.pid, id),
+        };
         self.keys.insert(
             id,
             KeyState {
-                // The pid keeps concurrent processes off each other's machines.
-                key: format!("llmy-{}-{}", self.pid, id),
+                key,
                 sends: VecDeque::new(),
                 last_used: now,
             },
@@ -353,18 +364,22 @@ impl CacheKeys {
     /// Pick the cache key for `req`, holding its prefixes in flight until the
     /// returned claim settles. `None` when auto keys are disabled.
     ///
+    /// A freshly minted key is tagged with `label` — the caller's debug prefix —
+    /// so logs and the debug DB show which workload opened it.
+    ///
     /// Selection and the rate-limit charge happen under one lock, so concurrent
     /// callers cannot both take the last slot on a key.
     pub fn select(
         &self,
         req: &RawExtensibleChatCompletionRequest,
         model: &OpenAIModel,
+        label: Option<&str>,
     ) -> Option<CacheKeyClaim> {
         let (key, id, held, expected_cached_tokens) = self
             .0
             .write()
             .expect("cache keys poisoned")
-            .select(req, model)?;
+            .select(req, model, label)?;
         Some(CacheKeyClaim(Arc::new(HeldClaim {
             keys: self.clone(),
             key,
@@ -660,7 +675,7 @@ mod tests {
     }
 
     fn select(keys: &CacheKeys, messages: &[&str]) -> Option<CacheKeyClaim> {
-        keys.select(&request(messages), &prefix_model())
+        keys.select(&request(messages), &prefix_model(), None)
     }
 
     /// A request that was sent *and* answered. These prompts are far below the
@@ -787,14 +802,14 @@ mod tests {
         let turn1 = request(&[&head]);
 
         // Turn 1 is a fresh key: nothing is expected back from it.
-        let claim = keys.select(&turn1, &model).unwrap();
+        let claim = keys.select(&turn1, &model, None).unwrap();
         assert_eq!(claim.expected_cached_tokens(), 0);
         claim.confirm(0);
 
         // Turn 2 matches turn 1's prefix, so the expectation is exactly what that
         // prefix was measured at when it was claimed — read back, not recomputed.
         let turn2 = request(&[&head, "and a follow-up"]);
-        let claim = keys.select(&turn2, &model).unwrap();
+        let claim = keys.select(&turn2, &model, None).unwrap();
         let expected = claim.expected_cached_tokens();
         assert!(expected > 0);
         assert_eq!(
@@ -809,7 +824,7 @@ mod tests {
 
         // Turn 3 matches turn 2's longer prefix, so it expects strictly more.
         let turn3 = request(&[&head, "and a follow-up", "more"]);
-        let claim = keys.select(&turn3, &model).unwrap();
+        let claim = keys.select(&turn3, &model, None).unwrap();
         assert!(claim.expected_cached_tokens() > expected);
     }
 
@@ -934,7 +949,7 @@ mod tests {
         let mut turn1 = request(&["head", "u1"]);
         turn1.messages[0].toggle_cache_breakpoint(true);
         turn1.prompt_cache_options = Some(PromptCacheOptionsRaw::explicit());
-        let claim = keys.select(&turn1, &breakpoint_model()).unwrap();
+        let claim = keys.select(&turn1, &breakpoint_model(), None).unwrap();
         let key = claim.key().to_string();
         claim.confirm(0);
 
@@ -943,7 +958,7 @@ mod tests {
         let mut turn2 = request(&["head", "u1", "a1", "u2"]);
         turn2.messages[0].toggle_cache_breakpoint(true);
         turn2.prompt_cache_options = Some(PromptCacheOptionsRaw::explicit());
-        let claim = keys.select(&turn2, &breakpoint_model()).unwrap();
+        let claim = keys.select(&turn2, &breakpoint_model(), None).unwrap();
         assert_eq!(claim.key(), key);
         claim.confirm(0);
         assert_eq!(keys.key_count(), 1);
@@ -952,7 +967,7 @@ mod tests {
         let mut other = request(&["other-head", "u1"]);
         other.messages[0].toggle_cache_breakpoint(true);
         other.prompt_cache_options = Some(PromptCacheOptionsRaw::explicit());
-        let claim = keys.select(&other, &breakpoint_model()).unwrap();
+        let claim = keys.select(&other, &breakpoint_model(), None).unwrap();
         assert_ne!(claim.key(), key);
     }
 }

@@ -585,6 +585,7 @@ CREATE TABLE IF NOT EXISTS llm_debug (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_debug_cache_key ON llm_debug(cache_key);
 CREATE INDEX IF NOT EXISTS idx_llm_debug_client_id ON llm_debug(client_id);
+CREATE INDEX IF NOT EXISTS idx_llm_debug_debug_prefix ON llm_debug(debug_prefix);
 CREATE TABLE IF NOT EXISTS prefix_billing (
     client_id INTEGER NOT NULL,
     prefix TEXT NOT NULL,
@@ -743,12 +744,13 @@ impl Sqlite3DebugDB {
         Ok(row.try_get::<Option<i64>, _>("id").unwrap_or(None))
     }
 
-    /// List rows optionally filtered by client and/or cache key, in
-    /// ascending id order.
+    /// List rows optionally filtered by client, cache key and/or debug prefix,
+    /// in ascending id order. Each filtered column is indexed.
     pub async fn list_filtered(
         &self,
         client_id: Option<i64>,
         cache_key: Option<&str>,
+        debug_prefix: Option<&str>,
     ) -> Result<Vec<LLMDebugRow>, LLMYError> {
         let mut sql = String::from("SELECT * FROM llm_debug WHERE 1=1");
         if client_id.is_some() {
@@ -756,6 +758,9 @@ impl Sqlite3DebugDB {
         }
         if cache_key.is_some() {
             sql.push_str(" AND cache_key = ?");
+        }
+        if debug_prefix.is_some() {
+            sql.push_str(" AND debug_prefix = ?");
         }
         sql.push_str(" ORDER BY id ASC");
 
@@ -765,6 +770,9 @@ impl Sqlite3DebugDB {
         }
         if let Some(ck) = cache_key {
             q = q.bind(ck);
+        }
+        if let Some(prefix) = debug_prefix {
+            q = q.bind(prefix);
         }
         let rows = q
             .fetch_all(&self.pool)
