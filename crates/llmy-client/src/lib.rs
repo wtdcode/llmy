@@ -3,6 +3,7 @@
 pub use rust_decimal;
 
 pub mod billing;
+pub mod cache_key;
 pub mod client;
 pub mod context;
 pub mod debug;

@@ -548,6 +548,13 @@ macro_rules! impl_part_cache_breakpoint {
                     $(Self::$variant(part) => part.inner.prompt_cache_breakpoint = breakpoint,)+
                 }
             }
+
+            /// Whether this part carries an explicit cache breakpoint.
+            pub fn has_cache_breakpoint(&self) -> bool {
+                match self {
+                    $(Self::$variant(part) => part.inner.prompt_cache_breakpoint.is_some(),)+
+                }
+            }
         }
     };
 }
@@ -609,6 +616,42 @@ macro_rules! impl_content_cache_breakpoint {
                     },
                     Self::Text(_) => unreachable!("promoted to Array above"),
                 }
+            }
+
+            /// Whether any part of this content carries an explicit cache
+            /// breakpoint.
+            pub fn has_cache_breakpoint(&self) -> bool {
+                match self {
+                    Self::Text(_) => false,
+                    Self::Array(parts) => parts.iter().any(|part| part.has_cache_breakpoint()),
+                }
+            }
+
+            /// Collapse a lone plain text part back to string content — the
+            /// inverse of the promotion [`Self::toggle_cache_breakpoint`] does
+            /// when enabling. Content carrying a breakpoint or any extension
+            /// field is left alone, since collapsing would drop it. Returns
+            /// whether anything collapsed.
+            pub fn compact(&mut self) -> bool {
+                let Self::Array(parts) = self else {
+                    return false;
+                };
+                let [only] = parts.as_slice() else {
+                    return false;
+                };
+                if !only.other.is_empty() {
+                    return false;
+                }
+                let part = match &only.inner {
+                    $part_raw::Text(part) => part,
+                    #[allow(unreachable_patterns)]
+                    _ => return false,
+                };
+                if part.inner.prompt_cache_breakpoint.is_some() || !part.other.is_empty() {
+                    return false;
+                }
+                *self = Self::Text(part.inner.text.clone());
+                true
             }
         }
     };
@@ -836,6 +879,75 @@ pub enum ChatCompletionRequestMessageRaw {
     Function(ChatCompletionRequestFunctionMessage),
 }
 pub type ChatCompletionRequestMessage = WithOtherFields<ChatCompletionRequestMessageRaw>;
+
+impl ChatCompletionRequestMessageRaw {
+    /// Toggle an **explicit** cache breakpoint at the end of this message: the
+    /// conversation prefix up to and including it is what gets read from /
+    /// written to the prompt cache. Pair with
+    /// [`prompt_cache_options`](CreateChatCompletionRequestRaw::prompt_cache_options)
+    /// set to [`PromptCacheOptionsRaw::explicit`] to suppress the implicit
+    /// breakpoint the API would otherwise add on the latest message.
+    ///
+    /// Enabling marks the last content part, promoting plain-string content to a
+    /// one-element array first; disabling clears every part but leaves that
+    /// promotion in place.
+    ///
+    /// Returns whether the message carries a breakpoint afterwards. Enabling
+    /// yields `true` for any message with content to mark — only a `function`
+    /// message, an assistant message with no content, or an empty content array
+    /// come back `false`. Disabling always yields `false`.
+    pub fn toggle_cache_breakpoint(&mut self, enabled: bool) -> bool {
+        match self {
+            Self::Developer(m) => m.inner.content.toggle_cache_breakpoint(enabled),
+            Self::System(m) => m.inner.content.toggle_cache_breakpoint(enabled),
+            Self::User(m) => m.inner.content.toggle_cache_breakpoint(enabled),
+            Self::Assistant(m) => m
+                .inner
+                .content
+                .as_mut()
+                .is_some_and(|content| content.toggle_cache_breakpoint(enabled)),
+            Self::Tool(m) => m.inner.content.toggle_cache_breakpoint(enabled),
+            // `function` messages carry a bare string, with no part to mark.
+            Self::Function(_) => false,
+        }
+    }
+
+    /// Mark this message as an explicit cache breakpoint — shorthand for
+    /// `toggle_cache_breakpoint(true)`, and idempotent.
+    pub fn breakpoint(&mut self) -> bool {
+        self.toggle_cache_breakpoint(true)
+    }
+
+    /// Whether this message carries an explicit cache breakpoint.
+    pub fn has_cache_breakpoint(&self) -> bool {
+        match self {
+            Self::Developer(m) => m.inner.content.has_cache_breakpoint(),
+            Self::System(m) => m.inner.content.has_cache_breakpoint(),
+            Self::User(m) => m.inner.content.has_cache_breakpoint(),
+            Self::Assistant(m) => m
+                .inner
+                .content
+                .as_ref()
+                .is_some_and(|content| content.has_cache_breakpoint()),
+            Self::Tool(m) => m.inner.content.has_cache_breakpoint(),
+            Self::Function(_) => false,
+        }
+    }
+
+    /// Collapse lone-text-part content back to a plain string, undoing the
+    /// promotion [`Self::toggle_cache_breakpoint`] does when enabling. Returns
+    /// whether anything collapsed.
+    pub fn compact(&mut self) -> bool {
+        match self {
+            Self::Developer(m) => m.inner.content.compact(),
+            Self::System(m) => m.inner.content.compact(),
+            Self::User(m) => m.inner.content.compact(),
+            Self::Assistant(m) => m.inner.content.as_mut().is_some_and(|c| c.compact()),
+            Self::Tool(m) => m.inner.content.compact(),
+            Self::Function(_) => false,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tools
@@ -1418,49 +1530,25 @@ impl RawExtensibleChatRequestMessage {
         self.0
     }
 
-    /// Toggle an **explicit** cache breakpoint at the end of this message: the
-    /// conversation prefix up to and including it is what gets read from /
-    /// written to the prompt cache. Pair with
-    /// [`prompt_cache_options`](CreateChatCompletionRequestRaw::prompt_cache_options)
-    /// set to [`PromptCacheOptionsRaw::explicit`] to suppress the implicit
-    /// breakpoint the API would otherwise add on the latest message.
-    ///
-    /// Enabling marks the last content part, promoting plain-string content to a
-    /// one-element array first; disabling clears every part but leaves that
-    /// promotion in place.
-    ///
-    /// Returns whether the message carries a breakpoint afterwards. Enabling
-    /// yields `true` for any message with content to mark — only a `function`
-    /// message, an assistant message with no content, or an empty content array
-    /// come back `false`. Disabling always yields `false`.
+    /// See [`ChatCompletionRequestMessageRaw::toggle_cache_breakpoint`].
     pub fn toggle_cache_breakpoint(&mut self, enabled: bool) -> bool {
-        match &mut self.0.inner {
-            ChatCompletionRequestMessageRaw::Developer(m) => {
-                m.inner.content.toggle_cache_breakpoint(enabled)
-            }
-            ChatCompletionRequestMessageRaw::System(m) => {
-                m.inner.content.toggle_cache_breakpoint(enabled)
-            }
-            ChatCompletionRequestMessageRaw::User(m) => {
-                m.inner.content.toggle_cache_breakpoint(enabled)
-            }
-            ChatCompletionRequestMessageRaw::Assistant(m) => m
-                .inner
-                .content
-                .as_mut()
-                .is_some_and(|content| content.toggle_cache_breakpoint(enabled)),
-            ChatCompletionRequestMessageRaw::Tool(m) => {
-                m.inner.content.toggle_cache_breakpoint(enabled)
-            }
-            // `function` messages carry a bare string, with no part to mark.
-            ChatCompletionRequestMessageRaw::Function(_) => false,
-        }
+        self.0.inner.toggle_cache_breakpoint(enabled)
     }
 
     /// Mark this message as an explicit cache breakpoint — shorthand for
     /// `toggle_cache_breakpoint(true)`, and idempotent.
     pub fn breakpoint(&mut self) -> bool {
-        self.toggle_cache_breakpoint(true)
+        self.0.inner.breakpoint()
+    }
+
+    /// Whether this message carries an explicit cache breakpoint.
+    pub fn has_cache_breakpoint(&self) -> bool {
+        self.0.inner.has_cache_breakpoint()
+    }
+
+    /// See [`ChatCompletionRequestMessageRaw::compact`].
+    pub fn compact(&mut self) -> bool {
+        self.0.inner.compact()
     }
 }
 
@@ -1604,6 +1692,63 @@ mod tests {
         assert_eq!(
             v["content"][0]["prompt_cache_breakpoint"]["mode"],
             "explicit"
+        );
+    }
+
+    #[test]
+    fn compact_round_trips_the_promotion_break_does() {
+        let mut msg = user("hello");
+        let plain = serde_json::to_value(&msg).unwrap();
+
+        msg.breakpoint();
+        // Collapsing now would drop the marker, so it refuses.
+        assert!(!msg.compact());
+        assert_eq!(
+            serde_json::to_value(&msg).unwrap()["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+
+        // Clearing the marker leaves the array form behind; compacting undoes it.
+        msg.toggle_cache_breakpoint(false);
+        assert!(msg.compact());
+        assert_eq!(serde_json::to_value(&msg).unwrap(), plain);
+        // Idempotent: plain-string content has nothing to collapse.
+        assert!(!msg.compact());
+    }
+
+    #[test]
+    fn compact_leaves_content_it_cannot_collapse_losslessly() {
+        // More than one part.
+        let mut many: RawExtensibleChatRequestMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "a" },
+                { "type": "text", "text": "b" }
+            ]
+        }))
+        .unwrap();
+        assert!(!many.compact());
+
+        // A lone part, but not a text one.
+        let mut image: RawExtensibleChatRequestMessage =
+            serde_json::from_value(serde_json::json!({
+                "role": "user",
+                "content": [{ "type": "image_url", "image_url": { "url": "https://e.test/i.png" } }]
+            }))
+            .unwrap();
+        assert!(!image.compact());
+
+        // A lone text part carrying an unknown field, which collapsing would drop.
+        let mut extra: RawExtensibleChatRequestMessage =
+            serde_json::from_value(serde_json::json!({
+                "role": "user",
+                "content": [{ "type": "text", "text": "a", "vendor_hint": 1 }]
+            }))
+            .unwrap();
+        assert!(!extra.compact());
+        assert_eq!(
+            serde_json::to_value(&extra).unwrap()["content"][0]["vendor_hint"],
+            1
         );
     }
 

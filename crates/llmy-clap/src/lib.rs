@@ -96,7 +96,39 @@ macro_rules! make_openai_args {
                 default_value_t = true,
                 value_parser = clap::builder::BoolishValueParser::new()
             )]
-            pub auto_strip: bool
+            pub auto_strip: bool,
+
+            /// For requests sent without an explicit `prompt_cache_key`, pick the
+            /// key whose prompt prefix best matches — so consecutive turns of a
+            /// conversation keep hitting the machine that cached them.
+            #[arg(
+                long = concat!($long, "llm-auto-cache-key"),
+                env = concat!($prefix, "LLM_AUTO_CACHE_KEY"),
+                default_value_t = true,
+                value_parser = clap::builder::BoolishValueParser::new()
+            )]
+            pub auto_cache_key: bool,
+
+            /// How long an auto cache key survives without being used, in
+            /// seconds. This only bounds memory: reusing a key whose cache entry
+            /// has lapsed is free, while dropping one early guarantees a miss, so
+            /// the default errs long (4 hours).
+            #[arg(
+                long = concat!($long, "llm-cache-key-ttl"),
+                env = concat!($prefix, "LLM_CACHE_KEY_TTL"),
+                default_value_t = llmy_client::cache_key::DEFAULT_TTL_SECS,
+            )]
+            pub cache_key_ttl: u64,
+
+            /// Requests per minute one auto cache key takes before we spread to
+            /// another. OpenAI steers one key to one machine and warns that
+            /// sustaining more than 15/min costs hit rate.
+            #[arg(
+                long = concat!($long, "llm-cache-key-rpm"),
+                env = concat!($prefix, "LLM_CACHE_KEY_RPM"),
+                default_value_t = llmy_client::cache_key::DEFAULT_MAX_RPM,
+            )]
+            pub cache_key_rpm: u32
         }
 
         impl $struct_name {
@@ -112,6 +144,9 @@ macro_rules! make_openai_args {
                     top_p: self.top_p,
                     reasoning_effort: self.reasoning_effort.clone(),
                     auto_strip: self.auto_strip,
+                    auto_cache_key: self.auto_cache_key,
+                    cache_key_ttl: self.cache_key_ttl,
+                    cache_key_rpm: self.cache_key_rpm,
                 }
             }
 

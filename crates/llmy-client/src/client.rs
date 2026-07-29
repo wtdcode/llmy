@@ -31,6 +31,7 @@ use crate::resp::{
     CreateChatCompletionResponseRaw, CreateChatCompletionStreamResponse, FinishReason,
 };
 
+use crate::cache_key::{CacheKeyClaim, CacheKeys};
 use crate::debug::{self, DebugBackend, DebugRowContext, DebugUsage, PrefixBilling};
 pub use crate::filters::{
     GoogleContentFilter, MarkdownTagFilter, MiMoContentFilter, NoFilter, OpenAIContentFilter,
@@ -192,6 +193,8 @@ impl LLM {
             None => {}
         }
 
+        let cache_keys = CacheKeys::new(settings.cache_key_config());
+
         LLM {
             llm: Arc::new(LLMInner {
                 node: ROOT,
@@ -203,6 +206,7 @@ impl LLM {
                 azure_deployment,
                 default_settings: settings,
                 content_filter: Arc::new(StdRwLock::new(content_filter)),
+                cache_keys,
             }),
         }
     }
@@ -306,6 +310,9 @@ pub struct LLMInner {
     pub azure_deployment: Option<String>,
     pub default_settings: LLMSettings,
     content_filter: Arc<StdRwLock<Box<dyn OpenAIContentFilter>>>,
+    /// Auto `prompt_cache_key` selection, shared with every scope cut from this
+    /// client so a sub-agent continuing a conversation keeps its routing.
+    cache_keys: CacheKeys,
 }
 
 impl Drop for LLMInner {
@@ -343,6 +350,7 @@ impl LLMInner {
             azure_deployment: self.azure_deployment.clone(),
             default_settings: self.default_settings.clone(),
             content_filter: self.content_filter.clone(),
+            cache_keys: self.cache_keys.clone(),
         }
     }
 
@@ -359,6 +367,44 @@ impl LLMInner {
     fn apply_filter_input(&self, req: &mut RawExtensibleChatCompletionRequest) {
         let guard = self.content_filter.read().expect("content_filter poisoned");
         guard.filter_input(req);
+    }
+
+    /// Give a request that came without a `prompt_cache_key` the one that best
+    /// matches what this client has already sent, so consecutive turns of a
+    /// conversation keep landing on the machine holding their cached prefix.
+    ///
+    /// The returned claim must be confirmed once the request is answered, and
+    /// dropped otherwise — see [`CacheKeyClaim`]. A caller-supplied key is never
+    /// second-guessed.
+    #[must_use = "an unconfirmed claim is abandoned on drop"]
+    fn apply_auto_cache_key(
+        &self,
+        req: &mut RawExtensibleChatCompletionRequest,
+    ) -> Option<CacheKeyClaim> {
+        if req.prompt_cache_key.is_some() {
+            return None;
+        }
+        let claim = self.cache_keys.select(req, self.model.cache_policy())?;
+        tracing::debug!("auto prompt cache key {}", claim.key());
+        req.prompt_cache_key = Some(claim.key().to_string());
+        Some(claim)
+    }
+
+    /// Clone `req` with its auto cache key already resolved, so a retry loop
+    /// picks (and charges for) one key rather than one per attempt. The claim
+    /// spans every attempt: a retry is the same logical request.
+    fn with_auto_cache_key(
+        &self,
+        req: &RawExtensibleChatCompletionRequest,
+    ) -> (RawExtensibleChatCompletionRequest, Option<CacheKeyClaim>) {
+        let mut req = req.clone();
+        let claim = self.apply_auto_cache_key(&mut req);
+        (req, claim)
+    }
+
+    /// Snapshot of the auto cache key policy in force for this client.
+    pub fn cache_key_config(&self) -> crate::cache_key::CacheKeyConfig {
+        self.cache_keys.config()
     }
 
     fn apply_filter_output(&self, resp: &mut RawExtensibleChatCompletionResponse) {
@@ -472,6 +518,9 @@ impl LLMInner {
         retry: Option<u64>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
         let retry = retry.unwrap_or(u64::MAX);
+        // Resolve the auto cache key once, not per attempt: it charges the key's
+        // request budget, and a retry is the same logical request.
+        let (req, mut claim) = self.with_auto_cache_key(req);
 
         let mut last = None;
         for idx in 0..retry {
@@ -479,7 +528,12 @@ impl LLMInner {
                 .complete_extensible(req.clone(), debug_prefix, timeout)
                 .await
             {
-                Ok(r) => return Ok(r),
+                Ok(r) => {
+                    if let Some(claim) = claim.take() {
+                        claim.confirm();
+                    }
+                    return Ok(r);
+                }
                 // A billing/cap error is deterministic — retrying can't recover it
                 // (and would keep tripping the pre-flight check), so fail fast.
                 Err(e @ LLMYError::Billing { .. }) => return Err(e),
@@ -505,6 +559,8 @@ impl LLMInner {
         retry: Option<u64>,
     ) -> Result<T, LLMYError> {
         let retry = retry.unwrap_or(u64::MAX);
+        // Resolve the auto cache key once — see the note in the untyped variant.
+        let (req, mut claim) = self.with_auto_cache_key(req);
 
         let mut last = None;
         for idx in 0..retry {
@@ -512,7 +568,12 @@ impl LLMInner {
                 .complete_extensible_typed::<T>(req.clone(), debug_prefix, timeout)
                 .await
             {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    if let Some(claim) = claim.take() {
+                        claim.confirm();
+                    }
+                    return Ok(value);
+                }
                 // A billing/cap error is deterministic — retrying can't recover it
                 // (and would keep tripping the pre-flight check), so fail fast.
                 Err(e @ LLMYError::Billing { .. }) => return Err(e),
@@ -590,6 +651,7 @@ impl LLMInner {
         // Fail fast: if we're already over budget, don't issue the request.
         self.billing.read().unwrap().check_cap(self.node)?;
 
+        let cache_claim = self.apply_auto_cache_key(&mut req);
         self.apply_filter_input(&mut req);
 
         // Keep the raw prefix (None => "") for the per-prefix billing dimension,
@@ -657,9 +719,15 @@ impl LLMInner {
                     let err = format!("{:?}", e);
                     backend.record_error(handle, &err).await;
                 }
+                // `cache_claim` drops here: the prompt was never cached.
                 return Err(e);
             }
         };
+        // The provider answered, so it really did cache this prompt's prefixes.
+        // Settle before the billing check below, which can still bail out.
+        if let Some(claim) = cache_claim {
+            claim.confirm();
+        }
         self.apply_filter_output(&mut resp);
         if let (Some(backend), Some(handle)) = (self.debug_backend.as_ref(), dbg_handle.as_ref()) {
             backend.record_response(handle, &req, &resp).await;
@@ -1108,6 +1176,9 @@ mod tests {
             top_p: None,
             reasoning_effort,
             auto_strip: true,
+            auto_cache_key: true,
+            cache_key_ttl: crate::cache_key::DEFAULT_TTL_SECS,
+            cache_key_rpm: crate::cache_key::DEFAULT_MAX_RPM,
         }
     }
 
@@ -1412,5 +1483,100 @@ mod tests {
         );
         assert_eq!(echoed["tool_calls"][0]["id"], "call_1");
         assert_eq!(echoed["tool_calls"][0]["function"]["name"], "lookup");
+    }
+
+    // --- auto prompt cache key ---------------------------------------------
+
+    /// Resolve a key for `req` and settle it, i.e. a request that was answered.
+    fn landed(llm: &LLM, req: &mut RawExtensibleChatCompletionRequest) {
+        if let Some(claim) = llm.apply_auto_cache_key(req) {
+            claim.confirm();
+        }
+    }
+
+    fn extended(base: &str, more: &str) -> RawExtensibleChatCompletionRequest {
+        let mut req = user_request(base);
+        req.messages
+            .push(WithOtherFields::new(ChatCompletionRequestMessageRaw::User(
+                ChatCompletionRequestUserMessageRaw::new_text(more),
+            )));
+        req
+    }
+
+    #[test]
+    fn auto_cache_key_is_stable_across_turns_and_scopes() {
+        let llm = test_llm();
+
+        let mut turn1 = user_request("hello");
+        landed(&llm, &mut turn1);
+        let key = turn1.prompt_cache_key.clone().expect("auto key");
+
+        // A scope shares the client's registry, so a sub-agent continuing the
+        // same conversation stays on the same machine.
+        let scoped = llm.scope(Some("sub".into()), None);
+        let mut turn2 = extended("hello", "and more");
+        landed(&scoped, &mut turn2);
+        assert_eq!(turn2.prompt_cache_key.as_deref(), Some(&*key));
+
+        // An unrelated conversation must not be pinned to it.
+        let mut other = user_request("something else entirely");
+        landed(&llm, &mut other);
+        assert_ne!(other.prompt_cache_key.as_deref(), Some(&*key));
+    }
+
+    #[test]
+    fn a_request_that_never_landed_leaves_no_claim_behind() {
+        let llm = test_llm();
+
+        // Claim taken, then dropped unconfirmed — the request failed, so nothing
+        // was cached and the prefix must not point anywhere.
+        let mut failed = user_request("hello");
+        drop(llm.apply_auto_cache_key(&mut failed));
+        let stale = failed.prompt_cache_key.clone().expect("auto key");
+
+        let mut retry = user_request("hello");
+        landed(&llm, &mut retry);
+        assert_ne!(retry.prompt_cache_key.as_deref(), Some(&*stale));
+    }
+
+    #[test]
+    fn concurrent_siblings_share_an_in_flight_claim() {
+        let llm = test_llm();
+
+        // Two sub-agents fan out from the same prefix at once. Neither has an
+        // answer yet, but the second must still land on the first one's machine.
+        let mut first = user_request("shared");
+        let first_claim = llm.apply_auto_cache_key(&mut first).expect("auto key");
+        let mut second = extended("shared", "branch");
+        let second_claim = llm.apply_auto_cache_key(&mut second).expect("auto key");
+        assert_eq!(second.prompt_cache_key, first.prompt_cache_key);
+
+        // The first one failing must not strand the second, which is still going.
+        drop(first_claim);
+        let mut third = extended("shared", "other branch");
+        landed(&llm, &mut third);
+        assert_eq!(third.prompt_cache_key, first.prompt_cache_key);
+        second_claim.confirm();
+    }
+
+    #[test]
+    fn a_caller_supplied_cache_key_is_never_overridden() {
+        let llm = test_llm();
+        let mut req = user_request("hello");
+        req.prompt_cache_key = Some("mine".to_string());
+        landed(&llm, &mut req);
+        assert_eq!(req.prompt_cache_key.as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn auto_cache_key_can_be_switched_off() {
+        let llm = test_llm_with(LLMSettings {
+            auto_cache_key: false,
+            ..test_settings(None)
+        });
+        let mut req = user_request("hello");
+        landed(&llm, &mut req);
+        assert!(req.prompt_cache_key.is_none());
+        assert!(!llm.cache_key_config().enabled);
     }
 }

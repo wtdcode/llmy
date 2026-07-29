@@ -97,9 +97,25 @@ pub struct LLMSettings {
     /// When a typed/JSON completion fails to deserialize, retry the parse after
     /// stripping a markdown code fence from the content (see `MarkdownTagFilter`).
     pub auto_strip: bool,
+    /// Pick a `prompt_cache_key` for requests that don't come with one, based on
+    /// what this client has already sent (see [`crate::cache_key`]).
+    pub auto_cache_key: bool,
+    /// How long an auto cache key survives without being used, in seconds.
+    pub cache_key_ttl: u64,
+    /// Requests per minute one auto cache key takes before we spread to another.
+    pub cache_key_rpm: u32,
 }
 
 impl LLMSettings {
+    /// The auto cache key policy these settings describe.
+    pub fn cache_key_config(&self) -> crate::cache_key::CacheKeyConfig {
+        crate::cache_key::CacheKeyConfig {
+            enabled: self.auto_cache_key,
+            ttl: std::time::Duration::from_secs(self.cache_key_ttl),
+            max_rpm: self.cache_key_rpm,
+        }
+    }
+
     pub fn timeout(&self) -> std::time::Duration {
         if self.llm_prompt_timeout == 0 {
             std::time::Duration::MAX

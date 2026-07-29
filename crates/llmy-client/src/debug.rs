@@ -81,6 +81,13 @@ pub fn response_to_string(resp: &ChatCompletionResponseMessage) -> String {
     format!("<{}>\n{}\n</{}>\n", &role, s, &role)
 }
 
+/// Render a request message as the prompt text it stands for: role, content and
+/// tool calls, and nothing that never reaches the model.
+///
+/// Besides the debug dumps, [`crate::cache_key`] identifies cacheable prefixes
+/// by this rendering, so changing the format shifts every auto cache key once.
+/// That costs one round of cache misses, never correctness — but it does mean
+/// the rule "only prompt content goes in here" is load-bearing.
 #[allow(deprecated)]
 pub fn completion_to_string(msg: &ChatCompletionRequestMessage) -> String {
     const CONT: &str = "<cont/>\n";
@@ -157,7 +164,10 @@ pub fn completion_to_string(msg: &ChatCompletionRequestMessage) -> String {
                         format!("<audio>{}</audio>", audio.input_audio.data)
                     }
                     ChatCompletionRequestUserMessageContentPartRaw::File(f) => {
-                        format!("<file>{:?}</file>", f)
+                        // The file itself, not the part wrapper: wrapper fields
+                        // (`prompt_cache_breakpoint`) are not prompt content, and
+                        // `crate::cache_key` identifies prefixes by this render.
+                        format!("<file>{:?}</file>", f.file)
                     }
                 })
                 .join(CONT),

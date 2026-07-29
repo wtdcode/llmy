@@ -1121,6 +1121,9 @@ mod tests {
             top_p: None,
             reasoning_effort: None,
             auto_strip: false,
+            auto_cache_key: true,
+            cache_key_ttl: llmy_client::cache_key::DEFAULT_TTL_SECS,
+            cache_key_rpm: llmy_client::cache_key::DEFAULT_MAX_RPM,
         }
     }
 
