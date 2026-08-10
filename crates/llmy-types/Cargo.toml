@@ -11,7 +11,10 @@ repository.workspace = true
 [dependencies]
 thiserror.workspace = true
 color-eyre.workspace = true
-async-openai.workspace = true
+# `_api` is what gates `OpenAIError::ApiError`, which the policy-refusal
+# classifier below matches on. It is the narrowest feature that exposes it;
+# every real build already has it via `llmy-client`.
+async-openai = { workspace = true, features = ["_api"] }
 serde_json.workspace = true
 schemars.workspace = true
 serde.workspace = true

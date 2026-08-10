@@ -133,7 +133,29 @@ macro_rules! make_openai_args {
                 env = concat!($prefix, "LLM_CACHE_KEY_RPM"),
                 default_value_t = llmy_client::cache_key::DEFAULT_MAX_RPM,
             )]
-            pub cache_key_rpm: u32
+            pub cache_key_rpm: u32,
+
+            /// Log the running billing total at INFO once every this many
+            /// tokens; the requests in between log it at DEBUG. Set to 0 to put
+            /// every request back at INFO.
+            #[arg(
+                long = concat!($long, "llm-billing-log-tokens"),
+                env = concat!($prefix, "LLM_BILLING_LOG_TOKENS"),
+                default_value_t = 1_000_000,
+            )]
+            pub billing_log_tokens: u64,
+
+            /// How far the local token estimate may drift from the provider's
+            /// own count, in percent, before the comparison is logged at INFO
+            /// rather than DEBUG. A large drift means the tokenizer config for
+            /// this model is off. The estimator renders messages its own way, so
+            /// it sits a few percent high even when healthy — hence the slack.
+            #[arg(
+                long = concat!($long, "llm-token-estimate-pct"),
+                env = concat!($prefix, "LLM_TOKEN_ESTIMATE_PCT"),
+                default_value_t = 10.0,
+            )]
+            pub token_estimate_pct: f64
         }
 
         impl $struct_name {
@@ -152,6 +174,8 @@ macro_rules! make_openai_args {
                     auto_cache_key: self.auto_cache_key,
                     cache_key_ttl: self.cache_key_ttl,
                     cache_key_rpm: self.cache_key_rpm,
+                    billing_log_tokens: self.billing_log_tokens,
+                    token_estimate_pct: self.token_estimate_pct,
                 }
             }
 

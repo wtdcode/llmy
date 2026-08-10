@@ -399,6 +399,24 @@ impl LLMInner {
             .unwrap_or_default() as u64
     }
 
+    /// Whether this request's billing line should go to INFO rather than DEBUG:
+    /// true once every `billing_log_tokens` of the client's traffic.
+    ///
+    /// `running` is the client's total after this request, `just_billed` this
+    /// request's own slice of it, so the request owns the interval
+    /// `(running - just_billed, running]` and reports if a multiple of the
+    /// threshold falls inside it. That needs no counter of its own: the
+    /// intervals of all requests tile the total exactly once, whatever order
+    /// concurrent scopes finish in, so every boundary is reported exactly once.
+    fn billing_line_due(&self, running: TokenUsage, just_billed: TokenUsage) -> bool {
+        let every = self.default_settings.billing_log_tokens;
+        if every == 0 {
+            return true;
+        }
+        let total = running.total();
+        total / every != total.saturating_sub(just_billed.total()) / every
+    }
+
     /// Snapshot of the auto cache key policy in force for this client.
     pub fn cache_key_config(&self) -> crate::cache_key::CacheKeyConfig {
         self.cache_keys.config()
@@ -533,7 +551,7 @@ impl LLMInner {
                 Ok(r) => return Ok(r),
                 // A billing/cap error is deterministic — retrying can't recover it
                 // (and would keep tripping the pre-flight check), so fail fast.
-                Err(e @ LLMYError::Billing { .. }) => return Err(e),
+                Err(e @ LLMYError::Billing(_)) => return Err(e),
                 Err(e) => {
                     tracing::warn!("Having an error {} during {} retry", e, idx);
                     last = Some(Err(e));
@@ -576,7 +594,7 @@ impl LLMInner {
                 Ok(value) => return Ok(value),
                 // A billing/cap error is deterministic — retrying can't recover it
                 // (and would keep tripping the pre-flight check), so fail fast.
-                Err(e @ LLMYError::Billing { .. }) => return Err(e),
+                Err(e @ LLMYError::Billing(_)) => return Err(e),
                 Err(e) => {
                     tracing::warn!("Having an error {} during {} retry", e, idx);
                     last = Some(Err(e));
@@ -769,6 +787,7 @@ impl LLMInner {
             backend.record_response(handle, &req, &resp).await;
         }
 
+        let mut billed: Option<(TokenBilling, TokenUsage)> = None;
         let output_tokens = if let Some(usage) = &resp.usage {
             let prompt_details = usage.prompt_tokens_details.as_ref();
             let cached = prompt_details
@@ -802,9 +821,14 @@ impl LLMInner {
             let debug_snapshot = {
                 let mut tree = self.billing.write().unwrap();
                 tree.record(self.node, billing_prefix, &self.model, delta)?;
+                // Snapshot under the same lock as the record, so this request's
+                // slice of the running total is exactly `total - billed` even
+                // when other scopes are recording concurrently.
+                let snapshot = tree.root_snapshot();
+                billed = Some((snapshot, delta));
                 self.debug_backend
                     .as_ref()
-                    .map(|_| (tree.root_snapshot(), tree.usage_by_prefix()))
+                    .map(|_| (snapshot, tree.usage_by_prefix()))
             };
 
             if let (Some(backend), Some(handle), Some((snapshot, prefix_usage))) = (
@@ -843,12 +867,23 @@ impl LLMInner {
                 } else {
                     0.0
                 };
-                tracing::info!(
-                    "Token estimate: {} estimated vs {} actual (diff {:.1}%)",
-                    est,
-                    usage.prompt_tokens,
-                    pct
-                );
+                // A small drift is just tokenizer noise; a large one means this
+                // model's tokenizer config is wrong and is worth surfacing.
+                if pct > self.default_settings.token_estimate_pct {
+                    tracing::info!(
+                        "Token estimate: {} estimated vs {} actual (diff {:.1}%)",
+                        est,
+                        usage.prompt_tokens,
+                        pct
+                    );
+                } else {
+                    tracing::debug!(
+                        "Token estimate: {} estimated vs {} actual (diff {:.1}%)",
+                        est,
+                        usage.prompt_tokens,
+                        pct
+                    );
+                }
             }
 
             usage.completion_tokens
@@ -861,17 +896,36 @@ impl LLMInner {
             .duration_since(now)
             .map(|v| v.as_secs_f64())
             .unwrap_or_default();
-        let billing_snapshot = self.billing.read().unwrap().root_snapshot();
-        tracing::info!(
-            "Usage: {}, Speed: {:.2} tok/s (client={:?})",
-            billing_snapshot,
-            if delta.is_normal() && delta.is_sign_positive() {
-                output_tokens as f64 / delta
-            } else {
-                0.0f64
-            },
-            self.debug_backend.as_ref().and_then(|v| v.client_id())
-        );
+        let (billing_snapshot, promote) = match billed {
+            Some((snapshot, just_billed)) => (
+                snapshot,
+                self.billing_line_due(snapshot.tokens, just_billed),
+            ),
+            // No usage came back, so nothing was billed: still report the
+            // running total, but don't spend an INFO slot on it.
+            None => (self.billing.read().unwrap().root_snapshot(), false),
+        };
+        let speed = if delta.is_normal() && delta.is_sign_positive() {
+            output_tokens as f64 / delta
+        } else {
+            0.0f64
+        };
+        let client = self.debug_backend.as_ref().and_then(|v| v.client_id());
+        if promote {
+            tracing::info!(
+                "Usage: {}, Speed: {:.2} tok/s (client={:?})",
+                billing_snapshot,
+                speed,
+                client
+            );
+        } else {
+            tracing::debug!(
+                "Usage: {}, Speed: {:.2} tok/s (client={:?})",
+                billing_snapshot,
+                speed,
+                client
+            );
+        }
         Ok(resp)
     }
 
@@ -1215,6 +1269,8 @@ mod tests {
             auto_cache_key: true,
             cache_key_ttl: crate::cache_key::DEFAULT_TTL_SECS,
             cache_key_rpm: crate::cache_key::DEFAULT_MAX_RPM,
+            billing_log_tokens: 100_000,
+            token_estimate_pct: 10.0,
         }
     }
 
@@ -1292,7 +1348,7 @@ mod tests {
             .complete_extensible_once_with_retry(&req, None, Some(Duration::from_secs(5)), Some(8))
             .await
             .unwrap_err();
-        assert!(matches!(err, LLMYError::Billing { .. }), "got {err:?}");
+        assert!(matches!(err, LLMYError::Billing(_)), "got {err:?}");
     }
 
     #[test]
@@ -1622,6 +1678,124 @@ mod tests {
         let mut given = user_request("hello");
         given.prompt_cache_key = Some("mine".into());
         assert!(llm.auto_cache_key(&given, None).is_none());
+    }
+
+    #[test]
+    fn the_billing_line_is_promoted_once_per_interval_crossed() {
+        let llm = test_llm_with(LLMSettings {
+            billing_log_tokens: 1000,
+            ..test_settings(None)
+        });
+        // Each request owns the interval (running - billed, running] and reports
+        // if a multiple of 1000 lands inside it.
+        assert!(!llm.billing_line_due(tokens(500), tokens(500))); // (0, 500]
+        assert!(llm.billing_line_due(tokens(1200), tokens(700))); // (500, 1200] crosses 1000
+        assert!(!llm.billing_line_due(tokens(1900), tokens(700))); // (1200, 1900]
+        assert!(llm.billing_line_due(tokens(2100), tokens(200))); // (1900, 2100] crosses 2000
+
+        // One request spanning several intervals still reports just once.
+        assert!(llm.billing_line_due(tokens(9000), tokens(6900)));
+        // Nothing billed, nothing to report.
+        assert!(!llm.billing_line_due(tokens(9000), tokens(0)));
+    }
+
+    #[test]
+    fn interleaved_requests_cover_every_boundary_exactly_once() {
+        let llm = test_llm_with(LLMSettings {
+            billing_log_tokens: 1000,
+            ..test_settings(None)
+        });
+        // Concurrent scopes land in whatever order; their intervals still tile
+        // the running total, which is what makes the counter unnecessary.
+        let mut running = 0;
+        let mut promoted = Vec::new();
+        for billed in [300u64, 1500, 900, 50, 2250] {
+            let before = running;
+            running += billed;
+            if llm.billing_line_due(tokens(running), tokens(billed)) {
+                promoted.push((before, running));
+            }
+        }
+        assert_eq!(running, 5000);
+
+        // Every boundary in the run is inside exactly one promoted interval —
+        // none missed, none reported twice.
+        for boundary in (1000..=running).step_by(1000) {
+            let covering = promoted
+                .iter()
+                .filter(|(start, end)| *start < boundary && boundary <= *end)
+                .count();
+            assert_eq!(covering, 1, "boundary {boundary}");
+        }
+        // And nothing was promoted that had no boundary to report. Fewer lines
+        // than boundaries because the last request swallowed three at once.
+        assert_eq!(promoted.len(), 3);
+    }
+
+    /// A usage carrying `n` tokens, for the billing-line interval maths.
+    fn tokens(n: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: n,
+            ..Default::default()
+        }
+    }
+
+    /// Deterministic xorshift, so the sweep below is reproducible without a
+    /// `rand` dev-dependency.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn every_boundary_is_covered_exactly_once_for_any_split() {
+        let mut seed = 0x5eed_1234_9abc_def0u64;
+        // Sweep interval sizes against request sizes that are far smaller,
+        // comparable and far larger than the interval, plus zero-token requests.
+        for every in [1u64, 7, 1000, 100_000] {
+            let llm = test_llm_with(LLMSettings {
+                billing_log_tokens: every,
+                ..test_settings(None)
+            });
+            for spread in [1u64, every.max(1), every.saturating_mul(4)] {
+                let mut running = 0u64;
+                let mut promoted: Vec<(u64, u64)> = Vec::new();
+
+                for _ in 0..200 {
+                    // Zero-token requests are real: a provider can answer
+                    // without reporting usage of its own.
+                    let billed = xorshift(&mut seed) % (spread + 1);
+                    let before = running;
+                    running += billed;
+                    if llm.billing_line_due(tokens(running), tokens(billed)) {
+                        promoted.push((before, running));
+                    }
+                }
+
+                // Each promoted line must own at least one boundary...
+                for (start, end) in &promoted {
+                    assert!(
+                        (start / every) != (end / every),
+                        "every={every} spread={spread}: promoted [{start}, {end}) with no boundary"
+                    );
+                }
+                // ...and every boundary in the run must be owned by exactly one.
+                let mut boundary = every;
+                while boundary <= running {
+                    let owners = promoted
+                        .iter()
+                        .filter(|(start, end)| *start < boundary && boundary <= *end)
+                        .count();
+                    assert_eq!(
+                        owners, 1,
+                        "every={every} spread={spread}: boundary {boundary} owned by {owners}"
+                    );
+                    boundary += every;
+                }
+            }
+        }
     }
 
     #[test]

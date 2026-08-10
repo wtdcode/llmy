@@ -104,6 +104,12 @@ pub struct LLMSettings {
     pub cache_key_ttl: u64,
     /// Requests per minute one auto cache key takes before we spread to another.
     pub cache_key_rpm: u32,
+    /// Emit the running billing line at INFO once every this many tokens; every
+    /// other request logs it at DEBUG. `0` puts every request at INFO.
+    pub billing_log_tokens: u64,
+    /// How far the local token estimate may drift from the provider's count, in
+    /// percent, before the comparison is logged at INFO instead of DEBUG.
+    pub token_estimate_pct: f64,
 }
 
 impl LLMSettings {

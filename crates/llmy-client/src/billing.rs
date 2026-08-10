@@ -3,7 +3,7 @@ use std::fmt::Display;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
 use crate::model::OpenAIModel;
-use llmy_types::error::LLMYError;
+use llmy_types::error::{BillingExhausted, LLMYError};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +63,16 @@ impl TokenUsage {
             + Decimal::from(self.cache_tokens) * cache_read_price
             + Decimal::from(self.cache_write_tokens) * cache_write_price
     }
+    /// Every token this usage covers: input plus output.
+    ///
+    /// `cache_tokens` and `cache_write_tokens` are slices of `input_tokens`, and
+    /// `reasoning_tokens` is a slice of `output_tokens`, so adding those in
+    /// would double count. Saturating rather than panicking like [`Add`],
+    /// because callers use this to *report* on usage and must not blow up.
+    pub fn total(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
     pub fn output_cost(&self, model: &OpenAIModel) -> Decimal {
         let pricing = model.pricing();
         Decimal::from(self.output_tokens) * pricing.output
@@ -345,12 +355,12 @@ impl BillingTree {
             n.billing.current += dcost;
             hit_root |= id == ROOT;
             if violation.is_none() && !n.billing.in_cap() {
-                violation = Some(LLMYError::Billing {
+                violation = Some(LLMYError::Billing(BillingExhausted {
                     cap: n.billing.cap,
                     current: n.billing.current,
                     node: id,
                     scope: n.name.clone(),
-                });
+                }));
             }
             cur = n.parent;
         }
@@ -361,12 +371,12 @@ impl BillingTree {
             root.billing.tokens += delta;
             root.billing.current += dcost;
             if violation.is_none() && !root.billing.in_cap() {
-                violation = Some(LLMYError::Billing {
+                violation = Some(LLMYError::Billing(BillingExhausted {
                     cap: root.billing.cap,
                     current: root.billing.current,
                     node: ROOT,
                     scope: root.name.clone(),
-                });
+                }));
             }
         }
 
@@ -393,12 +403,12 @@ impl BillingTree {
                 break; // stale handle to a removed scope
             };
             if !n.billing.in_cap() {
-                return Err(LLMYError::Billing {
+                return Err(LLMYError::Billing(BillingExhausted {
                     cap: n.billing.cap,
                     current: n.billing.current,
                     node: id,
                     scope: n.name.clone(),
-                });
+                }));
             }
             saw_root |= id == ROOT;
             cur = n.parent;
@@ -406,12 +416,12 @@ impl BillingTree {
         if !saw_root {
             let root = self.nodes.get(&ROOT).expect("root node always present");
             if !root.billing.in_cap() {
-                return Err(LLMYError::Billing {
+                return Err(LLMYError::Billing(BillingExhausted {
                     cap: root.billing.cap,
                     current: root.billing.current,
                     node: ROOT,
                     scope: root.name.clone(),
-                });
+                }));
             }
         }
         Ok(())
@@ -565,6 +575,14 @@ mod tests {
     }
 
     #[test]
+    fn total_is_input_plus_output_only() {
+        // The cache and reasoning counts are slices of those two, so a naive
+        // sum of every field would count them twice.
+        let u = usage(100, 40, 20, 12, 5);
+        assert_eq!(u.total(), 140);
+    }
+
+    #[test]
     fn token_usage_add_is_field_wise() {
         let a = usage(100, 40, 20, 12, 5);
         let b = usage(30, 10, 8, 3, 2);
@@ -681,12 +699,12 @@ mod tests {
         let err = tree.record(sub, None, &model, input(5)).unwrap_err(); // 13 > 10
 
         match err {
-            LLMYError::Billing {
+            LLMYError::Billing(BillingExhausted {
                 cap,
                 current,
                 node,
                 scope,
-            } => {
+            }) => {
                 assert_eq!(cap, rust_decimal::dec!(10));
                 assert_eq!(current, rust_decimal::dec!(13));
                 assert_eq!(node, sub);
@@ -704,7 +722,7 @@ mod tests {
         let mut tree = BillingTree::new(rust_decimal::dec!(10)); // tight root
         let err = tree.record(ROOT, None, &model, input(11)).unwrap_err();
         match err {
-            LLMYError::Billing { node, cap, .. } => {
+            LLMYError::Billing(BillingExhausted { node, cap, .. }) => {
                 assert_eq!(node, ROOT);
                 assert_eq!(cap, rust_decimal::dec!(10));
             }
@@ -723,7 +741,7 @@ mod tests {
         // So the child itself is the (deepest) scope that blows the budget.
         let err = tree.record(sub, None, &model, input(11)).unwrap_err();
         match err {
-            LLMYError::Billing { node, cap, .. } => {
+            LLMYError::Billing(BillingExhausted { node, cap, .. }) => {
                 assert_eq!(node, sub);
                 assert_eq!(cap, rust_decimal::dec!(10));
             }
@@ -776,13 +794,51 @@ mod tests {
         // Pre-flight now refuses, naming the offending scope, and records nothing.
         let before = tree.node_snapshot(sub).tokens;
         match tree.check_cap(sub).unwrap_err() {
-            LLMYError::Billing { node, scope, .. } => {
+            LLMYError::Billing(BillingExhausted { node, scope, .. }) => {
                 assert_eq!(node, sub);
                 assert_eq!(scope.as_deref(), Some("limited"));
             }
             other => panic!("expected Billing, got {other:?}"),
         }
         assert_eq!(tree.node_snapshot(sub).tokens, before); // check_cap is read-only
+    }
+
+    #[test]
+    fn root_total_is_the_running_sum_of_every_delta() {
+        // Load-bearing for the billing-line throttle in `client`: it derives
+        // "the total before this request" as `root_total - delta`, which only
+        // holds if root receives each delta exactly once, no matter which scope
+        // issued it or whether that scope is still alive.
+        let model = model_1usd();
+        let mut tree = BillingTree::new(rust_decimal::dec!(100_000));
+        let stage = tree.alloc_child(ROOT, Some("stage".into()), None);
+        let sub = tree.alloc_child(stage, Some("sub".into()), None);
+        let orphan = tree.alloc_child(stage, Some("orphan".into()), None);
+        tree.remove(orphan); // recording through it takes the `!hit_root` path
+
+        let mut expected = TokenUsage::default();
+        for (node, delta) in [
+            (ROOT, usage(10, 1, 0, 0, 0)),
+            (stage, usage(20, 2, 0, 0, 0)),
+            (sub, usage(30, 3, 0, 0, 0)),
+            (orphan, usage(40, 4, 0, 0, 0)),
+            (sub, usage(50, 5, 0, 0, 0)),
+        ] {
+            let before = tree.root_snapshot().tokens;
+            tree.record(node, None, &model, delta).unwrap();
+            let after = tree.root_snapshot().tokens;
+
+            // Exactly one application of the delta, so the client can recover
+            // its own slice by subtracting.
+            assert_eq!(after, before + delta, "node {node}");
+            expected += delta;
+            assert_eq!(after, expected);
+            assert_eq!(after.total() - before.total(), delta.total(), "node {node}");
+        }
+
+        // A scope only sees its own subtree, which is why the throttle reads
+        // root rather than the calling scope.
+        assert!(tree.node_snapshot(sub).tokens.total() < tree.root_snapshot().tokens.total());
     }
 
     #[test]
