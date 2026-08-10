@@ -121,6 +121,8 @@ pub mod tokenizer {
     pub use llmy_tokenizer::*;
 }
 
+/// Re-export of `BillingExhausted`
+pub use llmy_types::error::BillingExhausted;
 /// Common llmy error type shared across agent, tool, and client layers.
 pub use llmy_types::error::LLMYError;
 
