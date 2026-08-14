@@ -55,7 +55,7 @@ pub mod agent;
 pub mod mcp;
 pub mod tool;
 
-pub use agent::StepResult;
+pub use agent::{AgentEvent, AgentEvents, StepResult};
 pub use llmy_agent_derive::tool;
 pub use llmy_types::error::LLMYError;
 pub use tool::{Tool, ToolDyn};

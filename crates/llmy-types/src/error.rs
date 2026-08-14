@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneralToolCall {
     pub tool_id: String,
     pub tool_name: String,

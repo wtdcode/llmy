@@ -17,7 +17,7 @@ color-eyre.workspace = true
 async-openai = { workspace = true, features = ["_api"] }
 serde_json.workspace = true
 schemars.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
 rmcp = { workspace = true, features = ["server", "client"] }
 tokio.workspace = true
 rust_decimal = { workspace = true }
