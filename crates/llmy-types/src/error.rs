@@ -42,6 +42,29 @@ impl Display for BillingExhausted {
     }
 }
 
+/// A failed request rendered for a debug record, as `{"error": {...}}`.
+///
+/// The typed error is decomposed rather than stringified, so a failure can be
+/// grouped by `kind` and its interesting cases picked out in SQL — previously
+/// this was a bare `Debug` rendering, and reading it back meant regexing prose.
+/// `detail` keeps that rendering for the cases the fields do not cover.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorPayload {
+    pub error: ErrorFields,
+}
+
+/// The decomposed fields inside [`ErrorPayload`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorFields {
+    pub kind: &'static str,
+    pub message: String,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filtered: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing: Option<BillingExhausted>,
+}
+
 /// The link OpenAI puts in its cybersecurity-filter refusal.
 ///
 /// That refusal carries nothing machine-readable — it arrives as a plain
@@ -117,6 +140,41 @@ impl LLMYError {
                 None => None,
             }),
             _ => None,
+        }
+    }
+
+    /// Machine-readable name of this variant, so recorded failures can be
+    /// grouped and filtered without parsing prose out of a `Debug` rendering.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::IO(_) => "io",
+            Self::OpenAI(_) => "openai",
+            Self::STDJSON(_) => "json",
+            Self::Billing(_) => "billing",
+            Self::IncorrectToolCall(..) => "incorrect_tool_call",
+            Self::ToolCallError(..) => "tool_call",
+            Self::Filtered(_) => "filtered",
+            Self::EmptyChoice => "empty_choice",
+            Self::OutputLength => "output_length",
+            Self::McpServerInit(_) => "mcp_server_init",
+            Self::McpClientInit(_) => "mcp_client_init",
+            Self::McpService(_) => "mcp_service",
+            Self::McpJoin(_) => "mcp_join",
+            Self::Other(_) => "other",
+        }
+    }
+
+    /// Render this error for a debug record; see [`ErrorPayload`] for why the
+    /// variant is decomposed instead of stringified.
+    pub fn payload(&self) -> ErrorPayload {
+        ErrorPayload {
+            error: ErrorFields {
+                kind: self.kind(),
+                message: self.to_string(),
+                detail: format!("{self:?}"),
+                filtered: self.filtered().map(str::to_string),
+                billing: self.billing_exhaustion(),
+            },
         }
     }
 
@@ -278,5 +336,49 @@ mod tests {
 
         // Anything else has none.
         assert!(LLMYError::EmptyChoice.billing_exhaustion().is_none());
+    }
+
+    #[test]
+    fn a_refusal_payload_records_its_kind_and_message_not_just_a_blob() {
+        let payload =
+            serde_json::to_value(LLMYError::Filtered("flagged for cyber".into()).payload())
+                .expect("serialize payload");
+        let error = &payload["error"];
+
+        assert_eq!(error["kind"], "filtered");
+        assert_eq!(error["message"], "response filtered: flagged for cyber");
+        // The interesting part is pulled out, so it is greppable in SQL rather
+        // than buried in the `Debug` text.
+        assert_eq!(error["filtered"], "flagged for cyber");
+        assert!(
+            error["detail"]
+                .as_str()
+                .expect("detail is a string")
+                .contains("Filtered")
+        );
+        assert!(error.get("billing").is_none());
+    }
+
+    #[test]
+    fn a_cap_exhaustion_payload_records_the_structured_billing_details() {
+        let payload =
+            serde_json::to_value(LLMYError::Billing(exhausted(Some("planner"))).payload())
+                .expect("serialize payload");
+        let error = &payload["error"];
+
+        assert_eq!(error["kind"], "billing");
+        assert_eq!(error["billing"]["node"], 7);
+        assert_eq!(error["billing"]["scope"], "planner");
+        assert!(error.get("filtered").is_none());
+    }
+
+    #[test]
+    fn an_unremarkable_error_payload_still_records_kind_and_message() {
+        let payload =
+            serde_json::to_value(LLMYError::EmptyChoice.payload()).expect("serialize payload");
+        assert_eq!(payload["error"]["kind"], "empty_choice");
+        assert_eq!(payload["error"]["message"], "no choice is returned");
+        assert!(payload["error"].get("filtered").is_none());
+        assert!(payload["error"].get("billing").is_none());
     }
 }

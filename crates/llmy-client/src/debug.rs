@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 
 use color_eyre::eyre::eyre;
 use itertools::Itertools;
-use llmy_types::error::LLMYError;
+use llmy_types::error::{ErrorPayload, LLMYError};
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sqlx::{
@@ -932,8 +932,8 @@ impl Sqlite3DebugDB {
         Ok(())
     }
 
-    async fn update_error(&self, row_id: i64, error: &str) -> Result<(), LLMYError> {
-        let payload = serde_json::to_string(&serde_json::json!({ "error": error }))?;
+    async fn update_error(&self, row_id: i64, payload: &ErrorPayload) -> Result<(), LLMYError> {
+        let payload = serde_json::to_string(payload)?;
         sqlx::query("UPDATE llm_debug SET raw_resp = ? WHERE id = ?")
             .bind(payload)
             .bind(row_id)
@@ -1030,15 +1030,16 @@ impl DebugBackend {
         }
     }
 
-    pub async fn record_error(&self, handle: &DebugHandle, error: &str) {
+    pub async fn record_error(&self, handle: &DebugHandle, error: &LLMYError) {
+        let payload = error.payload();
         match (self, handle) {
             (DebugBackend::Sqlite3(db), DebugHandle::Sqlite3 { row_id }) => {
-                if let Err(e) = db.update_error(*row_id, error).await {
+                if let Err(e) = db.update_error(*row_id, &payload).await {
                     tracing::warn!("Fail to record debug error: {}", e);
                 }
             }
             (DebugBackend::Folder(_), DebugHandle::Folder { fpath }) => {
-                if let Err(je) = rewrite_json(fpath, &serde_json::json!({ "error": error })).await {
+                if let Err(je) = rewrite_json(fpath, &payload).await {
                     tracing::warn!("can not save error: {} due to json error {}", error, je);
                 }
             }

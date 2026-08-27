@@ -769,8 +769,7 @@ impl LLMInner {
                 if let (Some(backend), Some(handle)) =
                     (self.debug_backend.as_ref(), dbg_handle.as_ref())
                 {
-                    let err = format!("{:?}", e);
-                    backend.record_error(handle, &err).await;
+                    backend.record_error(handle, &e).await;
                 }
                 // This attempt's clone drops here without settling; the caller
                 // still holds the claim for a retry, or drops it to abandon.
