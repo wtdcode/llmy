@@ -23,21 +23,27 @@ use crate::req::{
     ChatCompletionMessageToolCallRaw, ChatCompletionMessageToolCalls,
     ChatCompletionMessageToolCallsRaw, ChatCompletionRequestMessageRaw,
     ChatCompletionRequestSystemMessageRaw, ChatCompletionRequestUserMessageRaw,
-    ChatCompletionStreamOptionsRaw, ChatCompletionToolChoiceOptionRaw, ChatCompletionTools,
-    CreateChatCompletionRequestRaw, FunctionCallRaw, Role, ToolChoiceOptions,
+    ChatCompletionStreamOptionsRaw, ChatCompletionTools, CreateChatCompletionRequestRaw,
+    FunctionCallRaw, Role,
 };
 use crate::resp::{
     ChatChoice, ChatChoiceRaw, ChatCompletionResponseMessageRaw, CompletionUsage,
     CreateChatCompletionResponseRaw, CreateChatCompletionStreamResponse, FinishReason,
 };
 
-use crate::cache_key::{CacheKeyClaim, CacheKeys};
-use crate::debug::{self, DebugBackend, DebugRowContext, DebugUsage, PrefixBilling};
-pub use crate::filters::{
-    GoogleContentFilter, MarkdownTagFilter, MiMoContentFilter, NoFilter, OpenAIContentFilter,
+pub use crate::anthropic::{AnthropicConfig, DEFAULT_ANTHROPIC_VERSION};
+use crate::anthropic::{
+    AnthropicMessagesRequest, AnthropicMessagesRequestRaw, AnthropicMessagesResponse,
+    AnthropicStreamAccumulator, AnthropicStreamEvent,
 };
+use crate::cache_key::{CacheKeyClaim, CacheKeys, CacheShape};
+use crate::debug::{self, DebugBackend, DebugRequest, DebugRowContext, DebugUsage, PrefixBilling};
+pub use crate::filters::{GoogleContentFilter, MarkdownTagFilter, NoFilter, OpenAIContentFilter};
 pub use crate::req::{RawExtensibleChatCompletionRequest, RawExtensibleChatRequestMessage};
 pub use crate::resp::{RawExtensibleChatChoice, RawExtensibleChatCompletionResponse};
+use crate::responses::{
+    ResponsesRequest, ResponsesRequestRaw, ResponsesResponse, ResponsesStreamEvent,
+};
 use crate::{
     billing::{BillingTree, NodeId, ROOT, TokenBilling, TokenUsage},
     settings::{LLMSettings, Reasoning},
@@ -57,6 +63,12 @@ pub enum SupportedConfig {
         deployment_id: String,
     },
     OpenAI(OpenAIConfig),
+    /// Anthropic Messages protocol at an OpenAI-style base URL (e.g.
+    /// `https://api.anthropic.com/v1`).
+    Anthropic(AnthropicConfig),
+    /// OpenAI Responses protocol; same auth and base URL shape as
+    /// [`Self::OpenAI`], different wire format.
+    OpenAIResponses(OpenAIConfig),
 }
 
 impl SupportedConfig {
@@ -79,10 +91,27 @@ impl SupportedConfig {
         Self::OpenAI(cfg)
     }
 
+    /// Anthropic Messages protocol. `endpoint` should include the version
+    /// segment (e.g. `https://api.anthropic.com/v1`); `version` is the
+    /// `anthropic-version` header value, see [`DEFAULT_ANTHROPIC_VERSION`].
+    pub fn new_anthropic(endpoint: &str, key: &str, version: &str) -> Self {
+        Self::Anthropic(AnthropicConfig::new(endpoint, key, version))
+    }
+
+    /// OpenAI Responses protocol at an OpenAI-style base URL.
+    pub fn new_responses(endpoint: &str, key: &str) -> Self {
+        let cfg = OpenAIConfig::new()
+            .with_api_base(endpoint)
+            .with_api_key(key);
+        Self::OpenAIResponses(cfg)
+    }
+
     pub fn endpoint_kind(&self) -> &'static str {
         match self {
             Self::Azure { .. } => "azure",
             Self::OpenAI(_) => "openai",
+            Self::Anthropic(_) => "anthropic",
+            Self::OpenAIResponses(_) => "openai-responses",
         }
     }
 
@@ -93,21 +122,28 @@ impl SupportedConfig {
         match self {
             Self::Azure { config, .. } => config.api_base(),
             Self::OpenAI(cfg) => cfg.api_base(),
+            Self::Anthropic(cfg) => cfg.api_base(),
+            Self::OpenAIResponses(cfg) => cfg.api_base(),
         }
     }
 
     pub fn azure_deployment(&self) -> Option<&str> {
         match self {
             Self::Azure { deployment_id, .. } => Some(deployment_id),
-            Self::OpenAI(_) => None,
+            Self::OpenAI(_) | Self::Anthropic(_) | Self::OpenAIResponses(_) => None,
         }
     }
 }
 
+/// The protocol-speaking inner client. Everything above it (billing, debug
+/// records, filters, cache keys) works on chat-completion types; each variant
+/// converts to and from its own wire format at this boundary.
 #[derive(Debug, Clone)]
 pub enum LLMClient {
     Azure(Client<AzureConfig>),
     OpenAI(Client<OpenAIConfig>),
+    Anthropic(Client<AnthropicConfig>),
+    Responses(Client<OpenAIConfig>),
 }
 
 /// SSE stream of [`CreateChatCompletionStreamResponse`] chunks until the
@@ -118,24 +154,111 @@ pub type ChatCompletionResponseStream = std::pin::Pin<
     Box<dyn futures::Stream<Item = Result<CreateChatCompletionStreamResponse, OpenAIError>> + Send>,
 >;
 
+/// SSE stream of one protocol's own event objects (Anthropic / Responses),
+/// aggregated back into a full chat-completion response by
+/// [`LLMClient::complete_streaming_extensible`].
+type ProtocolEventStream<E> =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<E, OpenAIError>> + Send>>;
+
 impl LLMClient {
     pub fn new(config: SupportedConfig) -> Self {
         match config {
             SupportedConfig::Azure { config, .. } => Self::Azure(Client::with_config(config)),
             SupportedConfig::OpenAI(cfg) => Self::OpenAI(Client::with_config(cfg)),
+            SupportedConfig::Anthropic(cfg) => Self::Anthropic(Client::with_config(cfg)),
+            SupportedConfig::OpenAIResponses(cfg) => Self::Responses(Client::with_config(cfg)),
         }
     }
 
-    pub async fn create_chat_extensible(
-        &self,
-        req: &RawExtensibleChatCompletionRequest,
-    ) -> Result<RawExtensibleChatCompletionResponse, OpenAIError> {
+    /// Which wire protocol this client speaks.
+    pub fn protocol(&self) -> &'static str {
         match self {
-            Self::Azure(cl) => cl.chat().create_byot(req).await,
-            Self::OpenAI(cl) => cl.chat().create_byot(req).await,
+            Self::Azure(_) | Self::OpenAI(_) => "chat-completion",
+            Self::Anthropic(_) => "anthropic",
+            Self::Responses(_) => "responses",
         }
     }
 
+    /// Resolve a request against this client's protocol. Only one path is
+    /// unconditional: a request already in the backend's wire format passes
+    /// through verbatim. Everything else — chat structs included — is an
+    /// implicit conversion through the chat hub, allowed only when
+    /// `allow_implicit_convert` is set (`LLMY_ALLOW_IMPLICIT_CONVERT`):
+    /// rewriting a request into another protocol should be a conscious
+    /// choice. `default_max_output_tokens` backs the Anthropic protocol's
+    /// mandatory `max_tokens` when a converted request carries no bound of
+    /// its own.
+    pub fn resolve_request(
+        &self,
+        req: LLMRequest,
+        default_max_output_tokens: u32,
+        allow_implicit_convert: bool,
+    ) -> Result<LLMRequest, LLMYError> {
+        let req = match (self, req) {
+            // Already in the backend's own format: send exactly as given.
+            (Self::Azure(_) | Self::OpenAI(_), req @ LLMRequest::Chat(_))
+            | (Self::Anthropic(_), req @ LLMRequest::Anthropic(_))
+            | (Self::Responses(_), req @ LLMRequest::Responses(_)) => return Ok(req),
+            (_, req) => req,
+        };
+        if !allow_implicit_convert {
+            return Err(eyre!(
+                "a {} request cannot be sent over the {} protocol; set \
+                 LLMY_ALLOW_IMPLICIT_CONVERT (--allow-implicit-convert) to convert it through \
+                 the chat form",
+                req.protocol(),
+                self.protocol()
+            )
+            .into());
+        }
+        let chat = match req {
+            LLMRequest::Chat(chat) => chat,
+            LLMRequest::Anthropic(req) => req.into_inner().into_chat_request()?,
+            LLMRequest::Responses(req) => req.into_inner().into_chat_request()?,
+        };
+        match self {
+            Self::Azure(_) | Self::OpenAI(_) => Ok(LLMRequest::Chat(chat)),
+            Self::Anthropic(_) => Ok(LLMRequest::Anthropic(
+                AnthropicMessagesRequestRaw::from_chat(&chat, default_max_output_tokens)?,
+            )),
+            Self::Responses(_) => Ok(LLMRequest::Responses(ResponsesRequestRaw::from_chat(
+                &chat,
+            )?)),
+        }
+    }
+
+    /// Send one resolved, non-streaming request verbatim; the response comes
+    /// back in the protocol's own wire format.
+    pub async fn send(&self, req: &LLMRequest) -> Result<LLMResponse, LLMYError> {
+        match (self, req) {
+            (Self::Azure(cl), LLMRequest::Chat(req)) => {
+                let resp: RawExtensibleChatCompletionResponse = cl.chat().create_byot(req).await?;
+                Ok(LLMResponse::Chat(resp))
+            }
+            (Self::OpenAI(cl), LLMRequest::Chat(req)) => {
+                let resp: RawExtensibleChatCompletionResponse = cl.chat().create_byot(req).await?;
+                Ok(LLMResponse::Chat(resp))
+            }
+            (Self::Anthropic(cl), LLMRequest::Anthropic(req)) => {
+                let resp: AnthropicMessagesResponse = cl.chat().create_byot(req).await?;
+                Ok(LLMResponse::Anthropic(resp))
+            }
+            (Self::Responses(cl), LLMRequest::Responses(req)) => {
+                let resp: ResponsesResponse = cl.responses().create_byot(req).await?;
+                Ok(LLMResponse::Responses(resp))
+            }
+            (client, req) => Err(eyre!(
+                "a {} request reached the {} protocol unsent; resolve_request must run first",
+                req.protocol(),
+                client.protocol()
+            )
+            .into()),
+        }
+    }
+
+    /// Raw chat-completion chunk stream. Only the chat protocols emit these
+    /// chunks; on Anthropic/Responses use [`Self::send_streaming`], which
+    /// aggregates each protocol's own event stream instead.
     pub async fn create_chat_stream_extensible(
         &self,
         req: &RawExtensibleChatCompletionRequest,
@@ -143,7 +266,403 @@ impl LLMClient {
         match self {
             Self::Azure(cl) => cl.chat().create_stream_byot(req).await,
             Self::OpenAI(cl) => cl.chat().create_stream_byot(req).await,
+            Self::Anthropic(_) | Self::Responses(_) => Err(OpenAIError::InvalidArgument(
+                "chat-completion chunk streams exist only on the chat protocols".to_string(),
+            )),
         }
+    }
+
+    /// Send one resolved streaming request and aggregate the protocol's event
+    /// stream back into a full response. `fallback_model` fills the chat
+    /// response's model field when the stream never named one.
+    pub async fn send_streaming(
+        &self,
+        req: &mut LLMRequest,
+        fallback_model: &str,
+    ) -> Result<LLMResponse, LLMYError> {
+        match (self, req) {
+            (Self::Azure(_) | Self::OpenAI(_), LLMRequest::Chat(chat)) => Ok(LLMResponse::Chat(
+                self.chat_streaming(chat, fallback_model).await?,
+            )),
+            (Self::Anthropic(cl), LLMRequest::Anthropic(converted)) => {
+                converted.stream = Some(true);
+                let mut stream: ProtocolEventStream<AnthropicStreamEvent> =
+                    cl.chat().create_stream_byot(&*converted).await?;
+                let mut acc = AnthropicStreamAccumulator::new();
+                while let Some(event) = stream.next().await {
+                    acc.push(event?)?;
+                }
+                Ok(LLMResponse::Anthropic(acc.finish()?))
+            }
+            (Self::Responses(cl), LLMRequest::Responses(converted)) => {
+                converted.stream = Some(true);
+                let mut stream: ProtocolEventStream<ResponsesStreamEvent> =
+                    cl.responses().create_stream_byot(&*converted).await?;
+                // The terminal events carry the entire final response object,
+                // so aggregation is just waiting for one of them. A `failed`
+                // response is kept: its error field surfaces when the caller
+                // takes the chat view.
+                let mut terminal: Option<ResponsesResponse> = None;
+                while let Some(event) = stream.next().await {
+                    match event? {
+                        ResponsesStreamEvent::Completed { response }
+                        | ResponsesStreamEvent::Incomplete { response }
+                        | ResponsesStreamEvent::Failed { response } => terminal = Some(response),
+                        ResponsesStreamEvent::Error { code, message } => {
+                            return Err(
+                                eyre!("responses stream error {:?}: {}", code, message).into()
+                            );
+                        }
+                        ResponsesStreamEvent::Other => {}
+                    }
+                }
+                Ok(LLMResponse::Responses(terminal.ok_or_else(|| {
+                    eyre!("responses stream ended without a terminal response event")
+                })?))
+            }
+            (client, req) => Err(eyre!(
+                "a {} request reached the {} protocol unsent; resolve_request must run first",
+                req.protocol(),
+                client.protocol()
+            )
+            .into()),
+        }
+    }
+
+    /// Aggregate a chat-completion chunk stream into one full response.
+    #[allow(deprecated)]
+    async fn chat_streaming(
+        &self,
+        req: &mut RawExtensibleChatCompletionRequest,
+        fallback_model: &str,
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        req.stream = Some(true);
+
+        if req.stream_options.is_none() {
+            req.stream_options = Some(WithOtherFields::new(ChatCompletionStreamOptionsRaw {
+                include_usage: Some(true),
+                include_obfuscation: None,
+            }));
+        }
+
+        let mut stream = self.create_chat_stream_extensible(&*req).await?;
+
+        let mut id: Option<String> = None;
+        let mut created: Option<u32> = None;
+        let mut model: Option<String> = None;
+        let mut service_tier = None;
+        let mut system_fingerprint = None;
+        let mut usage: Option<CompletionUsage> = None;
+
+        let mut contents: Vec<String> = Vec::new();
+        let mut finish_reasons: Vec<Option<FinishReason>> = Vec::new();
+        let mut tool_calls: Vec<Vec<ToolCallAcc>> = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            let chunk: CreateChatCompletionStreamResponse = item?;
+            // Take ownership of the inner raw chunk so we can move fields out of `WithOtherFields`.
+            let chunk = chunk.inner;
+            if id.is_none() {
+                id = Some(chunk.id.clone());
+            }
+            created = Some(chunk.created);
+            model = Some(chunk.model.clone());
+            service_tier = chunk.service_tier.clone();
+            #[allow(deprecated)]
+            {
+                system_fingerprint = chunk.system_fingerprint.clone();
+            }
+            if let Some(u) = chunk.usage.clone() {
+                usage = Some(u);
+            }
+
+            for ch in chunk.choices.into_iter() {
+                let ch = ch.inner;
+                let idx = ch.index as usize;
+                if contents.len() <= idx {
+                    contents.resize_with(idx + 1, String::new);
+                    finish_reasons.resize_with(idx + 1, || None);
+                    tool_calls.resize_with(idx + 1, Vec::new);
+                }
+                let delta = ch.delta.inner;
+                if let Some(content) = delta.content {
+                    contents[idx].push_str(&content);
+                }
+                if let Some(tcs) = delta.tool_calls {
+                    for tc in tcs.into_iter() {
+                        let tc = tc.inner;
+                        let tc_idx = tc.index as usize;
+                        if tool_calls[idx].len() <= tc_idx {
+                            tool_calls[idx].resize_with(tc_idx + 1, ToolCallAcc::default);
+                        }
+                        let acc = &mut tool_calls[idx][tc_idx];
+                        if let Some(id) = tc.id {
+                            acc.id = id;
+                        }
+                        if let Some(func) = tc.function {
+                            let func = func.inner;
+                            if let Some(name) = func.name {
+                                acc.name = name;
+                            }
+                            if let Some(args) = func.arguments {
+                                acc.arguments.push_str(&args);
+                            }
+                        }
+                    }
+                }
+                if ch.finish_reason.is_some() {
+                    finish_reasons[idx] = ch.finish_reason;
+                }
+            }
+        }
+
+        let mut choices: Vec<ChatChoice> = Vec::new();
+        for (idx, content) in contents.into_iter().enumerate() {
+            let finish_reason = finish_reasons.get(idx).cloned().unwrap_or(None);
+            let built_tool_calls: Vec<ChatCompletionMessageToolCalls> = tool_calls
+                .get(idx)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|t| !t.name.trim().is_empty() || !t.arguments.trim().is_empty())
+                .map(|t| {
+                    let raw = ChatCompletionMessageToolCallRaw {
+                        id: if t.id.trim().is_empty() {
+                            format!("toolcall-{}", idx)
+                        } else {
+                            t.id
+                        },
+                        function: WithOtherFields::new(FunctionCallRaw {
+                            name: t.name,
+                            arguments: t.arguments,
+                        }),
+                    };
+                    WithOtherFields::new(ChatCompletionMessageToolCallsRaw::Function(
+                        WithOtherFields::new(raw),
+                    ))
+                })
+                .collect();
+            let tool_calls_opt = if built_tool_calls.is_empty() {
+                None
+            } else {
+                Some(built_tool_calls)
+            };
+            #[allow(deprecated)]
+            let message = WithOtherFields::new(ChatCompletionResponseMessageRaw {
+                content: if content.is_empty() {
+                    None
+                } else {
+                    Some(content)
+                },
+                refusal: None,
+                tool_calls: tool_calls_opt,
+                annotations: None,
+                role: Role::Assistant,
+                function_call: None,
+                audio: None,
+            });
+            choices.push(WithOtherFields::new(ChatChoiceRaw {
+                index: idx as u32,
+                message,
+                finish_reason,
+                logprobs: None,
+            }));
+        }
+        if choices.is_empty() {
+            #[allow(deprecated)]
+            let message = WithOtherFields::new(ChatCompletionResponseMessageRaw {
+                content: Some(String::new()),
+                refusal: None,
+                tool_calls: None,
+                annotations: None,
+                role: Role::Assistant,
+                function_call: None,
+                audio: None,
+            });
+            choices.push(WithOtherFields::new(ChatChoiceRaw {
+                index: 0,
+                message,
+                finish_reason: None,
+                logprobs: None,
+            }));
+        }
+
+        #[allow(deprecated)]
+        let resp_raw = CreateChatCompletionResponseRaw {
+            id: id.unwrap_or_else(|| "stream".to_string()),
+            choices,
+            created: created.unwrap_or(0),
+            model: model.unwrap_or_else(|| fallback_model.to_string()),
+            service_tier,
+            system_fingerprint,
+            object: "chat.completion".to_string(),
+            usage,
+        };
+        Ok(RawExtensibleChatCompletionResponse::new(resp_raw))
+    }
+}
+
+/// A request in the wire format it will be sent in. The rule is transparency:
+/// whatever the caller hands over is sent as-is when the backend speaks that
+/// protocol; any cross-protocol send is an implicit conversion through the
+/// chat hub, gated by `allow_implicit_convert` (see
+/// [`LLMClient::resolve_request`]).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+pub enum LLMRequest {
+    Chat(RawExtensibleChatCompletionRequest),
+    Anthropic(AnthropicMessagesRequest),
+    Responses(ResponsesRequest),
+}
+
+impl LLMRequest {
+    /// Which wire protocol this request is in.
+    pub fn protocol(&self) -> &'static str {
+        match self {
+            Self::Chat(_) => "chat-completion",
+            Self::Anthropic(_) => "anthropic",
+            Self::Responses(_) => "responses",
+        }
+    }
+
+    fn prompt_cache_key(&self) -> Option<&str> {
+        match self {
+            Self::Chat(req) => req.prompt_cache_key.as_deref(),
+            Self::Responses(req) => req.prompt_cache_key.as_deref(),
+            Self::Anthropic(_) => None,
+        }
+    }
+
+    /// Set the routing key on the protocols that have one; the Anthropic
+    /// protocol routes by content, so there is nothing to set.
+    fn set_prompt_cache_key(&mut self, key: &str) {
+        match self {
+            Self::Chat(req) => req.prompt_cache_key = Some(key.to_string()),
+            Self::Responses(req) => req.prompt_cache_key = Some(key.to_string()),
+            Self::Anthropic(_) => {}
+        }
+    }
+
+    /// The cache-key shape, for the protocols that route by
+    /// `prompt_cache_key`; `None` means auto keys do not apply.
+    fn cache_shape(&self) -> Option<CacheShape> {
+        match self {
+            Self::Chat(req) => Some(CacheShape::from_chat(req)),
+            Self::Responses(req) => Some(req.cache_shape()),
+            Self::Anthropic(_) => None,
+        }
+    }
+
+    /// Raw text for token estimation.
+    fn estimate_text(&self) -> String {
+        match self {
+            Self::Chat(req) => debug::extract_raw_text_with_other(req),
+            Self::Anthropic(req) => req.estimate_text(),
+            Self::Responses(req) => req.estimate_text(),
+        }
+    }
+
+    /// Render this request for the debug record — the JSON is the wire truth,
+    /// whichever protocol it goes out in.
+    fn debug_request(&self) -> DebugRequest {
+        match self {
+            Self::Chat(req) => DebugRequest::from_chat(req),
+            Self::Anthropic(req) => DebugRequest {
+                json: serde_json::to_value(req).unwrap_or(serde_json::Value::Null),
+                conversation: req.conversation_text(),
+                tools_text: req.tools_text(),
+            },
+            Self::Responses(req) => DebugRequest {
+                json: serde_json::to_value(req).unwrap_or(serde_json::Value::Null),
+                conversation: req.conversation_text(),
+                tools_text: req.tools_text(),
+            },
+        }
+    }
+}
+
+/// A response in the wire format it arrived in.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+pub enum LLMResponse {
+    Chat(RawExtensibleChatCompletionResponse),
+    Anthropic(AnthropicMessagesResponse),
+    Responses(ResponsesResponse),
+}
+
+impl LLMResponse {
+    /// The normalized chat-completion view every caller-facing API returns;
+    /// billing and content filters read it too. A chat response passes through
+    /// untouched; a native response that is itself a failure surfaces here as
+    /// an error.
+    pub fn into_chat_view(self) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        match self {
+            Self::Chat(resp) => Ok(resp),
+            Self::Anthropic(resp) => Ok(resp.into_inner().into_chat_response()),
+            Self::Responses(resp) => resp.into_inner().into_chat_response(),
+        }
+    }
+}
+
+impl From<RawExtensibleChatCompletionRequest> for LLMRequest {
+    fn from(req: RawExtensibleChatCompletionRequest) -> Self {
+        Self::Chat(req)
+    }
+}
+
+impl From<CreateChatCompletionRequestRaw> for LLMRequest {
+    fn from(req: CreateChatCompletionRequestRaw) -> Self {
+        Self::Chat(RawExtensibleChatCompletionRequest::new(req))
+    }
+}
+
+impl From<AnthropicMessagesRequest> for LLMRequest {
+    fn from(req: AnthropicMessagesRequest) -> Self {
+        Self::Anthropic(req)
+    }
+}
+
+impl From<AnthropicMessagesRequestRaw> for LLMRequest {
+    fn from(req: AnthropicMessagesRequestRaw) -> Self {
+        Self::Anthropic(WithOtherFields::new(req))
+    }
+}
+
+impl From<ResponsesRequest> for LLMRequest {
+    fn from(req: ResponsesRequest) -> Self {
+        Self::Responses(req)
+    }
+}
+
+impl From<ResponsesRequestRaw> for LLMRequest {
+    fn from(req: ResponsesRequestRaw) -> Self {
+        Self::Responses(WithOtherFields::new(req))
+    }
+}
+
+impl From<RawExtensibleChatCompletionResponse> for LLMResponse {
+    fn from(resp: RawExtensibleChatCompletionResponse) -> Self {
+        Self::Chat(resp)
+    }
+}
+
+impl From<AnthropicMessagesResponse> for LLMResponse {
+    fn from(resp: AnthropicMessagesResponse) -> Self {
+        Self::Anthropic(resp)
+    }
+}
+
+impl From<ResponsesResponse> for LLMResponse {
+    fn from(resp: ResponsesResponse) -> Self {
+        Self::Responses(resp)
+    }
+}
+
+impl TryFrom<LLMResponse> for RawExtensibleChatCompletionResponse {
+    type Error = LLMYError;
+
+    fn try_from(resp: LLMResponse) -> Result<Self, Self::Error> {
+        resp.into_chat_view()
     }
 }
 
@@ -168,9 +687,7 @@ impl LLM {
         let endpoint = config.endpoint_url().to_string();
         let azure_deployment = config.azure_deployment().map(|s| s.to_string());
 
-        let content_filter: Box<dyn OpenAIContentFilter> = if model.is_mimo() {
-            Box::new(MiMoContentFilter::default())
-        } else if model.is_google() {
+        let content_filter: Box<dyn OpenAIContentFilter> = if model.is_google() {
             Box::new(GoogleContentFilter)
         } else {
             Box::new(NoFilter)
@@ -354,9 +871,15 @@ impl LLMInner {
         }
     }
 
+    /// The model's configured max output tokens; backs protocol fields that
+    /// demand an explicit bound (the Anthropic protocol's mandatory
+    /// `max_tokens`) when the request itself carries none.
+    fn default_max_output_tokens(&self) -> u32 {
+        self.model.config.max_tokens.try_into().unwrap_or(u32::MAX)
+    }
+
     /// Replace the content filter applied to every request and response. Defaults to
-    /// `MiMoContentFilter` for mimo models, `GoogleContentFilter` for google models,
-    /// `NoFilter` otherwise.
+    /// `GoogleContentFilter` for google models, `NoFilter` otherwise.
     pub fn set_content_filter(&self, filter: Box<dyn OpenAIContentFilter>) {
         *self
             .content_filter
@@ -379,6 +902,9 @@ impl LLMInner {
     /// A newly minted key carries `debug_prefix` in its name, so the keys in the
     /// logs and the debug DB say which workload opened them. A caller-supplied
     /// key is never second-guessed.
+    // Production traffic goes through [`Self::auto_cache_key_request`]; this
+    // chat-typed shorthand remains for the tests exercising claim semantics.
+    #[cfg(test)]
     fn auto_cache_key(
         &self,
         req: &RawExtensibleChatCompletionRequest,
@@ -388,6 +914,22 @@ impl LLMInner {
             return None;
         }
         self.cache_keys.select(req, &self.model, debug_prefix)
+    }
+
+    /// Take the auto cache key for one logical request, whatever protocol it
+    /// resolved to. The Anthropic protocol routes by content, so it never
+    /// takes one; a caller-supplied key is never second-guessed.
+    fn auto_cache_key_request(
+        &self,
+        req: &LLMRequest,
+        debug_prefix: Option<&str>,
+    ) -> Option<CacheKeyClaim> {
+        if req.prompt_cache_key().is_some() {
+            return None;
+        }
+        let shape = req.cache_shape()?;
+        self.cache_keys
+            .select_shape(&shape, &self.model, debug_prefix)
     }
 
     /// Cached prompt tokens the provider reported, or zero if it reported none.
@@ -456,17 +998,13 @@ impl LLMInner {
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
-        let sys = ChatCompletionRequestSystemMessageRaw::new_text(sys_msg);
-        let user = ChatCompletionRequestUserMessageRaw::new_text(user_msg);
-        self.prompt_messages_once(
-            vec![
-                ChatCompletionRequestMessageRaw::System(sys),
-                ChatCompletionRequestMessageRaw::User(user),
-            ],
+        let settings = settings.unwrap_or_else(|| self.default_settings.clone());
+        let req = self.build_prompt_request(sys_msg, user_msg, cache_key, &settings)?;
+        self.complete_request_once_with_retry(
+            req,
             debug_prefix,
-            cache_key,
-            settings,
-            None,
+            Some(settings.timeout()),
+            Some(settings.llm_retry),
         )
         .await
     }
@@ -482,17 +1020,13 @@ impl LLMInner {
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
     ) -> Result<T, LLMYError> {
-        let sys = ChatCompletionRequestSystemMessageRaw::new_text(sys_msg);
-        let user = ChatCompletionRequestUserMessageRaw::new_text(user_msg);
-        self.prompt_messages_once_typed::<T>(
-            vec![
-                ChatCompletionRequestMessageRaw::System(sys),
-                ChatCompletionRequestMessageRaw::User(user),
-            ],
+        let settings = settings.unwrap_or_else(|| self.default_settings.clone());
+        let req = self.build_prompt_request(sys_msg, user_msg, cache_key, &settings)?;
+        self.complete_request_once_with_retry_typed::<T>(
+            req,
             debug_prefix,
-            cache_key,
-            settings,
-            None,
+            Some(settings.timeout()),
+            Some(settings.llm_retry),
         )
         .await
     }
@@ -532,10 +1066,36 @@ impl LLMInner {
         timeout: Option<Duration>,
         retry: Option<u64>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        self.complete_request_once_with_retry(
+            LLMRequest::Chat(req.clone()),
+            debug_prefix,
+            timeout,
+            retry,
+        )
+        .await
+    }
+
+    /// Retry wrapper over one logical request in any wire format. The request
+    /// is resolved against the backend exactly once — passthrough when it is
+    /// already in the backend's protocol; any cross-protocol conversion needs
+    /// `allow_implicit_convert` — and every attempt then sends the same
+    /// resolved request.
+    pub async fn complete_request_once_with_retry(
+        &self,
+        req: LLMRequest,
+        debug_prefix: Option<&str>,
+        timeout: Option<Duration>,
+        retry: Option<u64>,
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        let req = self.client.resolve_request(
+            req,
+            self.default_max_output_tokens(),
+            self.default_settings.allow_implicit_convert,
+        )?;
         let retry = retry.unwrap_or(u64::MAX);
         // One claim for the whole logical request; every attempt gets a clone,
         // and giving up drops the last one, which abandons it.
-        let claim = self.auto_cache_key(req, debug_prefix);
+        let claim = self.auto_cache_key_request(&req, debug_prefix);
 
         let mut last = None;
         for idx in 0..retry {
@@ -545,7 +1105,7 @@ impl LLMInner {
                 claim.charge_resend();
             }
             match self
-                .complete_extensible_attempt(req.clone(), claim.clone(), debug_prefix, timeout)
+                .complete_request_attempt(req.clone(), claim.clone(), debug_prefix, timeout)
                 .await
             {
                 Ok(r) => return Ok(r),
@@ -573,24 +1133,44 @@ impl LLMInner {
         timeout: Option<Duration>,
         retry: Option<u64>,
     ) -> Result<T, LLMYError> {
+        self.complete_request_once_with_retry_typed::<T>(
+            LLMRequest::Chat(req.clone()),
+            debug_prefix,
+            timeout,
+            retry,
+        )
+        .await
+    }
+
+    /// Like [`Self::complete_request_once_with_retry`], but each attempt also
+    /// deserializes the first-choice content into `T` (with markdown
+    /// auto-strip); a malformed response is retried like any other error.
+    pub async fn complete_request_once_with_retry_typed<T: DeserializeOwned>(
+        &self,
+        req: LLMRequest,
+        debug_prefix: Option<&str>,
+        timeout: Option<Duration>,
+        retry: Option<u64>,
+    ) -> Result<T, LLMYError> {
+        let req = self.client.resolve_request(
+            req,
+            self.default_max_output_tokens(),
+            self.default_settings.allow_implicit_convert,
+        )?;
         let retry = retry.unwrap_or(u64::MAX);
         // One claim for the whole logical request — see the untyped variant.
-        let claim = self.auto_cache_key(req, debug_prefix);
+        let claim = self.auto_cache_key_request(&req, debug_prefix);
 
         let mut last = None;
         for idx in 0..retry {
             if let (true, Some(claim)) = (idx > 0, claim.as_ref()) {
                 claim.charge_resend();
             }
-            match self
-                .complete_extensible_typed_attempt::<T>(
-                    req.clone(),
-                    claim.clone(),
-                    debug_prefix,
-                    timeout,
-                )
+            let attempt = self
+                .complete_request_attempt(req.clone(), claim.clone(), debug_prefix, timeout)
                 .await
-            {
+                .and_then(|resp| self.parse_first_choice::<T>(&resp));
+            match attempt {
                 Ok(value) => return Ok(value),
                 // A billing/cap error is deterministic — retrying can't recover it
                 // (and would keep tripping the pre-flight check), so fail fast.
@@ -654,22 +1234,8 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
     ) -> Result<T, LLMYError> {
-        let claim = self.auto_cache_key(&req, debug_prefix);
-        self.complete_extensible_typed_attempt::<T>(req, claim, debug_prefix, timeout_overwrite)
-            .await
-    }
-
-    /// One attempt of a typed logical request; see
-    /// [`Self::complete_extensible_attempt`] for how `given_claim` travels.
-    async fn complete_extensible_typed_attempt<T: DeserializeOwned>(
-        &self,
-        req: RawExtensibleChatCompletionRequest,
-        given_claim: Option<CacheKeyClaim>,
-        debug_prefix: Option<&str>,
-        timeout_overwrite: Option<Duration>,
-    ) -> Result<T, LLMYError> {
         let resp = self
-            .complete_extensible_attempt(req, given_claim, debug_prefix, timeout_overwrite)
+            .complete_request(LLMRequest::Chat(req), debug_prefix, timeout_overwrite)
             .await?;
         self.parse_first_choice::<T>(&resp)
     }
@@ -680,20 +1246,39 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
-        // A one-shot call is a logical request of exactly one attempt, so the
-        // claim is taken and dropped here — abandoned if the call does not land.
-        let claim = self.auto_cache_key(&req, debug_prefix);
-        self.complete_extensible_attempt(req, claim, debug_prefix, timeout_overwrite)
+        self.complete_request(LLMRequest::Chat(req), debug_prefix, timeout_overwrite)
             .await
     }
 
-    /// One attempt of a logical request, carrying that request's cache key
-    /// claim — see [`Self::auto_cache_key`]. The attempt only ever uses the
-    /// claim it is given; it never takes one of its own, so retrying cannot cost
-    /// a second claim or a second slot of the key's request budget.
-    async fn complete_extensible_attempt(
+    /// One-shot send of a request in any wire format: passthrough when the
+    /// backend speaks it; a cross-protocol send needs `allow_implicit_convert`
+    /// to convert through the chat hub. A one-shot
+    /// call is a logical request of exactly one attempt, so the cache-key
+    /// claim is taken and dropped here — abandoned if the call does not land.
+    pub async fn complete_request(
         &self,
-        mut req: RawExtensibleChatCompletionRequest,
+        req: LLMRequest,
+        debug_prefix: Option<&str>,
+        timeout_overwrite: Option<Duration>,
+    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        let req = self.client.resolve_request(
+            req,
+            self.default_max_output_tokens(),
+            self.default_settings.allow_implicit_convert,
+        )?;
+        let claim = self.auto_cache_key_request(&req, debug_prefix);
+        self.complete_request_attempt(req, claim, debug_prefix, timeout_overwrite)
+            .await
+    }
+
+    /// One attempt of a resolved logical request, carrying that request's
+    /// cache key claim — see [`Self::auto_cache_key_request`]. The attempt only
+    /// ever uses the claim it is given; it never takes one of its own, so
+    /// retrying cannot cost a second claim or a second slot of the key's
+    /// request budget.
+    async fn complete_request_attempt(
+        &self,
+        mut req: LLMRequest,
         given_claim: Option<CacheKeyClaim>,
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
@@ -703,9 +1288,13 @@ impl LLMInner {
 
         if let Some(claim) = given_claim.as_ref() {
             tracing::debug!("auto prompt cache key {}", claim.key());
-            req.prompt_cache_key = Some(claim.key().to_string());
+            req.set_prompt_cache_key(claim.key());
         }
-        self.apply_filter_input(&mut req);
+        // The content-filter quirks are all chat-endpoint quirks; a native
+        // request goes out exactly as built.
+        if let LLMRequest::Chat(chat) = &mut req {
+            self.apply_filter_input(chat);
+        }
 
         // Keep the raw prefix (None => "") for the per-prefix billing dimension,
         // before it gets defaulted to "llm" for the debug backend below.
@@ -718,16 +1307,18 @@ impl LLMInner {
             "llm".to_string()
         };
 
-        let dbg_handle = if let Some(backend) = self.debug_backend.as_ref() {
-            let cache_key = req.prompt_cache_key.clone();
-            let ctx = self.debug_row_context(cache_key.as_deref());
-            backend.start(&debug_prefix, ctx, &req).await
+        let dbg_req = self.debug_backend.as_ref().map(|_| req.debug_request());
+        let dbg_handle = if let (Some(backend), Some(dbg_req)) =
+            (self.debug_backend.as_ref(), dbg_req.as_ref())
+        {
+            let ctx = self.debug_row_context(req.prompt_cache_key());
+            backend.start(&debug_prefix, ctx, dbg_req).await
         } else {
             None
         };
 
         let estimated_tokens = {
-            let text = debug::extract_raw_text_with_other(&req);
+            let text = req.estimate_text();
             tracing::trace!("Text is {:?}", text);
             self.model.config.count_tokens(&text)
         };
@@ -740,12 +1331,11 @@ impl LLMInner {
         let now = std::time::SystemTime::now();
         let llm_fut = async {
             if use_stream {
-                self.complete_streaming(&mut req).await
-            } else {
                 self.client
-                    .create_chat_extensible(&req)
+                    .send_streaming(&mut req, self.model.api_model_name())
                     .await
-                    .map_err(|e| e.into())
+            } else {
+                self.client.send(&req).await
             }
         };
 
@@ -763,7 +1353,7 @@ impl LLMInner {
                 })
         };
 
-        let mut resp = match resp {
+        let resp = match resp {
             Ok(resp) => resp,
             Err(e) => {
                 if let (Some(backend), Some(handle)) =
@@ -776,14 +1366,39 @@ impl LLMInner {
                 return Err(e);
             }
         };
+        // The wire-truth JSON for the debug record, captured before the
+        // response is normalized into its chat view.
+        let resp_json = dbg_handle
+            .as_ref()
+            .map(|_| serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null));
+        let mut resp = match resp.into_chat_view() {
+            Ok(view) => view,
+            Err(e) => {
+                // A response that is itself a failure (e.g. a `failed`
+                // responses object) is recorded like any other error.
+                if let (Some(backend), Some(handle)) =
+                    (self.debug_backend.as_ref(), dbg_handle.as_ref())
+                {
+                    backend.record_error(handle, &e).await;
+                }
+                return Err(e);
+            }
+        };
         // The provider answered, so it really did cache this prompt's prefixes.
         // Settle before the billing record below, which can still bail out.
         if let Some(claim) = given_claim.as_ref() {
             claim.confirm(Self::reported_cached_tokens(&resp));
         }
         self.apply_filter_output(&mut resp);
-        if let (Some(backend), Some(handle)) = (self.debug_backend.as_ref(), dbg_handle.as_ref()) {
-            backend.record_response(handle, &req, &resp).await;
+        if let (Some(backend), Some(handle), Some(dbg_req), Some(resp_json)) = (
+            self.debug_backend.as_ref(),
+            dbg_handle.as_ref(),
+            dbg_req.as_ref(),
+            resp_json.as_ref(),
+        ) {
+            backend
+                .record_response(handle, dbg_req, resp_json, &resp)
+                .await;
         }
 
         let mut billed: Option<(TokenBilling, TokenUsage)> = None;
@@ -928,176 +1543,6 @@ impl LLMInner {
         Ok(resp)
     }
 
-    #[allow(deprecated)]
-    async fn complete_streaming(
-        &self,
-        req: &mut RawExtensibleChatCompletionRequest,
-    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
-        req.stream = Some(true);
-
-        if req.stream_options.is_none() {
-            req.stream_options = Some(WithOtherFields::new(ChatCompletionStreamOptionsRaw {
-                include_usage: Some(true),
-                include_obfuscation: None,
-            }));
-        }
-
-        let mut stream = self.client.create_chat_stream_extensible(&*req).await?;
-
-        let mut id: Option<String> = None;
-        let mut created: Option<u32> = None;
-        let mut model: Option<String> = None;
-        let mut service_tier = None;
-        let mut system_fingerprint = None;
-        let mut usage: Option<CompletionUsage> = None;
-
-        let mut contents: Vec<String> = Vec::new();
-        let mut finish_reasons: Vec<Option<FinishReason>> = Vec::new();
-        let mut tool_calls: Vec<Vec<ToolCallAcc>> = Vec::new();
-
-        while let Some(item) = stream.next().await {
-            let chunk: CreateChatCompletionStreamResponse = item?;
-            // Take ownership of the inner raw chunk so we can move fields out of `WithOtherFields`.
-            let chunk = chunk.inner;
-            if id.is_none() {
-                id = Some(chunk.id.clone());
-            }
-            created = Some(chunk.created);
-            model = Some(chunk.model.clone());
-            service_tier = chunk.service_tier.clone();
-            #[allow(deprecated)]
-            {
-                system_fingerprint = chunk.system_fingerprint.clone();
-            }
-            if let Some(u) = chunk.usage.clone() {
-                usage = Some(u);
-            }
-
-            for ch in chunk.choices.into_iter() {
-                let ch = ch.inner;
-                let idx = ch.index as usize;
-                if contents.len() <= idx {
-                    contents.resize_with(idx + 1, String::new);
-                    finish_reasons.resize_with(idx + 1, || None);
-                    tool_calls.resize_with(idx + 1, Vec::new);
-                }
-                let delta = ch.delta.inner;
-                if let Some(content) = delta.content {
-                    contents[idx].push_str(&content);
-                }
-                if let Some(tcs) = delta.tool_calls {
-                    for tc in tcs.into_iter() {
-                        let tc = tc.inner;
-                        let tc_idx = tc.index as usize;
-                        if tool_calls[idx].len() <= tc_idx {
-                            tool_calls[idx].resize_with(tc_idx + 1, ToolCallAcc::default);
-                        }
-                        let acc = &mut tool_calls[idx][tc_idx];
-                        if let Some(id) = tc.id {
-                            acc.id = id;
-                        }
-                        if let Some(func) = tc.function {
-                            let func = func.inner;
-                            if let Some(name) = func.name {
-                                acc.name = name;
-                            }
-                            if let Some(args) = func.arguments {
-                                acc.arguments.push_str(&args);
-                            }
-                        }
-                    }
-                }
-                if ch.finish_reason.is_some() {
-                    finish_reasons[idx] = ch.finish_reason;
-                }
-            }
-        }
-
-        let mut choices: Vec<ChatChoice> = Vec::new();
-        for (idx, content) in contents.into_iter().enumerate() {
-            let finish_reason = finish_reasons.get(idx).cloned().unwrap_or(None);
-            let built_tool_calls: Vec<ChatCompletionMessageToolCalls> = tool_calls
-                .get(idx)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|t| !t.name.trim().is_empty() || !t.arguments.trim().is_empty())
-                .map(|t| {
-                    let raw = ChatCompletionMessageToolCallRaw {
-                        id: if t.id.trim().is_empty() {
-                            format!("toolcall-{}", idx)
-                        } else {
-                            t.id
-                        },
-                        function: WithOtherFields::new(FunctionCallRaw {
-                            name: t.name,
-                            arguments: t.arguments,
-                        }),
-                    };
-                    WithOtherFields::new(ChatCompletionMessageToolCallsRaw::Function(
-                        WithOtherFields::new(raw),
-                    ))
-                })
-                .collect();
-            let tool_calls_opt = if built_tool_calls.is_empty() {
-                None
-            } else {
-                Some(built_tool_calls)
-            };
-            #[allow(deprecated)]
-            let message = WithOtherFields::new(ChatCompletionResponseMessageRaw {
-                content: if content.is_empty() {
-                    None
-                } else {
-                    Some(content)
-                },
-                refusal: None,
-                tool_calls: tool_calls_opt,
-                annotations: None,
-                role: Role::Assistant,
-                function_call: None,
-                audio: None,
-            });
-            choices.push(WithOtherFields::new(ChatChoiceRaw {
-                index: idx as u32,
-                message,
-                finish_reason,
-                logprobs: None,
-            }));
-        }
-        if choices.is_empty() {
-            #[allow(deprecated)]
-            let message = WithOtherFields::new(ChatCompletionResponseMessageRaw {
-                content: Some(String::new()),
-                refusal: None,
-                tool_calls: None,
-                annotations: None,
-                role: Role::Assistant,
-                function_call: None,
-                audio: None,
-            });
-            choices.push(WithOtherFields::new(ChatChoiceRaw {
-                index: 0,
-                message,
-                finish_reason: None,
-                logprobs: None,
-            }));
-        }
-
-        #[allow(deprecated)]
-        let resp_raw = CreateChatCompletionResponseRaw {
-            id: id.unwrap_or_else(|| "stream".to_string()),
-            choices,
-            created: created.unwrap_or(0),
-            model: model.unwrap_or_else(|| self.model.api_model_name().to_string()),
-            service_tier,
-            system_fingerprint,
-            object: "chat.completion".to_string(),
-            usage,
-        };
-        Ok(RawExtensibleChatCompletionResponse::new(resp_raw))
-    }
-
     /// Build an extensible chat request with this model's settings, tools, and provider quirks
     /// applied. Per-message extras (e.g. mimo `reasoning_content`) are preserved from the
     /// supplied wrapped messages.
@@ -1117,11 +1562,6 @@ impl LLMInner {
 
         if let Some(tc) = settings.llm_tool_choice.clone() {
             raw.tool_choice = Some(tc.0);
-        } else if self.model.is_mimo() {
-            // This ensures mimo generates tool calls correctly, only god knows why.
-            raw.tool_choice = Some(WithOtherFields::new(
-                ChatCompletionToolChoiceOptionRaw::Mode(ToolChoiceOptions::Auto),
-            ));
         }
 
         if let Some(effort) = settings.reasoning_effort.clone()
@@ -1151,6 +1591,53 @@ impl LLMInner {
         let mut req = RawExtensibleChatCompletionRequest::new(raw);
         apply_provider_request_extensions(&self.model, settings, &mut req);
         Ok(req)
+    }
+
+    /// Build the protocol-native request for a plain system+user prompt:
+    /// strings go straight into the backend's own wire format instead of being
+    /// forced through the chat shape only to be converted back out of it.
+    /// Chat-typed callers (message/struct APIs) still build chat requests and
+    /// rely on [`LLMClient::resolve_request`] to convert — which, on a
+    /// non-chat backend, needs `allow_implicit_convert`.
+    pub fn build_prompt_request(
+        &self,
+        sys_msg: &str,
+        user_msg: &str,
+        cache_key: Option<&str>,
+        settings: &LLMSettings,
+    ) -> Result<LLMRequest, LLMYError> {
+        match &self.client {
+            LLMClient::Azure(_) | LLMClient::OpenAI(_) => {
+                let sys = ChatCompletionRequestSystemMessageRaw::new_text(sys_msg);
+                let user = ChatCompletionRequestUserMessageRaw::new_text(user_msg);
+                let messages = vec![
+                    ChatCompletionRequestMessageRaw::System(sys),
+                    ChatCompletionRequestMessageRaw::User(user),
+                ]
+                .into_iter()
+                .map(RawExtensibleChatRequestMessage::new)
+                .collect();
+                Ok(LLMRequest::Chat(
+                    self.build_chat_request(messages, cache_key, settings, None)?,
+                ))
+            }
+            LLMClient::Anthropic(_) => Ok(LLMRequest::Anthropic(
+                AnthropicMessagesRequestRaw::from_prompt(
+                    self.model.api_model_name(),
+                    sys_msg,
+                    user_msg,
+                    settings,
+                    self.default_max_output_tokens(),
+                )?,
+            )),
+            LLMClient::Responses(_) => Ok(LLMRequest::Responses(ResponsesRequestRaw::from_prompt(
+                self.model.api_model_name(),
+                sys_msg,
+                user_msg,
+                cache_key,
+                settings,
+            )?)),
+        }
     }
 
     pub async fn prompt_messages_once(
@@ -1210,19 +1697,8 @@ impl LLMInner {
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
-        let sys = ChatCompletionRequestSystemMessageRaw::new_text(sys_msg);
-        let user = ChatCompletionRequestUserMessageRaw::new_text(user_msg);
-        self.prompt_messages_once(
-            vec![
-                ChatCompletionRequestMessageRaw::System(sys),
-                ChatCompletionRequestMessageRaw::User(user),
-            ],
-            debug_prefix,
-            cache_key,
-            settings,
-            None,
-        )
-        .await
+        self.prompt_once_with_retry(sys_msg, user_msg, debug_prefix, cache_key, settings)
+            .await
     }
 }
 
@@ -1270,6 +1746,7 @@ mod tests {
             cache_key_rpm: crate::cache_key::DEFAULT_MAX_RPM,
             billing_log_tokens: 100_000,
             token_estimate_pct: 10.0,
+            allow_implicit_convert: false,
         }
     }
 
@@ -1838,5 +2315,166 @@ mod tests {
         landed(&llm, &mut req);
         assert!(req.prompt_cache_key.is_none());
         assert!(!llm.cache_key_config().enabled);
+    }
+
+    // --- protocol passthrough / conversion ----------------------------------
+
+    fn anthropic_llm() -> LLM {
+        let config =
+            SupportedConfig::new_anthropic("http://localhost:0/v1", "k", DEFAULT_ANTHROPIC_VERSION);
+        let model = OpenAIModel::from_str("captest,1000000,1000000").unwrap();
+        LLM::new(
+            config,
+            model,
+            rust_decimal::dec!(100),
+            test_settings(None),
+            None,
+        )
+    }
+
+    fn responses_llm() -> LLM {
+        let config = SupportedConfig::new_responses("http://localhost:0/v1", "k");
+        let model = OpenAIModel::from_str("captest,1000000,1000000").unwrap();
+        LLM::new(
+            config,
+            model,
+            rust_decimal::dec!(100),
+            test_settings(None),
+            None,
+        )
+    }
+
+    #[test]
+    fn a_string_prompt_builds_the_backend_native_request() {
+        // Chat backend: the chat request, as before.
+        let req = test_llm()
+            .build_prompt_request("sys", "user", None, &test_settings(None))
+            .unwrap();
+        assert_eq!(req.protocol(), "chat-completion");
+
+        // Anthropic backend: the native messages request, no chat intermediate.
+        let req = anthropic_llm()
+            .build_prompt_request("sys", "user", None, &test_settings(None))
+            .unwrap();
+        assert_eq!(req.protocol(), "anthropic");
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value["system"][0]["text"], "sys");
+        assert_eq!(value["messages"][0]["role"], "user");
+        assert_eq!(value["messages"][0]["content"][0]["text"], "user");
+        assert!(value["max_tokens"].is_number());
+
+        // Responses backend: the native responses request.
+        let req = responses_llm()
+            .build_prompt_request("sys", "user", Some("key-9"), &test_settings(None))
+            .unwrap();
+        assert_eq!(req.protocol(), "responses");
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value["input"][0]["role"], "system");
+        assert_eq!(value["input"][1]["role"], "user");
+        assert_eq!(value["input"][1]["content"], "user");
+        assert_eq!(value["prompt_cache_key"], "key-9");
+        assert_eq!(value["store"], false);
+    }
+
+    #[test]
+    fn resolve_passes_matching_requests_through_and_gates_every_conversion() {
+        let anthropic = anthropic_llm();
+        let settings = test_settings(None);
+
+        // A request already in the backend's own format passes through
+        // byte-for-byte — no opt-in needed.
+        let native = anthropic
+            .build_prompt_request("s", "u", None, &settings)
+            .unwrap();
+        let before = serde_json::to_value(&native).unwrap();
+        let resolved = anthropic
+            .client
+            .resolve_request(native, 4096, false)
+            .unwrap();
+        assert_eq!(serde_json::to_value(&resolved).unwrap(), before);
+
+        // Every cross-protocol send is an implicit conversion and is refused
+        // by default — a chat struct included...
+        let chat: LLMRequest = user_request("hello").into();
+        let err = anthropic
+            .client
+            .resolve_request(chat.clone(), 4096, false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("LLMY_ALLOW_IMPLICIT_CONVERT"),
+            "{err}"
+        );
+        let foreign = responses_llm()
+            .build_prompt_request("sys", "hello", None, &settings)
+            .unwrap();
+        let err = anthropic
+            .client
+            .resolve_request(foreign.clone(), 4096, false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("LLMY_ALLOW_IMPLICIT_CONVERT"),
+            "{err}"
+        );
+
+        // ...and converts through the chat hub once the caller opts in.
+        let resolved = anthropic.client.resolve_request(chat, 4096, true).unwrap();
+        assert_eq!(resolved.protocol(), "anthropic");
+        let resolved = anthropic
+            .client
+            .resolve_request(foreign, 4096, true)
+            .unwrap();
+        assert_eq!(resolved.protocol(), "anthropic");
+        let value = serde_json::to_value(&resolved).unwrap();
+        assert_eq!(value["system"][0]["text"], "sys");
+        assert_eq!(value["messages"][0]["content"][0]["text"], "hello");
+
+        // Native folds back down to plain chat the same way.
+        let native = anthropic
+            .build_prompt_request("sys", "hello", None, &settings)
+            .unwrap();
+        let resolved = test_llm()
+            .client
+            .resolve_request(native, 4096, true)
+            .unwrap();
+        assert_eq!(resolved.protocol(), "chat-completion");
+        let value = serde_json::to_value(&resolved).unwrap();
+        assert_eq!(value["messages"][0]["role"], "system");
+        assert_eq!(value["messages"][0]["content"], "sys");
+        assert_eq!(value["messages"][1]["role"], "user");
+        assert_eq!(value["messages"][1]["content"], "hello");
+    }
+
+    #[test]
+    fn trivial_conversions_wrap_and_unwrap() {
+        let req: LLMRequest = user_request("hi").into();
+        assert_eq!(req.protocol(), "chat-completion");
+
+        let resp: LLMResponse = crate::filters::build_resp(Some("ok"), FinishReason::Stop).into();
+        let chat: RawExtensibleChatCompletionResponse = resp.try_into().unwrap();
+        assert_eq!(
+            chat.choices[0].inner.message.inner.content.as_deref(),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn native_requests_take_auto_cache_keys_only_where_the_protocol_has_them() {
+        // The responses protocol routes by prompt_cache_key, so a native
+        // request still gets an auto key from its own rendering.
+        let responses = responses_llm();
+        let req = responses
+            .build_prompt_request("sys", "hello", None, &test_settings(None))
+            .unwrap();
+        let claim = responses
+            .auto_cache_key_request(&req, None)
+            .expect("auto key");
+        claim.confirm(0);
+
+        // The anthropic protocol routes by content: no key, no claim.
+        let anthropic = anthropic_llm();
+        let req = anthropic
+            .build_prompt_request("sys", "hello", None, &test_settings(None))
+            .unwrap();
+        assert!(anthropic.auto_cache_key_request(&req, None).is_none());
     }
 }

@@ -1138,6 +1138,7 @@ mod tests {
             cache_key_rpm: llmy_client::cache_key::DEFAULT_MAX_RPM,
             billing_log_tokens: 100_000,
             token_estimate_pct: 10.0,
+            allow_implicit_convert: false,
         }
     }
 

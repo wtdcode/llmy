@@ -2443,6 +2443,7 @@ dependencies = [
  "llmy-client",
  "llmy-types",
  "rust_decimal",
+ "tracing",
 ]
 
 [[package]]
@@ -2478,11 +2479,13 @@ dependencies = [
  "async-openai",
  "color-eyre",
  "futures",
+ "http",
  "itertools",
  "llmy-tokenizer",
  "llmy-types",
  "regex",
  "rust_decimal",
+ "secrecy",
  "serde",
  "serde_json",
  "sqlx",

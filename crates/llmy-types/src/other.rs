@@ -189,14 +189,46 @@ impl<'a> IntoIterator for &'a OtherFields {
 /// An extension to a struct that allows to capture additional fields when deserializing.
 ///
 /// See [`OtherFields`] for more information.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WithOtherFields<T> {
     /// The inner struct.
-    #[serde(flatten)]
     pub inner: T,
     /// All fields not present in the inner struct.
-    #[serde(flatten)]
     pub other: OtherFields,
+}
+
+impl<T> Serialize for WithOtherFields<T>
+where
+    T: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::Error;
+        // With no extension fields the wrapper is transparent: the inner value
+        // serializes exactly as itself. This matters for inners that are not
+        // JSON objects — e.g. a bare `tool_choice` mode, which is a plain
+        // string on the wire; a flatten-derived serializer would mangle those
+        // into `{"auto": null}`.
+        if self.other.is_empty() {
+            return self.inner.serialize(serializer);
+        }
+        let mut value = serde_json::to_value(&self.inner).map_err(S::Error::custom)?;
+        match &mut value {
+            Value::Object(map) => {
+                for (key, val) in self.other.iter() {
+                    map.insert(key.clone(), val.clone());
+                }
+            }
+            _ => {
+                return Err(S::Error::custom(
+                    "extension fields can only attach to a JSON object",
+                ));
+            }
+        }
+        value.serialize(serializer)
+    }
 }
 
 impl<T, U> AsRef<U> for WithOtherFields<T>
@@ -250,6 +282,15 @@ where
     where
         D: serde::Deserializer<'de>,
     {
+        // Buffer the value first: a non-object inner (e.g. a bare
+        // `tool_choice` mode string) has no extension fields to capture and
+        // must bypass the map-only flatten helper below.
+        let value = Value::deserialize(deserializer)?;
+        if !value.is_object() {
+            let inner = T::deserialize(value).map_err(serde::de::Error::custom)?;
+            return Ok(Self::new(inner));
+        }
+
         #[derive(Deserialize)]
         struct WithOtherFieldsHelper<T> {
             #[serde(flatten)]
@@ -258,7 +299,8 @@ where
             other: OtherFields,
         }
 
-        let mut helper = WithOtherFieldsHelper::deserialize(deserializer)?;
+        let mut helper =
+            WithOtherFieldsHelper::deserialize(value).map_err(serde::de::Error::custom)?;
         // remove all fields present in the inner struct from the other fields, this is to avoid
         // duplicate fields in the catch all other fields because serde flatten does not exclude
         // already deserialized fields when deserializing the other fields.
@@ -439,5 +481,56 @@ mod tests {
 
         let iterated_map: BTreeMap<_, _> = other_fields.into_iter().collect();
         assert_eq!(iterated_map, map);
+    }
+
+    #[test]
+    fn a_non_object_inner_round_trips_transparently() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        #[serde(tag = "type", rename_all = "lowercase")]
+        enum Choice {
+            Named {
+                name: String,
+            },
+            #[serde(untagged)]
+            Mode(Mode),
+        }
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        #[serde(rename_all = "lowercase")]
+        enum Mode {
+            Auto,
+        }
+
+        // The wire form of a bare mode is a plain string, not `{"auto": null}`.
+        let wrapped = WithOtherFields::new(Choice::Mode(Mode::Auto));
+        assert_eq!(serde_json::to_value(&wrapped).unwrap(), json!("auto"));
+        let back: WithOtherFields<Choice> = serde_json::from_value(json!("auto")).unwrap();
+        assert_eq!(back.inner, Choice::Mode(Mode::Auto));
+        assert!(back.other.is_empty());
+
+        // Tagged variants keep the object form and still capture extras.
+        let back: WithOtherFields<Choice> =
+            serde_json::from_value(json!({"type": "named", "name": "f", "extra": 1})).unwrap();
+        assert_eq!(
+            back.inner,
+            Choice::Named {
+                name: "f".to_string()
+            }
+        );
+        assert_eq!(back.other.get("extra"), Some(&json!(1)));
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            json!({"type": "named", "name": "f", "extra": 1})
+        );
+    }
+
+    #[test]
+    fn extension_fields_cannot_attach_to_a_non_object() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        #[serde(transparent)]
+        struct Plain(String);
+
+        let mut wrapped = WithOtherFields::new(Plain("x".to_string()));
+        wrapped.other.insert("extra".to_string(), json!(1));
+        assert!(serde_json::to_string(&wrapped).is_err());
     }
 }

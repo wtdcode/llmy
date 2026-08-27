@@ -91,6 +91,49 @@ impl Default for CacheKeyConfig {
     }
 }
 
+/// The cache-relevant shape of one request, independent of wire protocol: the
+/// rendered prompt blocks and where the provider will store cache entries.
+/// Each protocol's request type produces this once per selection, so the
+/// registry never needs to know which protocol it is routing for.
+#[derive(Debug, Clone)]
+pub struct CacheShape {
+    /// Rendered tool definitions; they head the chain because changing them
+    /// invalidates every later prefix.
+    pub tools_text: String,
+    /// One rendered prompt block per message, in order.
+    pub message_texts: Vec<String>,
+    /// Indices into `message_texts` carrying an explicit cache breakpoint.
+    pub breakpoints: Vec<usize>,
+    /// Whether the provider adds an implicit breakpoint on the latest message.
+    pub mode: PromptCacheMode,
+}
+
+impl CacheShape {
+    /// Read a chat-completion request's cache shape. Blocks are rendered as
+    /// the **prompt text** they stand for, via [`completion_to_string`], not
+    /// the JSON we happen to hold — anything that never reaches the model (a
+    /// breakpoint marker, a vendor extension field) must not look like a
+    /// different conversation.
+    pub fn from_chat(req: &RawExtensibleChatCompletionRequest) -> Self {
+        Self {
+            tools_text: serde_json::to_string(&req.tools).unwrap_or_default(),
+            message_texts: req.messages.iter().map(completion_to_string).collect(),
+            breakpoints: req
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message.has_cache_breakpoint())
+                .map(|(index, _)| index)
+                .collect(),
+            mode: req
+                .prompt_cache_options
+                .as_ref()
+                .and_then(|options| options.mode)
+                .unwrap_or_default(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct KeyState {
     key: String,
@@ -173,22 +216,22 @@ impl CacheKeyRegistry {
         self.config
     }
 
-    /// Pick the cache key for `req` under `policy`, take its prefixes in flight,
-    /// and charge the send against that key's budget.
+    /// Pick the cache key for a request of this `shape`, take its prefixes in
+    /// flight, and charge the send against that key's budget.
     ///
     /// The claims are provisional until [`Self::confirm`]; see [`CacheKeyClaim`].
     /// Returns `None` only when auto keys are disabled.
     fn select(
         &mut self,
-        req: &RawExtensibleChatCompletionRequest,
+        shape: &CacheShape,
         model: &OpenAIModel,
         label: Option<&str>,
     ) -> Option<(String, KeyId, Vec<PrefixHash>, u64)> {
         if !self.config.enabled {
             return None;
         }
-        let blocks = prompt_blocks(req);
-        let claimable = cache_points(req, model.cache_policy(), blocks.len());
+        let blocks = prompt_blocks(shape);
+        let claimable = cache_points(shape, model.cache_policy(), blocks.len());
 
         let now = Instant::now();
         self.expire(now);
@@ -361,17 +404,29 @@ impl CacheKeys {
         self.0.read().expect("cache keys poisoned").config()
     }
 
-    /// Pick the cache key for `req`, holding its prefixes in flight until the
-    /// returned claim settles. `None` when auto keys are disabled.
+    /// Pick the cache key for a chat request — shorthand for
+    /// [`Self::select_shape`] over [`CacheShape::from_chat`].
+    pub fn select(
+        &self,
+        req: &RawExtensibleChatCompletionRequest,
+        model: &OpenAIModel,
+        label: Option<&str>,
+    ) -> Option<CacheKeyClaim> {
+        self.select_shape(&CacheShape::from_chat(req), model, label)
+    }
+
+    /// Pick the cache key for a request of this pre-rendered shape, holding its
+    /// prefixes in flight until the returned claim settles. `None` when auto
+    /// keys are disabled.
     ///
     /// A freshly minted key is tagged with `label` — the caller's debug prefix —
     /// so logs and the debug DB show which workload opened it.
     ///
     /// Selection and the rate-limit charge happen under one lock, so concurrent
     /// callers cannot both take the last slot on a key.
-    pub fn select(
+    pub fn select_shape(
         &self,
-        req: &RawExtensibleChatCompletionRequest,
+        shape: &CacheShape,
         model: &OpenAIModel,
         label: Option<&str>,
     ) -> Option<CacheKeyClaim> {
@@ -379,7 +434,7 @@ impl CacheKeys {
             .0
             .write()
             .expect("cache keys poisoned")
-            .select(req, model, label)?;
+            .select(shape, model, label)?;
         Some(CacheKeyClaim(Arc::new(HeldClaim {
             keys: self.clone(),
             key,
@@ -541,43 +596,37 @@ struct Block {
     text: String,
 }
 
-/// Split a request into prompt blocks: the tool definitions first — they head
-/// the rendered prompt, and changing them invalidates everything after — then
-/// one per message. Block `i`'s hash covers the prefix `0..=i`, so two requests
-/// share a hash exactly when they share that stretch of prompt.
+/// Split a request's [`CacheShape`] into prompt blocks: the tool definitions
+/// first — they head the rendered prompt, and changing them invalidates
+/// everything after — then one per message. Block `i`'s hash covers the prefix
+/// `0..=i`, so two requests share a hash exactly when they share that stretch
+/// of prompt.
 ///
-/// Blocks are hashed as the **prompt text** they render to, via
-/// [`completion_to_string`], not as the JSON we happen to hold. What the
-/// provider caches is tokens, so anything that never reaches the model — a
-/// `prompt_cache_breakpoint` marker, the lone-text array that
-/// [`crate::req::RawExtensibleChatRequestMessage::breakpoint`] promotes content
-/// into, a vendor extension field — must not look like a different conversation.
-/// The bias is deliberate: a false match only wastes a lookup on the wrong
-/// machine, while a false miss throws away a real cache hit.
+/// The shape's blocks are already the **prompt text** the request renders to
+/// (see [`CacheShape::from_chat`]), so a false match only wastes a lookup on
+/// the wrong machine, while a false miss would throw away a real cache hit.
 ///
 /// The rendered text is kept rather than dropped, so pricing a newly claimed
 /// prefix does not have to render it a second time.
-fn prompt_blocks(req: &RawExtensibleChatCompletionRequest) -> Vec<Block> {
-    let mut blocks = Vec::with_capacity(req.messages.len() + 1);
+fn prompt_blocks(shape: &CacheShape) -> Vec<Block> {
+    let mut blocks = Vec::with_capacity(shape.message_texts.len() + 1);
     // One hasher fed block by block. `Hasher::finish` reads the running value
     // without resetting it, so block `i` comes out carrying the hash of the
     // whole prefix `0..=i` for a single pass over the prompt.
     let mut hasher = DefaultHasher::new();
 
     // Tool definitions go into the prompt as their schemas, so hash them so.
-    let tools = serde_json::to_string(&req.tools).unwrap_or_default();
-    hasher.write(tools.as_bytes());
+    hasher.write(shape.tools_text.as_bytes());
     blocks.push(Block {
         hash: hasher.finish(),
-        text: tools,
+        text: shape.tools_text.clone(),
     });
 
-    for message in req.messages.iter() {
-        let text = completion_to_string(message);
+    for text in shape.message_texts.iter() {
         hasher.write(text.as_bytes());
         blocks.push(Block {
             hash: hasher.finish(),
-            text,
+            text: text.clone(),
         });
     }
     blocks
@@ -599,31 +648,16 @@ fn prompt_blocks(req: &RawExtensibleChatCompletionRequest) -> Vec<Block> {
 /// link when the tools change. Claiming it would collapse every conversation
 /// sharing a toolbox — including all the ones with no tools at all — onto a
 /// single key.
-fn cache_points(
-    req: &RawExtensibleChatCompletionRequest,
-    policy: CachePolicy,
-    chain_len: usize,
-) -> Vec<usize> {
+fn cache_points(shape: &CacheShape, policy: CachePolicy, chain_len: usize) -> Vec<usize> {
     if !policy.needs_breakpoints() {
         return (1..chain_len).collect();
     }
 
     // chain[0] is the tools block, so message `i` lives at chain[i + 1].
-    let mut points: Vec<usize> = req
-        .messages
-        .iter()
-        .enumerate()
-        .filter(|(_, message)| message.has_cache_breakpoint())
-        .map(|(index, _)| index + 1)
-        .collect();
+    let mut points: Vec<usize> = shape.breakpoints.iter().map(|index| index + 1).collect();
 
-    let mode = req
-        .prompt_cache_options
-        .as_ref()
-        .and_then(|options| options.mode)
-        .unwrap_or_default();
     let last = chain_len - 1;
-    if mode == PromptCacheMode::Implicit && last > 0 && points.last() != Some(&last) {
+    if shape.mode == PromptCacheMode::Implicit && last > 0 && points.last() != Some(&last) {
         points.push(last);
     }
     points
@@ -662,7 +696,10 @@ mod tests {
     }
 
     fn hashes(req: &RawExtensibleChatCompletionRequest) -> Vec<PrefixHash> {
-        prompt_blocks(req).into_iter().map(|b| b.hash).collect()
+        prompt_blocks(&CacheShape::from_chat(req))
+            .into_iter()
+            .map(|b| b.hash)
+            .collect()
     }
 
     /// A model whose cache is the transparent prefix kind, the common case.
@@ -690,7 +727,11 @@ mod tests {
     /// What `PartialPrefix` claims for a request of `n` messages.
     fn claims_of(messages: &[&str]) -> Vec<usize> {
         let req = request(messages);
-        cache_points(&req, CachePolicy::PartialPrefix, messages.len() + 1)
+        cache_points(
+            &CacheShape::from_chat(&req),
+            CachePolicy::PartialPrefix,
+            messages.len() + 1,
+        )
     }
 
     #[test]
@@ -927,18 +968,27 @@ mod tests {
 
         // Implicit is the API default: the declared breakpoint, plus the end of
         // the request, which the API breaks on by itself.
-        assert_eq!(cache_points(&req, CachePolicy::Breakpoint, 4), vec![1, 3]);
+        assert_eq!(
+            cache_points(&CacheShape::from_chat(&req), CachePolicy::Breakpoint, 4),
+            vec![1, 3]
+        );
 
         // Explicit suppresses that, leaving only what the caller declared.
         req.prompt_cache_options = Some(PromptCacheOptionsRaw::explicit());
-        assert_eq!(cache_points(&req, CachePolicy::Breakpoint, 4), vec![1]);
+        assert_eq!(
+            cache_points(&CacheShape::from_chat(&req), CachePolicy::Breakpoint, 4),
+            vec![1]
+        );
     }
 
     #[test]
     fn a_breakpoint_on_the_last_message_is_not_claimed_twice() {
         let mut req = request(&["a", "b"]);
         req.messages[1].toggle_cache_breakpoint(true);
-        assert_eq!(cache_points(&req, CachePolicy::Breakpoint, 3), vec![2]);
+        assert_eq!(
+            cache_points(&CacheShape::from_chat(&req), CachePolicy::Breakpoint, 3),
+            vec![2]
+        );
     }
 
     #[test]

@@ -10,7 +10,12 @@ repository.workspace = true
 
 [dependencies]
 serde = {workspace = true, features = ["derive"]}
-async-openai = {workspace = true, features = ["completions", "completion-types", "chat-completion", "chat-completion-types", "byot"]}
+async-openai = {workspace = true, features = ["completions", "completion-types", "chat-completion", "chat-completion-types", "responses", "byot"]}
+# `AnthropicConfig` implements `async_openai::config::Config`, whose signature
+# names `reqwest::header::HeaderMap` (a re-export of `http`'s) and
+# `secrecy::SecretString`. Both versions must stay in lockstep with async-openai.
+http = "1"
+secrecy = "0.10"
 color-eyre.workspace = true
 tracing.workspace = true
 serde_json.workspace = true

@@ -5,12 +5,10 @@ use crate::resp::RawExtensibleChatCompletionResponse;
 
 mod google;
 mod json;
-mod mimo;
 mod no_filter;
 
 pub use google::GoogleContentFilter;
 pub use json::{MarkdownTagFilter, strip_markdown_fence};
-pub use mimo::MiMoContentFilter;
 pub use no_filter::NoFilter;
 
 /// A hook applied to every outgoing request and incoming response, used to

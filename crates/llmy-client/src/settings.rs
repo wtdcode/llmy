@@ -110,6 +110,11 @@ pub struct LLMSettings {
     /// How far the local token estimate may drift from the provider's count, in
     /// percent, before the comparison is logged at INFO instead of DEBUG.
     pub token_estimate_pct: f64,
+    /// Allow a request whose wire format differs from the backend's protocol
+    /// to be implicitly converted (through the chat form) instead of being
+    /// refused (`LLMY_ALLOW_IMPLICIT_CONVERT`). Only requests already in the
+    /// backend's own format are sent without it.
+    pub allow_implicit_convert: bool,
 }
 
 impl LLMSettings {

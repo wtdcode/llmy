@@ -27,7 +27,7 @@ use crate::req::{
     ChatCompletionRequestMessageRaw, ChatCompletionRequestSystemMessageContent,
     ChatCompletionRequestSystemMessageContentPartRaw, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestToolMessageContentPartRaw, ChatCompletionRequestUserMessageContent,
-    ChatCompletionRequestUserMessageContentPartRaw, ChatCompletionToolsRaw,
+    ChatCompletionRequestUserMessageContentPartRaw, ChatCompletionTools, ChatCompletionToolsRaw,
     CreateChatCompletionRequestRaw, RawExtensibleChatCompletionRequest,
 };
 use crate::resp::{ChatCompletionResponseMessage, RawExtensibleChatCompletionResponse};
@@ -227,30 +227,36 @@ pub(crate) async fn write_json_snapshot<T: Serialize>(path: &Path, t: &T) -> Res
     Ok(())
 }
 
-pub(crate) async fn save_llm_user(
-    fpath: &PathBuf,
-    request: &RawExtensibleChatCompletionRequest,
-) -> Result<(), LLMYError> {
-    let mut fp = tokio::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&fpath)
-        .await?;
-    fp.write_all(b"=====================\n<Request>\n").await?;
-    for it in request.messages.iter() {
-        let msg = completion_to_string(it);
-        fp.write_all(msg.as_bytes()).await?;
-    }
+/// A request rendered for recording, produced at the call site so the backend
+/// stays protocol-agnostic: the JSON is the wire truth — whatever protocol the
+/// request actually goes out in — and the renderings are its prompt-text view.
+#[derive(Debug, Clone)]
+pub struct DebugRequest {
+    /// Exactly what goes on the wire.
+    pub json: serde_json::Value,
+    /// Prompt-text rendering of the conversation (tools excluded); also the
+    /// prefix the response rendering is appended to for `full_conversation`.
+    pub conversation: String,
+    /// Tool definitions rendered for the folder backend's XML view; empty when
+    /// the request carries none.
+    pub tools_text: String,
+}
 
-    let mut tools = vec![];
-    for tool in request
-        .tools
-        .as_ref()
-        .map(|t| t.iter())
-        .into_iter()
-        .flatten()
-    {
+impl DebugRequest {
+    /// Render a chat-completion request for recording.
+    pub fn from_chat(request: &RawExtensibleChatCompletionRequest) -> Self {
+        Self {
+            json: serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
+            conversation: format_request_conversation(request),
+            tools_text: chat_tools_text(request.tools.as_deref()),
+        }
+    }
+}
+
+/// Render chat tool definitions the way the folder backend prints them.
+pub(crate) fn chat_tools_text(tools: Option<&[ChatCompletionTools]>) -> String {
+    let mut rendered = vec![];
+    for tool in tools.into_iter().flatten() {
         let s = match &tool.inner {
             ChatCompletionToolsRaw::Function(tool) => {
                 format!(
@@ -261,8 +267,7 @@ pub(crate) async fn save_llm_user(
                     tool.function
                         .parameters
                         .as_ref()
-                        .map(serde_json::to_string_pretty)
-                        .transpose()?
+                        .and_then(|p| serde_json::to_string_pretty(p).ok())
                         .unwrap_or_default()
                 )
             }
@@ -273,14 +278,29 @@ pub(crate) async fn save_llm_user(
                 )
             }
         };
-        tools.push(s);
+        rendered.push(s);
     }
-    fp.write_all(tools.join("\n").as_bytes()).await?;
+    rendered.join("\n")
+}
+
+pub(crate) async fn save_llm_user(
+    fpath: &PathBuf,
+    request: &DebugRequest,
+) -> Result<(), LLMYError> {
+    let mut fp = tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&fpath)
+        .await?;
+    fp.write_all(b"=====================\n<Request>\n").await?;
+    fp.write_all(request.conversation.as_bytes()).await?;
+    fp.write_all(request.tools_text.as_bytes()).await?;
     fp.write_all(b"\n</Request>\n=====================\n")
         .await?;
     fp.flush().await?;
 
-    rewrite_json(fpath, request).await?;
+    rewrite_json(fpath, &request.json).await?;
 
     Ok(())
 }
@@ -290,9 +310,12 @@ pub(crate) fn extract_raw_text_with_other(request: &RawExtensibleChatCompletionR
     extract_raw_text(&request)
 }
 
+/// Append a response to the folder record: the choices rendered from the
+/// normalized chat view, the JSON straight from the wire.
 pub(crate) async fn save_llm_resp(
     fpath: &PathBuf,
-    resp: &RawExtensibleChatCompletionResponse,
+    resp_json: &serde_json::Value,
+    chat_view: &RawExtensibleChatCompletionResponse,
 ) -> Result<(), LLMYError> {
     let mut fp = tokio::fs::OpenOptions::new()
         .create(false)
@@ -301,15 +324,13 @@ pub(crate) async fn save_llm_resp(
         .open(&fpath)
         .await?;
     fp.write_all(b"=====================\n<Response>\n").await?;
-    for it in &resp.choices {
-        let msg = response_to_string(&it.message);
-        fp.write_all(msg.as_bytes()).await?;
-    }
+    fp.write_all(format_response_conversation(chat_view).as_bytes())
+        .await?;
     fp.write_all(b"\n</Response>\n=====================\n")
         .await?;
     fp.flush().await?;
 
-    rewrite_json(fpath, resp).await?;
+    rewrite_json(fpath, resp_json).await?;
 
     Ok(())
 }
@@ -799,10 +820,10 @@ impl Sqlite3DebugDB {
         &self,
         debug_prefix: &str,
         ctx: &DebugRowContext,
-        req: &RawExtensibleChatCompletionRequest,
+        req: &DebugRequest,
     ) -> Result<i64, LLMYError> {
-        let raw_req = serde_json::to_string(req)?;
-        let full_conversation = format_request_conversation(req);
+        let raw_req = serde_json::to_string(&req.json)?;
+        let full_conversation = req.conversation.clone();
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -838,12 +859,17 @@ impl Sqlite3DebugDB {
     async fn update_response(
         &self,
         row_id: i64,
-        req: &RawExtensibleChatCompletionRequest,
-        resp: &RawExtensibleChatCompletionResponse,
+        req_conversation: &str,
+        resp_json: &serde_json::Value,
+        chat_view: &RawExtensibleChatCompletionResponse,
     ) -> Result<(), LLMYError> {
-        let raw_resp = serde_json::to_string(resp)?;
-        let full_conversation = format_full_conversation(req, resp);
-        let resp_text = first_choice_text(resp);
+        let raw_resp = serde_json::to_string(resp_json)?;
+        let full_conversation = format!(
+            "{}{}",
+            req_conversation,
+            format_response_conversation(chat_view)
+        );
+        let resp_text = first_choice_text(chat_view);
         sqlx::query(
             r#"UPDATE llm_debug
                SET raw_resp = ?, resp_text_content = ?, full_conversation = ?
@@ -1010,7 +1036,7 @@ impl DebugBackend {
         &self,
         debug_prefix: &str,
         ctx: DebugRowContext,
-        req: &RawExtensibleChatCompletionRequest,
+        req: &DebugRequest,
     ) -> Option<DebugHandle> {
         match self {
             DebugBackend::Sqlite3(db) => match db.insert_request(debug_prefix, &ctx, req).await {
@@ -1047,20 +1073,26 @@ impl DebugBackend {
         }
     }
 
+    /// Record a response: `resp_json` is the wire truth (whatever protocol it
+    /// arrived in), `chat_view` its normalized rendering for the text columns.
     pub async fn record_response(
         &self,
         handle: &DebugHandle,
-        req: &RawExtensibleChatCompletionRequest,
-        resp: &RawExtensibleChatCompletionResponse,
+        req: &DebugRequest,
+        resp_json: &serde_json::Value,
+        chat_view: &RawExtensibleChatCompletionResponse,
     ) {
         match (self, handle) {
             (DebugBackend::Sqlite3(db), DebugHandle::Sqlite3 { row_id }) => {
-                if let Err(e) = db.update_response(*row_id, req, resp).await {
+                if let Err(e) = db
+                    .update_response(*row_id, &req.conversation, resp_json, chat_view)
+                    .await
+                {
                     tracing::warn!("Fail to record debug response: {}", e);
                 }
             }
             (DebugBackend::Folder(_), DebugHandle::Folder { fpath }) => {
-                if let Err(e) = save_llm_resp(fpath, resp).await {
+                if let Err(e) = save_llm_resp(fpath, resp_json, chat_view).await {
                     tracing::warn!("Fail to save resp due to {}", e);
                 }
             }
@@ -1129,11 +1161,10 @@ fn format_request_conversation(req: &RawExtensibleChatCompletionRequest) -> Stri
     s
 }
 
-fn format_full_conversation(
-    req: &RawExtensibleChatCompletionRequest,
-    resp: &RawExtensibleChatCompletionResponse,
-) -> String {
-    let mut s = format_request_conversation(req);
+/// Prompt-text rendering of a (chat-view) response's choices; appended to the
+/// request rendering to form `full_conversation`.
+fn format_response_conversation(resp: &RawExtensibleChatCompletionResponse) -> String {
+    let mut s = String::new();
     for ch in &resp.choices {
         s.push_str(&response_to_string(&ch.message));
     }
@@ -1211,10 +1242,20 @@ mod sqlite_tests {
             cache_key: Some("cache-key-1".to_string()),
             cap_usd: 10.0,
         };
-        let id = db.insert_request("test", &ctx, &req).await.unwrap();
+        let id = db
+            .insert_request("test", &ctx, &DebugRequest::from_chat(&req))
+            .await
+            .unwrap();
 
         let resp = dummy_resp();
-        db.update_response(id, &req, &resp).await.unwrap();
+        db.update_response(
+            id,
+            &DebugRequest::from_chat(&req).conversation,
+            &serde_json::to_value(&resp).unwrap(),
+            &resp,
+        )
+        .await
+        .unwrap();
 
         let billing = TokenBilling::new(rust_decimal::dec!(10.0));
         let usage = DebugUsage {
@@ -1407,7 +1448,7 @@ INSERT INTO prefix_billing VALUES (1, 'planner', 10, 2, 5, 1, 1.5);
                     cache_key: None,
                     cap_usd: 10.0,
                 },
-                &dummy_req(),
+                &DebugRequest::from_chat(&dummy_req()),
             )
             .await
             .unwrap();
