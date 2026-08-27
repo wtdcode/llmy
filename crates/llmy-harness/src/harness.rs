@@ -343,8 +343,12 @@ impl Agent {
         let retry = settings.llm_retry;
         let mut req = llm.build_chat_request(messages, cache_key, &settings, tools)?;
         self.apply_cache_options(llm, &mut req);
+        // Lower the chat-typed conversation into the backend's wire format
+        // explicitly, so the agent runs natively on every protocol without the
+        // implicit-conversion opt-in.
+        let req = llm.lower_request(req)?;
         let mut resp = llm
-            .complete_extensible_once_with_retry(&req, debug_prefix, Some(timeout), Some(retry))
+            .complete_request_once_with_retry(req, debug_prefix, Some(timeout), Some(retry))
             .await?;
 
         if resp.choices.is_empty() {

@@ -185,9 +185,11 @@ impl LLMClient {
     /// implicit conversion through the chat hub, allowed only when
     /// `allow_implicit_convert` is set (`LLMY_ALLOW_IMPLICIT_CONVERT`):
     /// rewriting a request into another protocol should be a conscious
-    /// choice. `default_max_output_tokens` backs the Anthropic protocol's
-    /// mandatory `max_tokens` when a converted request carries no bound of
-    /// its own.
+    /// choice. Callers holding protocol-neutral conversation state rather
+    /// than a wire request build natively via [`Self::lower_chat_request`]
+    /// instead, which needs no opt-in. `default_max_output_tokens` backs the
+    /// Anthropic protocol's mandatory `max_tokens` when a converted request
+    /// carries no bound of its own.
     pub fn resolve_request(
         &self,
         req: LLMRequest,
@@ -216,6 +218,20 @@ impl LLMClient {
             LLMRequest::Anthropic(req) => req.into_inner().into_chat_request()?,
             LLMRequest::Responses(req) => req.into_inner().into_chat_request()?,
         };
+        self.lower_chat_request(chat, default_max_output_tokens)
+    }
+
+    /// Lower a chat-typed request into this backend's wire format — the
+    /// *explicit* counterpart of the conversion inside
+    /// [`Self::resolve_request`]. Callers holding protocol-neutral
+    /// conversation state (the agent harness, the message-level prompt APIs)
+    /// build their native request through here deliberately, so the
+    /// `allow_implicit_convert` opt-in does not apply.
+    pub fn lower_chat_request(
+        &self,
+        chat: RawExtensibleChatCompletionRequest,
+        default_max_output_tokens: u32,
+    ) -> Result<LLMRequest, LLMYError> {
         match self {
             Self::Azure(_) | Self::OpenAI(_) => Ok(LLMRequest::Chat(chat)),
             Self::Anthropic(_) => Ok(LLMRequest::Anthropic(
@@ -876,6 +892,18 @@ impl LLMInner {
     /// `max_tokens`) when the request itself carries none.
     fn default_max_output_tokens(&self) -> u32 {
         self.model.config.max_tokens.try_into().unwrap_or(u32::MAX)
+    }
+
+    /// Lower a chat-typed request into the backend's wire format — see
+    /// [`LLMClient::lower_chat_request`]. This is how conversation-state
+    /// callers (agents, the message-level prompt APIs) go native on any
+    /// backend without the implicit-conversion opt-in.
+    pub fn lower_request(
+        &self,
+        chat: RawExtensibleChatCompletionRequest,
+    ) -> Result<LLMRequest, LLMYError> {
+        self.client
+            .lower_chat_request(chat, self.default_max_output_tokens())
     }
 
     /// Replace the content filter applied to every request and response. Defaults to
@@ -1656,7 +1684,9 @@ impl LLMInner {
             .map(RawExtensibleChatRequestMessage::new)
             .collect();
         let req = self.build_chat_request(wrapped, cache_key, &settings, tools)?;
-        self.complete_extensible_once_with_retry(&req, debug_prefix, Some(timeout), Some(retry))
+        // Explicit lowering: message-level callers go native on any backend.
+        let req = self.lower_request(req)?;
+        self.complete_request_once_with_retry(req, debug_prefix, Some(timeout), Some(retry))
             .await
     }
 
@@ -1680,8 +1710,10 @@ impl LLMInner {
             .collect();
         let req: RawExtensibleChatCompletionRequest =
             self.build_chat_request(wrapped, cache_key, &settings, tools)?;
-        self.complete_extensible_once_with_retry_typed::<T>(
-            &req,
+        // Explicit lowering: message-level callers go native on any backend.
+        let req = self.lower_request(req)?;
+        self.complete_request_once_with_retry_typed::<T>(
+            req,
             debug_prefix,
             Some(timeout),
             Some(retry),
@@ -2455,6 +2487,24 @@ mod tests {
             chat.choices[0].inner.message.inner.content.as_deref(),
             Some("ok")
         );
+    }
+
+    #[test]
+    fn conversation_state_lowers_natively_without_the_opt_in() {
+        // Agents and the message-level APIs hold chat-typed conversation
+        // state; lowering it is an explicit build, not an implicit conversion,
+        // so it needs no allow_implicit_convert even on native backends.
+        let anthropic = anthropic_llm();
+        assert!(!anthropic.default_settings.allow_implicit_convert);
+        let lowered = anthropic.lower_request(user_request("hello")).unwrap();
+        assert_eq!(lowered.protocol(), "anthropic");
+
+        let responses = responses_llm();
+        let lowered = responses.lower_request(user_request("hello")).unwrap();
+        assert_eq!(lowered.protocol(), "responses");
+
+        let chat = test_llm().lower_request(user_request("hello")).unwrap();
+        assert_eq!(chat.protocol(), "chat-completion");
     }
 
     #[test]
