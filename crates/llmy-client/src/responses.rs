@@ -12,6 +12,14 @@
 //! filters and cache keys all keep operating on one set of types. Requests are
 //! sent with `store: false` unless the caller opts in, mirroring chat
 //! completion's statelessness.
+//!
+//! Multi-turn fidelity: conversation-state callers hold
+//! [`crate::message::Message`]s, and this module maps them natively in both
+//! directions — [`ResponsesRequestRaw::from_conversation`] builds the request
+//! straight from typed parts (reasoning items replay with their
+//! `encrypted_content`), and [`ResponsesResponseRaw::to_message`] parses the
+//! reply back into them. Stateless requests ask for
+//! `reasoning.encrypted_content` back so the replay has something to carry.
 
 use color_eyre::eyre::eyre;
 use llmy_types::{error::LLMYError, other::WithOtherFields};
@@ -19,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cache_key::CacheShape;
+use crate::message::{Message, MessagePart, MessageRole};
 use crate::req::PromptCacheMode;
 use crate::req::{
     ChatCompletionMessageToolCallRaw, ChatCompletionMessageToolCallsRaw,
@@ -49,6 +58,10 @@ use crate::resp::{
     PromptTokensDetailsRaw, RawExtensibleChatCompletionResponse,
 };
 use crate::settings::LLMSettings;
+
+/// Protocol tag carried by [`MessagePart::Opaque`] parts this module produces,
+/// so replay stays confined to its own protocol.
+const RESPONSES_PROTOCOL: &str = "responses";
 
 // ---------------------------------------------------------------------------
 // Wire types: request
@@ -83,8 +96,10 @@ pub enum ResponsesInputPartRaw {
         #[serde(skip_serializing_if = "Option::is_none")]
         filename: Option<String>,
     },
-    #[serde(other)]
-    Unknown,
+    /// Part kinds this client does not model, captured verbatim so a replayed
+    /// conversation keeps them.
+    #[serde(untagged)]
+    Raw(Value),
 }
 pub type ResponsesInputPart = WithOtherFields<ResponsesInputPartRaw>;
 
@@ -111,8 +126,20 @@ pub enum ResponsesInputItemRaw {
         call_id: String,
         output: String,
     },
-    #[serde(other)]
-    Unknown,
+    /// A replayed reasoning item; `encrypted_content` carries the model's own
+    /// reasoning back on stateless requests.
+    Reasoning {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default)]
+        summary: Vec<ResponsesReasoningSummary>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
+    /// Item kinds this client does not model (built-in tool calls), captured
+    /// verbatim so they go back on the wire untouched.
+    #[serde(untagged)]
+    Raw(Value),
 }
 pub type ResponsesInputItem = WithOtherFields<ResponsesInputItemRaw>;
 
@@ -136,8 +163,10 @@ pub enum ResponsesToolRaw {
         #[serde(skip_serializing_if = "Option::is_none")]
         strict: Option<bool>,
     },
-    #[serde(other)]
-    Unknown,
+    /// Tool kinds this client does not model (built-in tools), captured
+    /// verbatim.
+    #[serde(untagged)]
+    Raw(Value),
 }
 pub type ResponsesTool = WithOtherFields<ResponsesToolRaw>;
 
@@ -208,6 +237,11 @@ pub struct ResponsesRequestRaw {
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponsesReasoning>,
+    /// Extra response payloads to include. `reasoning.encrypted_content` is
+    /// requested automatically for stateless (`store: false`) requests, so
+    /// reasoning items can be replayed on the next turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<ResponsesTextConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -241,8 +275,9 @@ pub enum ResponsesOutputContentRaw {
     Refusal {
         refusal: String,
     },
-    #[serde(other)]
-    Unknown,
+    /// Content kinds this client does not model, captured verbatim.
+    #[serde(untagged)]
+    Raw(Value),
 }
 pub type ResponsesOutputContent = WithOtherFields<ResponsesOutputContentRaw>;
 
@@ -252,8 +287,9 @@ pub enum ResponsesReasoningSummaryRaw {
     SummaryText {
         text: String,
     },
-    #[serde(other)]
-    Unknown,
+    /// Summary kinds this client does not model, captured verbatim.
+    #[serde(untagged)]
+    Raw(Value),
 }
 pub type ResponsesReasoningSummary = WithOtherFields<ResponsesReasoningSummaryRaw>;
 
@@ -278,11 +314,13 @@ pub enum ResponsesOutputItemRaw {
         id: Option<String>,
         #[serde(default)]
         summary: Vec<ResponsesReasoningSummary>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
     },
     /// Output item kinds this client does not model (built-in tool calls
-    /// etc.). Tolerated on deserialize, ignored by the conversion.
-    #[serde(other)]
-    Unknown,
+    /// etc.), captured verbatim so a replayed conversation keeps them.
+    #[serde(untagged)]
+    Raw(Value),
 }
 pub type ResponsesOutputItem = WithOtherFields<ResponsesOutputItemRaw>;
 
@@ -456,6 +494,8 @@ impl ResponsesRequestRaw {
             safety_identifier: raw.safety_identifier.clone(),
             service_tier: raw.service_tier.clone(),
             metadata: raw.metadata.clone(),
+            include: (!raw.store.unwrap_or(false))
+                .then(|| vec!["reasoning.encrypted_content".to_string()]),
             store: Some(raw.store.unwrap_or(false)),
             stream: raw.stream,
         }))
@@ -715,13 +755,31 @@ impl ResponsesRequestRaw {
     }
 
     /// Build a native prompt request straight from strings — nothing is forced
-    /// through the chat-completion shape on its way to the wire. The caller's
-    /// settings map onto the protocol's own fields; a setting with no slot
-    /// here (`presence_penalty`) is refused rather than dropped.
+    /// through the chat-completion shape on its way to the wire.
     pub fn from_prompt(
         model: &str,
         sys_msg: &str,
         user_msg: &str,
+        cache_key: Option<&str>,
+        settings: &LLMSettings,
+    ) -> Result<ResponsesRequest, LLMYError> {
+        let mut conversation = Vec::new();
+        if !sys_msg.is_empty() {
+            conversation.push(Message::system(sys_msg));
+        }
+        conversation.push(Message::user(user_msg));
+        Self::from_conversation(model, &conversation, None, cache_key, settings)
+    }
+
+    /// Build the native request straight from a protocol-neutral conversation:
+    /// typed parts map onto their own items — reasoning replays with its
+    /// `encrypted_content` — so nothing is forced through the chat shape. The
+    /// caller's settings map onto the protocol's own fields; a setting with no
+    /// slot here (`presence_penalty`) is refused rather than dropped.
+    pub fn from_conversation(
+        model: &str,
+        conversation: &[Message],
+        tools: Option<&[ChatCompletionTools]>,
         cache_key: Option<&str>,
         settings: &LLMSettings,
     ) -> Result<ResponsesRequest, LLMYError> {
@@ -735,17 +793,13 @@ impl ResponsesRequestRaw {
             Some(choice) => Self::tool_choice(Some(&choice.0))?,
             None => None,
         };
+        let tools = tools.map(Self::tools).transpose()?;
+
         let mut input = Vec::new();
-        if !sys_msg.is_empty() {
-            input.push(ResponsesInputItemRaw::message(
-                ResponsesRole::System,
-                ResponsesInputContent::Text(sys_msg.to_string()),
-            ));
+        for message in conversation {
+            Self::conversation_items(message, &mut input)?;
         }
-        input.push(ResponsesInputItemRaw::message(
-            ResponsesRole::User,
-            ResponsesInputContent::Text(user_msg.to_string()),
-        ));
+
         Ok(WithOtherFields::new(Self {
             model: model.to_string(),
             input,
@@ -753,7 +807,7 @@ impl ResponsesRequestRaw {
             temperature: settings.llm_temperature,
             top_p: settings.top_p,
             top_logprobs: None,
-            tools: None,
+            tools,
             tool_choice,
             parallel_tool_calls: None,
             reasoning: settings.reasoning_effort.as_ref().map(|effort| {
@@ -766,9 +820,110 @@ impl ResponsesRequestRaw {
             safety_identifier: None,
             service_tier: None,
             metadata: None,
+            include: Some(vec!["reasoning.encrypted_content".to_string()]),
             store: Some(false),
             stream: None,
         }))
+    }
+
+    /// One neutral message into native input items, in part order. Parts
+    /// belonging to another protocol (anthropic thinking, foreign opaque
+    /// parts) are skipped — their payloads are only valid where they were
+    /// issued. The protocol has no explicit cache breakpoints, so the flag is
+    /// ignored here.
+    fn conversation_items(
+        message: &Message,
+        input: &mut Vec<ResponsesInputItem>,
+    ) -> Result<(), LLMYError> {
+        let role = match message.role {
+            MessageRole::System => ResponsesRole::System,
+            MessageRole::Assistant => ResponsesRole::Assistant,
+            MessageRole::User | MessageRole::Tool => ResponsesRole::User,
+        };
+        let mut parts: Vec<ResponsesInputPart> = Vec::new();
+        let flush = |parts: &mut Vec<ResponsesInputPart>, input: &mut Vec<ResponsesInputItem>| {
+            if parts.is_empty() {
+                return;
+            }
+            let content = if let [part] = parts.as_slice()
+                && let ResponsesInputPartRaw::InputText { text } = &part.inner
+            {
+                ResponsesInputContent::Text(text.clone())
+            } else {
+                ResponsesInputContent::Parts(std::mem::take(parts))
+            };
+            parts.clear();
+            input.push(ResponsesInputItemRaw::message(role, content));
+        };
+        for part in &message.parts {
+            match part {
+                MessagePart::Text { text } => {
+                    parts.push(WithOtherFields::new(ResponsesInputPartRaw::InputText {
+                        text: text.clone(),
+                    }))
+                }
+                MessagePart::Image { url } => {
+                    parts.push(WithOtherFields::new(ResponsesInputPartRaw::InputImage {
+                        image_url: Some(url.clone()),
+                        detail: None,
+                    }))
+                }
+                MessagePart::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                    extra,
+                } => {
+                    flush(&mut parts, input);
+                    let mut item = WithOtherFields::new(ResponsesInputItemRaw::FunctionCall {
+                        call_id: id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    });
+                    item.other = extra.clone();
+                    input.push(item);
+                }
+                MessagePart::ToolResult { id, content } => {
+                    flush(&mut parts, input);
+                    input.push(WithOtherFields::new(
+                        ResponsesInputItemRaw::FunctionCallOutput {
+                            call_id: id.clone(),
+                            output: content.clone(),
+                        },
+                    ));
+                }
+                MessagePart::Reasoning {
+                    id,
+                    summary,
+                    encrypted_content,
+                } => {
+                    flush(&mut parts, input);
+                    input.push(WithOtherFields::new(ResponsesInputItemRaw::Reasoning {
+                        id: id.clone(),
+                        summary: summary
+                            .iter()
+                            .map(|text| {
+                                WithOtherFields::new(ResponsesReasoningSummaryRaw::SummaryText {
+                                    text: text.clone(),
+                                })
+                            })
+                            .collect(),
+                        encrypted_content: encrypted_content.clone(),
+                    }));
+                }
+                MessagePart::Opaque { protocol, value } if protocol == RESPONSES_PROTOCOL => {
+                    flush(&mut parts, input);
+                    input.push(WithOtherFields::new(ResponsesInputItemRaw::Raw(
+                        value.clone(),
+                    )));
+                }
+                MessagePart::Thinking { .. }
+                | MessagePart::RedactedThinking { .. }
+                | MessagePart::Opaque { .. } => {}
+            }
+        }
+        flush(&mut parts, input);
+        Ok(())
     }
 
     /// Prompt-text rendering of one input item, tagged the same way as the
@@ -800,7 +955,7 @@ impl ResponsesRequestRaw {
                                     "<file name={:?} id={:?}/>",
                                     filename, file_id
                                 )),
-                                ResponsesInputPartRaw::Unknown => {}
+                                ResponsesInputPartRaw::Raw(_) => {}
                             }
                         }
                     }
@@ -819,7 +974,9 @@ impl ResponsesRequestRaw {
                 "<toolresult id=\"{}\">\n{}\n</toolresult>\n",
                 call_id, output
             ),
-            ResponsesInputItemRaw::Unknown => String::new(),
+            ResponsesInputItemRaw::Reasoning { .. } | ResponsesInputItemRaw::Raw(_) => {
+                String::new()
+            }
         }
     }
 
@@ -849,7 +1006,7 @@ impl ResponsesRequestRaw {
                         .and_then(|p| serde_json::to_string_pretty(p).ok())
                         .unwrap_or_default()
                 ),
-                ResponsesToolRaw::Unknown => String::new(),
+                ResponsesToolRaw::Raw(_) => String::new(),
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -931,7 +1088,11 @@ impl ResponsesRequestRaw {
                         ChatCompletionRequestToolMessageRaw::new_text(output, call_id),
                     )))
                 }
-                ResponsesInputItemRaw::Unknown => {
+                // Reasoning replay has no chat slot; degrading it is the whole
+                // point of asking for the chat form, so it is dropped rather
+                // than refused.
+                ResponsesInputItemRaw::Reasoning { .. } => {}
+                ResponsesInputItemRaw::Raw(_) => {
                     return Err(eyre!("an unknown input item has no chat-completion form").into());
                 }
             }
@@ -958,7 +1119,7 @@ impl ResponsesRequestRaw {
                                 }),
                             }),
                         ))),
-                        ResponsesToolRaw::Unknown => Err(LLMYError::from(eyre!(
+                        ResponsesToolRaw::Raw(_) => Err(LLMYError::from(eyre!(
                             "an unknown tool type has no chat-completion form"
                         ))),
                     })
@@ -1108,7 +1269,7 @@ impl ResponsesRequestRaw {
                                             },
                                         ),
                                     ),
-                                    ResponsesInputPartRaw::Unknown => {
+                                    ResponsesInputPartRaw::Raw(_) => {
                                         return Err(LLMYError::from(eyre!(
                                             "an unknown input part has no chat-completion form"
                                         )));
@@ -1160,6 +1321,64 @@ impl ResponsesRequestRaw {
 // ---------------------------------------------------------------------------
 
 impl ResponsesResponseRaw {
+    /// The assistant turn of this response in protocol-neutral form — typed
+    /// parts, encrypted reasoning included, ready to go back into conversation
+    /// state. Item-level extras ride the tool-call part (with the item's own
+    /// `id`), so a replayed `function_call` reproduces them.
+    pub fn to_message(&self) -> Message {
+        let mut parts = Vec::new();
+        for item in &self.output {
+            match &item.inner {
+                ResponsesOutputItemRaw::Message { content, .. } => {
+                    for part in content {
+                        if let ResponsesOutputContentRaw::OutputText { text } = &part.inner {
+                            parts.push(MessagePart::Text { text: text.clone() });
+                        }
+                    }
+                }
+                ResponsesOutputItemRaw::FunctionCall {
+                    id,
+                    call_id,
+                    name,
+                    arguments,
+                } => {
+                    let mut extra = item.other.clone();
+                    if let Some(item_id) = id {
+                        extra.insert("id".to_string(), Value::String(item_id.clone()));
+                    }
+                    parts.push(MessagePart::ToolCall {
+                        id: call_id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                        extra,
+                    });
+                }
+                ResponsesOutputItemRaw::Reasoning {
+                    id,
+                    summary,
+                    encrypted_content,
+                } => parts.push(MessagePart::Reasoning {
+                    id: id.clone(),
+                    summary: summary
+                        .iter()
+                        .filter_map(|part| match &part.inner {
+                            ResponsesReasoningSummaryRaw::SummaryText { text } => {
+                                Some(text.clone())
+                            }
+                            ResponsesReasoningSummaryRaw::Raw(_) => None,
+                        })
+                        .collect(),
+                    encrypted_content: encrypted_content.clone(),
+                }),
+                ResponsesOutputItemRaw::Raw(value) => parts.push(MessagePart::Opaque {
+                    protocol: RESPONSES_PROTOCOL.to_string(),
+                    value: value.clone(),
+                }),
+            }
+        }
+        Message::new(MessageRole::Assistant, parts)
+    }
+
     /// Fold a Responses reply back into the chat-completion shape the rest of
     /// the crate consumes. `function_call` items become `tool_calls` (their
     /// `call_id` becomes the chat tool-call id, so tool results round-trip),
@@ -1194,7 +1413,7 @@ impl ResponsesResponseRaw {
                             ResponsesOutputContentRaw::Refusal { refusal: message } => {
                                 refusal = Some(message)
                             }
-                            ResponsesOutputContentRaw::Unknown => {}
+                            ResponsesOutputContentRaw::Raw(_) => {}
                         }
                     }
                 }
@@ -1225,7 +1444,7 @@ impl ResponsesResponseRaw {
                         }
                     }
                 }
-                ResponsesOutputItemRaw::Unknown => {}
+                ResponsesOutputItemRaw::Raw(_) => {}
             }
         }
 
@@ -1527,6 +1746,96 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(delta, ResponsesStreamEvent::Other);
+    }
+
+    #[test]
+    fn reasoning_items_survive_the_context_round_trip() {
+        // Stateless requests ask for the encrypted reasoning payload back.
+        let req = chat_request(vec![ChatCompletionRequestMessageRaw::User(
+            ChatCompletionRequestUserMessageRaw::new_text("hi"),
+        )]);
+        let value = serde_json::to_value(ResponsesRequestRaw::from_chat(&req).unwrap()).unwrap();
+        assert_eq!(
+            value["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+
+        // A reply carrying a reasoning item parses into typed parts...
+        let resp: ResponsesResponse = serde_json::from_value(serde_json::json!({
+            "id": "resp_1", "object": "response", "created_at": 1.0,
+            "status": "completed", "model": "gpt-test",
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc-1",
+                 "summary": [{"type": "summary_text", "text": "hmm"}]},
+                {"type": "message", "id": "msg_1", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "on it"}]},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+                 "name": "lookup", "arguments": "{\"q\":1}"}
+            ]
+        }))
+        .unwrap();
+        let assistant = resp.to_message();
+        assert!(matches!(
+            &assistant.parts[0],
+            MessagePart::Reasoning { id: Some(id), encrypted_content: Some(enc), .. }
+                if id == "rs_1" && enc == "enc-1"
+        ));
+
+        // ...and rebuilding the next turn replays them, encrypted content and
+        // item ids included.
+        let conversation = vec![
+            Message::user("look it up"),
+            assistant,
+            Message::tool_result("call_1", "found"),
+        ];
+        let settings = LLMSettings {
+            llm_temperature: None,
+            llm_presence_penalty: None,
+            llm_prompt_timeout: 0,
+            llm_retry: 1,
+            llm_max_completion_tokens: None,
+            llm_tool_choice: None,
+            llm_stream: false,
+            top_p: None,
+            reasoning_effort: None,
+            auto_strip: false,
+            auto_cache_key: false,
+            cache_key_ttl: 0,
+            cache_key_rpm: 1,
+            billing_log_tokens: 0,
+            token_estimate_pct: 10.0,
+            allow_implicit_convert: false,
+        };
+        let value = serde_json::to_value(
+            ResponsesRequestRaw::from_conversation(
+                "gpt-test",
+                &conversation,
+                None,
+                None,
+                &settings,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let input = value["input"].as_array().unwrap();
+        assert_eq!(input.len(), 5, "{input:?}");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["encrypted_content"], "enc-1");
+        assert_eq!(input[1]["summary"][0]["text"], "hmm");
+        assert_eq!(input[2]["type"], "message");
+        assert_eq!(input[2]["role"], "assistant");
+        assert_eq!(input[2]["content"], "on it");
+        assert_eq!(input[3]["type"], "function_call");
+        assert_eq!(input[3]["call_id"], "call_1");
+        // The item's own id rode the part extras and lands back on the item.
+        assert_eq!(input[3]["id"], "fc_1");
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(input[4]["output"], "found");
+        assert_eq!(
+            value["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
     }
 
     #[test]

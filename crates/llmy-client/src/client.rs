@@ -39,6 +39,7 @@ use crate::anthropic::{
 use crate::cache_key::{CacheKeyClaim, CacheKeys, CacheShape};
 use crate::debug::{self, DebugBackend, DebugRequest, DebugRowContext, DebugUsage, PrefixBilling};
 pub use crate::filters::{GoogleContentFilter, MarkdownTagFilter, NoFilter, OpenAIContentFilter};
+pub use crate::message::{Message, MessagePart, MessageRole};
 pub use crate::req::{RawExtensibleChatCompletionRequest, RawExtensibleChatRequestMessage};
 pub use crate::resp::{RawExtensibleChatChoice, RawExtensibleChatCompletionResponse};
 use crate::responses::{
@@ -618,6 +619,21 @@ impl LLMResponse {
             Self::Responses(resp) => resp.into_inner().into_chat_response(),
         }
     }
+
+    /// The assistant turn of this response in protocol-neutral form, typed
+    /// parts preserved (signed thinking, encrypted reasoning, tool-call
+    /// extras) — what conversation-state callers push into their context.
+    pub fn to_message(&self) -> Message {
+        match self {
+            Self::Chat(resp) => resp
+                .choices
+                .first()
+                .map(Message::from_chat_choice)
+                .unwrap_or_else(|| Message::new(MessageRole::Assistant, vec![])),
+            Self::Anthropic(resp) => resp.to_message(),
+            Self::Responses(resp) => resp.to_message(),
+        }
+    }
 }
 
 impl From<RawExtensibleChatCompletionRequest> for LLMRequest {
@@ -887,11 +903,16 @@ impl LLMInner {
         }
     }
 
-    /// The model's configured max output tokens; backs protocol fields that
-    /// demand an explicit bound (the Anthropic protocol's mandatory
-    /// `max_tokens`) when the request itself carries none.
+    /// The output-token bound for protocols that demand one (the Anthropic
+    /// protocol's mandatory `max_tokens`) when `llm_max_completion_tokens` is
+    /// unset: the model's configured max, or 8192 when the config doesn't say
+    /// (custom `name,input,output` models leave it at zero — the wire rejects
+    /// `max_tokens: 0`).
     fn default_max_output_tokens(&self) -> u32 {
-        self.model.config.max_tokens.try_into().unwrap_or(u32::MAX)
+        match self.model.config.max_tokens {
+            0 => 8192,
+            max => max.try_into().unwrap_or(u32::MAX),
+        }
     }
 
     /// Lower a chat-typed request into the backend's wire format — see
@@ -1115,6 +1136,22 @@ impl LLMInner {
         timeout: Option<Duration>,
         retry: Option<u64>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+        self.complete_request_message_once_with_retry(req, debug_prefix, timeout, retry)
+            .await
+            .map(|(resp, _)| resp)
+    }
+
+    /// Like [`Self::complete_request_once_with_retry`], but also returns the
+    /// protocol-faithful assistant [`Message`] parsed from the wire response —
+    /// what conversation-state callers (the agent harness) push into their
+    /// context, so signed thinking and encrypted reasoning survive the turn.
+    pub async fn complete_request_message_once_with_retry(
+        &self,
+        req: LLMRequest,
+        debug_prefix: Option<&str>,
+        timeout: Option<Duration>,
+        retry: Option<u64>,
+    ) -> Result<(RawExtensibleChatCompletionResponse, Message), LLMYError> {
         let req = self.client.resolve_request(
             req,
             self.default_max_output_tokens(),
@@ -1197,7 +1234,7 @@ impl LLMInner {
             let attempt = self
                 .complete_request_attempt(req.clone(), claim.clone(), debug_prefix, timeout)
                 .await
-                .and_then(|resp| self.parse_first_choice::<T>(&resp));
+                .and_then(|(resp, _)| self.parse_first_choice::<T>(&resp));
             match attempt {
                 Ok(value) => return Ok(value),
                 // A billing/cap error is deterministic — retrying can't recover it
@@ -1297,6 +1334,7 @@ impl LLMInner {
         let claim = self.auto_cache_key_request(&req, debug_prefix);
         self.complete_request_attempt(req, claim, debug_prefix, timeout_overwrite)
             .await
+            .map(|(resp, _)| resp)
     }
 
     /// One attempt of a resolved logical request, carrying that request's
@@ -1310,7 +1348,7 @@ impl LLMInner {
         given_claim: Option<CacheKeyClaim>,
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
-    ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
+    ) -> Result<(RawExtensibleChatCompletionResponse, Message), LLMYError> {
         // Fail fast: if we're already over budget, don't issue the request.
         self.billing.read().unwrap().check_cap(self.node)?;
 
@@ -1399,6 +1437,9 @@ impl LLMInner {
         let resp_json = dbg_handle
             .as_ref()
             .map(|_| serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null));
+        // The protocol-faithful assistant turn, before normalization sheds
+        // anything the chat view cannot carry.
+        let assistant = resp.to_message();
         let mut resp = match resp.into_chat_view() {
             Ok(view) => view,
             Err(e) => {
@@ -1568,7 +1609,7 @@ impl LLMInner {
                 client
             );
         }
-        Ok(resp)
+        Ok((resp, assistant))
     }
 
     /// Build an extensible chat request with this model's settings, tools, and provider quirks
@@ -1665,6 +1706,45 @@ impl LLMInner {
                 cache_key,
                 settings,
             )?)),
+        }
+    }
+
+    /// Build the backend-native request for a protocol-neutral conversation:
+    /// typed parts map straight onto each protocol's own constructs (signed
+    /// thinking, encrypted reasoning, tool calls); on chat backends the
+    /// conversation lowers via [`Message::many_to_chat`].
+    pub fn build_conversation_request(
+        &self,
+        conversation: &[Message],
+        cache_key: Option<&str>,
+        settings: &LLMSettings,
+        tools: Option<Vec<ChatCompletionTools>>,
+    ) -> Result<LLMRequest, LLMYError> {
+        match &self.client {
+            LLMClient::Azure(_) | LLMClient::OpenAI(_) => {
+                let messages = Message::many_to_chat(conversation);
+                Ok(LLMRequest::Chat(self.build_chat_request(
+                    messages, cache_key, settings, tools,
+                )?))
+            }
+            LLMClient::Anthropic(_) => Ok(LLMRequest::Anthropic(
+                AnthropicMessagesRequestRaw::from_conversation(
+                    self.model.api_model_name(),
+                    conversation,
+                    tools.as_deref(),
+                    settings,
+                    self.default_max_output_tokens(),
+                )?,
+            )),
+            LLMClient::Responses(_) => Ok(LLMRequest::Responses(
+                ResponsesRequestRaw::from_conversation(
+                    self.model.api_model_name(),
+                    conversation,
+                    tools.as_deref(),
+                    cache_key,
+                    settings,
+                )?,
+            )),
         }
     }
 

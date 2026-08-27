@@ -13,9 +13,12 @@
 //! into a [`RawExtensibleChatCompletionResponse`], so billing, debug records,
 //! content filters and cache keys all keep operating on one set of types.
 //!
-//! Known gap: replaying multi-turn extended thinking combined with tool use
-//! would require echoing signed `thinking` blocks back verbatim, and
-//! chat-completion history has no slot for those — they are not replayed.
+//! Multi-turn fidelity: conversation-state callers hold
+//! [`crate::message::Message`]s, and this module maps them natively in both
+//! directions — [`AnthropicMessagesRequestRaw::from_conversation`] builds the
+//! request straight from typed parts (signed thinking replays verbatim), and
+//! [`AnthropicMessagesResponseRaw::to_message`] parses the reply back into
+//! them — so extended thinking with tool use survives multi-turn round trips.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,6 +28,7 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::message::{Message, MessagePart, MessageRole};
 use crate::req::{
     ChatCompletionMessageToolCallRaw, ChatCompletionMessageToolCallsRaw,
     ChatCompletionRequestAssistantMessageContent,
@@ -56,6 +60,10 @@ use crate::settings::LLMSettings;
 
 /// Default `anthropic-version` header value sent with every request.
 pub const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Protocol tag carried by [`MessagePart::Opaque`] parts this module produces,
+/// so replay stays confined to its own protocol.
+const ANTHROPIC_PROTOCOL: &str = "anthropic";
 
 // ---------------------------------------------------------------------------
 // HTTP config
@@ -210,9 +218,9 @@ pub enum AnthropicContentBlockRaw {
         data: String,
     },
     /// Server-side block kinds this client does not model (e.g. web search
-    /// results). Tolerated on deserialize, ignored by the conversions.
-    #[serde(other)]
-    Unknown,
+    /// results), captured verbatim so a replayed conversation keeps them.
+    #[serde(untagged)]
+    Raw(Value),
 }
 pub type AnthropicContentBlock = WithOtherFields<AnthropicContentBlockRaw>;
 
@@ -989,13 +997,37 @@ impl AnthropicMessagesRequestRaw {
     }
 
     /// Build a native prompt request straight from strings — nothing is forced
-    /// through the chat-completion shape on its way to the wire. The caller's
-    /// settings map onto the protocol's own fields; a setting with no slot
-    /// here (`presence_penalty`) is refused rather than dropped.
+    /// through the chat-completion shape on its way to the wire.
     pub fn from_prompt(
         model: &str,
         sys_msg: &str,
         user_msg: &str,
+        settings: &LLMSettings,
+        default_max_output_tokens: u32,
+    ) -> Result<AnthropicMessagesRequest, LLMYError> {
+        let mut conversation = Vec::new();
+        if !sys_msg.is_empty() {
+            conversation.push(Message::system(sys_msg));
+        }
+        conversation.push(Message::user(user_msg));
+        Self::from_conversation(
+            model,
+            &conversation,
+            None,
+            settings,
+            default_max_output_tokens,
+        )
+    }
+
+    /// Build the native request straight from a protocol-neutral conversation:
+    /// typed parts map onto their own blocks — signed thinking replays
+    /// verbatim — so nothing is forced through the chat shape. The caller's
+    /// settings map onto the protocol's own fields; a setting with no slot
+    /// here (`presence_penalty`) is refused rather than dropped.
+    pub fn from_conversation(
+        model: &str,
+        conversation: &[Message],
+        tools: Option<&[ChatCompletionTools]>,
         settings: &LLMSettings,
         default_max_output_tokens: u32,
     ) -> Result<AnthropicMessagesRequest, LLMYError> {
@@ -1012,17 +1044,25 @@ impl AnthropicMessagesRequestRaw {
             Some(choice) => Self::tool_choice(Some(&choice.0), None)?,
             None => None,
         };
-        let system = (!sys_msg.is_empty())
-            .then(|| vec![AnthropicContentBlockRaw::text(sys_msg.to_string(), None)]);
+        let tools = tools.map(Self::tools).transpose()?;
+
+        let mut system: Vec<AnthropicContentBlock> = Vec::new();
+        let mut messages: Vec<AnthropicMessage> = Vec::new();
+        for message in conversation {
+            Self::conversation_message(message, &mut system, &mut messages)?;
+        }
+        if messages.is_empty() {
+            return Err(
+                eyre!("the anthropic protocol needs at least one user/assistant message").into(),
+            );
+        }
+
         Ok(WithOtherFields::new(Self {
             model: model.to_string(),
-            messages: vec![WithOtherFields::new(AnthropicMessageRaw {
-                role: AnthropicRole::User,
-                content: vec![AnthropicContentBlockRaw::text(user_msg.to_string(), None)],
-            })],
+            messages,
             max_tokens,
-            system,
-            tools: None,
+            system: (!system.is_empty()).then_some(system),
+            tools,
             tool_choice,
             temperature: settings.llm_temperature,
             top_p: settings.top_p,
@@ -1030,6 +1070,109 @@ impl AnthropicMessagesRequestRaw {
             thinking: Self::thinking(settings.reasoning_effort.as_ref().map(|r| &r.0), max_tokens),
             stream: None,
         }))
+    }
+
+    /// One neutral message into native blocks. The message-level breakpoint
+    /// becomes `cache_control` on the message's last block; parts belonging to
+    /// another protocol (responses reasoning, foreign opaque parts) are
+    /// skipped — their payloads are only valid where they were issued.
+    fn conversation_message(
+        message: &Message,
+        system: &mut Vec<AnthropicContentBlock>,
+        messages: &mut Vec<AnthropicMessage>,
+    ) -> Result<(), LLMYError> {
+        if message.role == MessageRole::System {
+            let cache_control = message
+                .cache_breakpoint
+                .then(AnthropicCacheControlRaw::ephemeral);
+            system.push(AnthropicContentBlockRaw::text(
+                message.text(),
+                cache_control,
+            ));
+            return Ok(());
+        }
+        let role = if message.role == MessageRole::Assistant {
+            AnthropicRole::Assistant
+        } else {
+            AnthropicRole::User
+        };
+        let mut blocks: Vec<AnthropicContentBlock> = Vec::new();
+        for part in &message.parts {
+            match part {
+                MessagePart::Text { text } => {
+                    blocks.push(AnthropicContentBlockRaw::text(text.clone(), None))
+                }
+                MessagePart::Image { url } => {
+                    blocks.push(WithOtherFields::new(AnthropicContentBlockRaw::Image {
+                        source: AnthropicImageSourceRaw::from_chat_url(url),
+                        cache_control: None,
+                    }))
+                }
+                MessagePart::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                    extra,
+                } => {
+                    let arguments = arguments.trim();
+                    let input: Value = if arguments.is_empty() {
+                        Value::Object(Default::default())
+                    } else {
+                        serde_json::from_str(arguments).map_err(|e| {
+                            eyre!("tool call {} carries non-JSON arguments: {}", id, e)
+                        })?
+                    };
+                    let mut block = WithOtherFields::new(AnthropicContentBlockRaw::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input,
+                        cache_control: None,
+                    });
+                    block.other = extra.clone();
+                    blocks.push(block);
+                }
+                MessagePart::ToolResult { id, content } => {
+                    blocks.push(WithOtherFields::new(AnthropicContentBlockRaw::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: content.clone(),
+                        is_error: None,
+                        cache_control: None,
+                    }))
+                }
+                MessagePart::Thinking {
+                    thinking,
+                    signature,
+                } => blocks.push(WithOtherFields::new(AnthropicContentBlockRaw::Thinking {
+                    thinking: thinking.clone(),
+                    signature: signature.clone(),
+                })),
+                MessagePart::RedactedThinking { data } => blocks.push(WithOtherFields::new(
+                    AnthropicContentBlockRaw::RedactedThinking { data: data.clone() },
+                )),
+                MessagePart::Opaque { protocol, value } if protocol == ANTHROPIC_PROTOCOL => blocks
+                    .push(WithOtherFields::new(AnthropicContentBlockRaw::Raw(
+                        value.clone(),
+                    ))),
+                MessagePart::Reasoning { .. } | MessagePart::Opaque { .. } => {}
+            }
+        }
+        if message.cache_breakpoint
+            && let Some(last) = blocks.last_mut()
+        {
+            match &mut last.inner {
+                AnthropicContentBlockRaw::Text { cache_control, .. }
+                | AnthropicContentBlockRaw::Image { cache_control, .. }
+                | AnthropicContentBlockRaw::ToolUse { cache_control, .. }
+                | AnthropicContentBlockRaw::ToolResult { cache_control, .. } => {
+                    *cache_control = Some(AnthropicCacheControlRaw::ephemeral())
+                }
+                _ => {}
+            }
+        }
+        for block in blocks {
+            Self::push_block(messages, role, block);
+        }
+        Ok(())
     }
 
     /// Prompt-text rendering of this request (system + messages), tagged the
@@ -1089,7 +1232,7 @@ impl AnthropicMessagesRequestRaw {
                 }
             },
             AnthropicContentBlockRaw::RedactedThinking { .. }
-            | AnthropicContentBlockRaw::Unknown => {}
+            | AnthropicContentBlockRaw::Raw(_) => {}
         }
     }
 
@@ -1266,7 +1409,7 @@ impl AnthropicMessagesRequestRaw {
                 other @ (AnthropicContentBlockRaw::ToolUse { .. }
                 | AnthropicContentBlockRaw::Thinking { .. }
                 | AnthropicContentBlockRaw::RedactedThinking { .. }
-                | AnthropicContentBlockRaw::Unknown) => {
+                | AnthropicContentBlockRaw::Raw(_)) => {
                     return Err(eyre!(
                         "a user message block has no chat-completion form: {:?}",
                         other
@@ -1339,7 +1482,7 @@ impl AnthropicMessagesRequestRaw {
                 AnthropicContentBlockRaw::RedactedThinking { .. } => {}
                 other @ (AnthropicContentBlockRaw::Image { .. }
                 | AnthropicContentBlockRaw::ToolResult { .. }
-                | AnthropicContentBlockRaw::Unknown) => {
+                | AnthropicContentBlockRaw::Raw(_)) => {
                     return Err(eyre!(
                         "an assistant message block has no chat-completion form: {:?}",
                         other
@@ -1433,6 +1576,69 @@ impl AnthropicMessagesRequestRaw {
 // ---------------------------------------------------------------------------
 
 impl AnthropicMessagesResponseRaw {
+    /// The assistant turn of this response in protocol-neutral form — typed
+    /// parts, signatures included, ready to go back into conversation state.
+    /// A block carrying extension fields (outside `tool_use`, whose extras
+    /// ride the part) is kept whole as an opaque part so nothing is shed.
+    pub fn to_message(&self) -> Message {
+        let mut parts = Vec::new();
+        for block in &self.content {
+            if !block.other.is_empty()
+                && !matches!(block.inner, AnthropicContentBlockRaw::ToolUse { .. })
+            {
+                parts.push(MessagePart::Opaque {
+                    protocol: ANTHROPIC_PROTOCOL.to_string(),
+                    value: serde_json::to_value(block).unwrap_or(Value::Null),
+                });
+                continue;
+            }
+            match &block.inner {
+                AnthropicContentBlockRaw::Text { text, .. } => {
+                    parts.push(MessagePart::Text { text: text.clone() })
+                }
+                AnthropicContentBlockRaw::Thinking {
+                    thinking,
+                    signature,
+                } => parts.push(MessagePart::Thinking {
+                    thinking: thinking.clone(),
+                    signature: signature.clone(),
+                }),
+                AnthropicContentBlockRaw::RedactedThinking { data } => {
+                    parts.push(MessagePart::RedactedThinking { data: data.clone() })
+                }
+                AnthropicContentBlockRaw::ToolUse {
+                    id, name, input, ..
+                } => parts.push(MessagePart::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: input.to_string(),
+                    extra: block.other.clone(),
+                }),
+                AnthropicContentBlockRaw::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => parts.push(MessagePart::ToolResult {
+                    id: tool_use_id.clone(),
+                    content: content.clone(),
+                }),
+                AnthropicContentBlockRaw::Image { source, .. } => parts.push(MessagePart::Image {
+                    url: match &source.inner {
+                        AnthropicImageSourceRaw::Url { url } => url.clone(),
+                        AnthropicImageSourceRaw::Base64 { media_type, data } => {
+                            format!("data:{};base64,{}", media_type, data)
+                        }
+                    },
+                }),
+                AnthropicContentBlockRaw::Raw(value) => parts.push(MessagePart::Opaque {
+                    protocol: ANTHROPIC_PROTOCOL.to_string(),
+                    value: value.clone(),
+                }),
+            }
+        }
+        Message::new(MessageRole::Assistant, parts)
+    }
+
     /// Fold a Messages response back into the chat-completion shape the rest
     /// of the crate consumes: text blocks concatenate into `content`,
     /// `tool_use` blocks become `tool_calls`, thinking lands in the message's
@@ -1467,7 +1673,7 @@ impl AnthropicMessagesResponseRaw {
                 AnthropicContentBlockRaw::Image { .. }
                 | AnthropicContentBlockRaw::ToolResult { .. }
                 | AnthropicContentBlockRaw::RedactedThinking { .. }
-                | AnthropicContentBlockRaw::Unknown => {}
+                | AnthropicContentBlockRaw::Raw(_) => {}
             }
         }
 
@@ -1852,6 +2058,73 @@ mod tests {
         let event: AnthropicStreamEvent =
             serde_json::from_value(serde_json::json!({"type": "brand_new_event"})).unwrap();
         assert_eq!(event, AnthropicStreamEvent::Unknown);
+    }
+
+    #[test]
+    fn signed_thinking_survives_the_context_round_trip() {
+        // The wire truth of an assistant turn: signed thinking first, then the
+        // visible answer and a tool call.
+        let content = serde_json::json!([
+            {"type": "thinking", "thinking": "hmm", "signature": "sig-1"},
+            {"type": "text", "text": "on it"},
+            {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": 1}}
+        ]);
+        let resp: AnthropicMessagesResponse = serde_json::from_value(serde_json::json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-test",
+            "content": content,
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .unwrap();
+
+        // The response parses into typed parts, signature included.
+        let assistant = resp.to_message();
+        assert_eq!(assistant.role, MessageRole::Assistant);
+        assert!(matches!(
+            &assistant.parts[0],
+            MessagePart::Thinking { thinking, signature: Some(signature) }
+                if thinking == "hmm" && signature == "sig-1"
+        ));
+
+        // Rebuilding the next turn from conversation state replays the blocks
+        // verbatim — thinking first, signature intact.
+        let conversation = vec![
+            Message::user("look it up"),
+            assistant,
+            Message::tool_result("toolu_1", "found"),
+        ];
+        let settings = LLMSettings {
+            llm_temperature: None,
+            llm_presence_penalty: None,
+            llm_prompt_timeout: 0,
+            llm_retry: 1,
+            llm_max_completion_tokens: Some(512),
+            llm_tool_choice: None,
+            llm_stream: false,
+            top_p: None,
+            reasoning_effort: None,
+            auto_strip: false,
+            auto_cache_key: false,
+            cache_key_ttl: 0,
+            cache_key_rpm: 1,
+            billing_log_tokens: 0,
+            token_estimate_pct: 10.0,
+            allow_implicit_convert: false,
+        };
+        let value = serde_json::to_value(
+            AnthropicMessagesRequestRaw::from_conversation(
+                "claude-test",
+                &conversation,
+                None,
+                &settings,
+                4096,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["messages"][1]["content"], content);
+        assert_eq!(value["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(value["max_tokens"], 512);
     }
 
     #[test]

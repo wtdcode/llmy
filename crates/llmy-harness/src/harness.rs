@@ -5,28 +5,21 @@ use llmy_agent_tools::memory::{
 };
 use llmy_client::debug::completion_to_string;
 use llmy_client::model::OpenAIModel;
-use llmy_client::req::{
-    ChatCompletionMessageToolCallsRaw, ChatCompletionRequestMessageRaw,
-    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageRaw,
-    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageRaw,
-    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageRaw, PromptCacheMode,
-    PromptCacheOptionsRaw,
-};
+use llmy_client::req::{ChatCompletionRequestMessageRaw, PromptCacheMode, PromptCacheOptionsRaw};
 use llmy_client::resp::{ChatChoice, FinishReason};
 use llmy_client::{
-    client::{LLM, RawExtensibleChatCompletionRequest, RawExtensibleChatRequestMessage},
+    client::{LLM, LLMRequest, Message, MessagePart, RawExtensibleChatCompletionRequest},
     model::ModelConfig,
     settings::LLMSettings,
 };
 use llmy_types::error::GeneralToolCall;
-use llmy_types::other::WithOtherFields;
 
 use crate::{
     memory::AgentMemorySystemPromptCriteria,
     prompt::{
         render_compact_system_prompt, render_compact_user_prompt, render_compacted_context_message,
     },
-    utils::{chat_choice_to_assistant_with_content, chat_choice_to_toolcalls},
+    utils::chat_choice_to_toolcalls,
 };
 
 #[derive(Clone)]
@@ -65,14 +58,16 @@ impl AgentConfig {
     }
 }
 
-/// Agent implementation backed by an in-memory conversation context and toolbox.
+/// Agent implementation backed by an in-memory conversation context and
+/// toolbox. The context is held in protocol-neutral [`Message`] form, so the
+/// same agent runs natively on every backend protocol without loss.
 #[derive(Clone)]
 pub struct Agent {
     base_system_prompt: String,
     system_prompt: String,
     tools: ToolBox,
-    context: Vec<RawExtensibleChatRequestMessage>,
-    checkpoints: Vec<(Option<StepResult>, Vec<RawExtensibleChatRequestMessage>)>,
+    context: Vec<Message>,
+    checkpoints: Vec<(Option<StepResult>, Vec<Message>)>,
     last_step: Option<StepResult>,
     /// Fixed `prompt_cache_key` for this conversation. `None` leaves the choice
     /// to the client, which picks one per prompt prefix.
@@ -160,22 +155,13 @@ impl Agent {
         }
     }
 
-    fn system_message(system_prompt: String) -> ChatCompletionRequestMessageRaw {
-        let raw = ChatCompletionRequestSystemMessageRaw {
-            content: ChatCompletionRequestSystemMessageContent::Text(system_prompt),
-            name: None,
-        };
-        ChatCompletionRequestMessageRaw::System(WithOtherFields::new(raw))
-    }
-
-    pub fn conversation_context(&self) -> Vec<RawExtensibleChatRequestMessage> {
-        let mut system =
-            RawExtensibleChatRequestMessage::new(Self::system_message(self.system_prompt.clone()));
+    pub fn conversation_context(&self) -> Vec<Message> {
+        let mut system = Message::system(self.system_prompt.clone());
         if self.system_breakpoint {
             system.breakpoint();
         }
         std::iter::once(system)
-            .chain(self.context.clone())
+            .chain(self.context.iter().cloned())
             .collect()
     }
 
@@ -193,7 +179,7 @@ impl Agent {
     /// This is the conversation only. The system-prompt message is synthesized
     /// per request by [`Agent::conversation_context`], so it gets its own switch:
     /// [`Agent::toggle_system_breakpoint`].
-    pub fn context_mut(&mut self) -> &mut Vec<RawExtensibleChatRequestMessage> {
+    pub fn context_mut(&mut self) -> &mut Vec<Message> {
         &mut self.context
     }
 
@@ -268,7 +254,7 @@ impl Agent {
     }
 
     pub fn render_context(&self) -> String {
-        self.conversation_context()
+        Message::many_to_chat(&self.conversation_context())
             .iter()
             .map(|m| completion_to_string(&m.0))
             .collect::<Vec<_>>()
@@ -317,13 +303,7 @@ impl Agent {
     }
 
     pub fn push_user_message(&mut self, user_prompt: String) {
-        let user = ChatCompletionRequestUserMessageRaw {
-            content: ChatCompletionRequestUserMessageContent::Text(user_prompt),
-            name: None,
-        };
-        self.context.push(RawExtensibleChatRequestMessage::new(
-            ChatCompletionRequestMessageRaw::User(WithOtherFields::new(user)),
-        ));
+        self.context.push(Message::user(user_prompt));
     }
 
     pub async fn step(
@@ -335,20 +315,20 @@ impl Agent {
         let config = self.config.from_model(&llm.model);
 
         let current_context = self.context.clone();
-        let messages = self.conversation_context();
+        let conversation = self.conversation_context();
         let tools = (self.tools.len() != 0).then(|| self.tools.openai_objects());
         let cache_key = self.cache_key.as_deref();
         let settings = settings.unwrap_or_else(|| llm.default_settings.clone());
         let timeout = settings.timeout();
         let retry = settings.llm_retry;
-        let mut req = llm.build_chat_request(messages, cache_key, &settings, tools)?;
-        self.apply_cache_options(llm, &mut req);
-        // Lower the chat-typed conversation into the backend's wire format
-        // explicitly, so the agent runs natively on every protocol without the
-        // implicit-conversion opt-in.
-        let req = llm.lower_request(req)?;
-        let mut resp = llm
-            .complete_request_once_with_retry(req, debug_prefix, Some(timeout), Some(retry))
+        // The context is protocol-neutral; the client builds the backend's
+        // native request from it directly.
+        let mut req = llm.build_conversation_request(&conversation, cache_key, &settings, tools)?;
+        if let LLMRequest::Chat(chat) = &mut req {
+            self.apply_cache_options(llm, chat);
+        }
+        let (mut resp, assistant_native) = llm
+            .complete_request_message_once_with_retry(req, debug_prefix, Some(timeout), Some(retry))
             .await?;
 
         if resp.choices.is_empty() {
@@ -363,7 +343,6 @@ impl Agent {
         }
 
         let choice: ChatChoice = resp.choices.pop().unwrap();
-        let propagated_reasoning = propagated_reasoning_content(&choice);
 
         if let Some(refused) = choice.message.refusal.clone() {
             return Err(LLMYError::Filtered(refused));
@@ -374,95 +353,84 @@ impl Agent {
             .ok_or_else(|| eyre!("no finish reason?!"))?;
 
         let mut assistant_content = choice.message.content.clone();
+        let mut content_override: Option<String> = None;
 
-        let (step_result, extra_messages): (StepResult, Vec<ChatCompletionRequestMessageRaw>) =
-            match reason {
-                FinishReason::ToolCalls | FinishReason::FunctionCall => {
-                    let calls = chat_choice_to_toolcalls(&choice);
-                    let mut out = vec![];
-                    if calls.is_empty() {
-                        if config.allow_empty_tool_calls {
-                            tracing::warn!("no tool calls but give tool call reason");
-                            assistant_content = Some("Your previous tool call format is incorrect, please stick to json format and retry. Nothing is executed for your tool call request.".to_string());
-                        } else {
-                            return Err(eyre!("no tool calls but give tool call reason").into());
-                        }
+        let (step_result, extra_messages): (StepResult, Vec<Message>) = match reason {
+            FinishReason::ToolCalls | FinishReason::FunctionCall => {
+                let calls = chat_choice_to_toolcalls(&choice);
+                let mut out = vec![];
+                if calls.is_empty() {
+                    if config.allow_empty_tool_calls {
+                        tracing::warn!("no tool calls but give tool call reason");
+                        let nudge = "Your previous tool call format is incorrect, please stick to json format and retry. Nothing is executed for your tool call request.".to_string();
+                        assistant_content = Some(nudge.clone());
+                        content_override = Some(nudge);
                     } else {
-                        let calls = self.invoke_tool_calls(calls, &config).await;
+                        return Err(eyre!("no tool calls but give tool call reason").into());
+                    }
+                } else {
+                    let calls = self.invoke_tool_calls(calls, &config).await;
 
-                        for (call, tool_out) in calls.into_iter() {
-                            if let Some(tool_out) = tool_out {
-                                match tool_out {
-                                    Ok(tool_out) => {
-                                        out.push(tool_out);
-                                    }
-                                    Err(LLMYError::IncorrectToolCall(_, _, e)) => {
-                                        tracing::warn!(
-                                            "Incorrect tool call detected for {}, schema is {:?}, we will ask LLM to retry.",
-                                            call,
-                                            &e
-                                        );
-                                        let tool_msg = ChatCompletionRequestToolMessageRaw {
-                                            content: ChatCompletionRequestToolMessageContent::Text(
-                                                format!(
-                                                    "Tool call to {} does not conform to schema {:?}",
-                                                    call, e
-                                                ),
-                                            ),
-                                            tool_call_id: call.tool_id.clone(),
-                                        };
-                                        out.push(ChatCompletionRequestMessageRaw::Tool(
-                                            WithOtherFields::new(tool_msg),
-                                        ));
-                                    }
-                                    Err(e) => return Err(e),
+                    for (call, tool_out) in calls.into_iter() {
+                        if let Some(tool_out) = tool_out {
+                            match tool_out {
+                                Ok(tool_out) => {
+                                    out.push(Message::from_chat_request(&tool_out));
                                 }
-                            } else {
-                                tracing::warn!("Tool call {} is not defined", call);
-                                let tool_msg = ChatCompletionRequestToolMessageRaw {
-                                    content: ChatCompletionRequestToolMessageContent::Text(
-                                        format!("The tool of {} is not defined", call),
-                                    ),
-                                    tool_call_id: call.tool_id.clone(),
-                                };
-                                out.push(ChatCompletionRequestMessageRaw::Tool(
-                                    WithOtherFields::new(tool_msg),
-                                ));
+                                Err(LLMYError::IncorrectToolCall(_, _, e)) => {
+                                    tracing::warn!(
+                                        "Incorrect tool call detected for {}, schema is {:?}, we will ask LLM to retry.",
+                                        call,
+                                        &e
+                                    );
+                                    out.push(Message::tool_result(
+                                        call.tool_id.clone(),
+                                        format!(
+                                            "Tool call to {} does not conform to schema {:?}",
+                                            call, e
+                                        ),
+                                    ));
+                                }
+                                Err(e) => return Err(e),
                             }
+                        } else {
+                            tracing::warn!("Tool call {} is not defined", call);
+                            out.push(Message::tool_result(
+                                call.tool_id.clone(),
+                                format!("The tool of {} is not defined", call),
+                            ));
                         }
                     }
-
-                    (StepResult::Toolcalled(assistant_content.clone()), out)
                 }
-                FinishReason::ContentFilter => {
-                    tracing::warn!("Our response is filtered?! {:?}", &resp);
-                    return Err(LLMYError::Filtered(
-                        choice.message.content.clone().unwrap_or_default(),
-                    ));
-                }
-                FinishReason::Stop => (
-                    StepResult::Stop(choice.message.content.clone().unwrap_or_default()),
-                    vec![],
-                ),
-                FinishReason::Length => return Err(LLMYError::OutputLength),
-            };
 
-        let assistant = chat_choice_to_assistant_with_content(&choice, assistant_content)?;
+                (StepResult::Toolcalled(assistant_content.clone()), out)
+            }
+            FinishReason::ContentFilter => {
+                tracing::warn!("Our response is filtered?! {:?}", &resp);
+                return Err(LLMYError::Filtered(
+                    choice.message.content.clone().unwrap_or_default(),
+                ));
+            }
+            FinishReason::Stop => (
+                StepResult::Stop(choice.message.content.clone().unwrap_or_default()),
+                vec![],
+            ),
+            FinishReason::Length => return Err(LLMYError::OutputLength),
+        };
+
+        // The protocol-faithful assistant turn goes into the context — typed
+        // parts (signed thinking, encrypted reasoning, tool-call extras)
+        // included; only the empty-tool-call retry nudge replaces it with
+        // synthetic content.
+        let assistant_message = match content_override {
+            Some(content) => Message::assistant(content),
+            None => assistant_native,
+        };
 
         self.checkpoints
             .push((self.last_step().clone(), current_context));
-        let mut assistant_message = RawExtensibleChatRequestMessage::new(
-            ChatCompletionRequestMessageRaw::Assistant(assistant),
-        );
-        if let Some(reasoning_content) = propagated_reasoning {
-            assistant_message.insert_extra_string("reasoning_content", reasoning_content);
-        }
         self.context.push(assistant_message);
-        self.context.extend(
-            extra_messages
-                .into_iter()
-                .map(RawExtensibleChatRequestMessage::new),
-        );
+        self.context.extend(extra_messages);
         self.last_step = Some(step_result.clone());
         Ok(step_result)
     }
@@ -612,33 +580,12 @@ impl Agent {
     }
 
     fn did_write_memory(&self) -> bool {
-        self.context.iter().any(|message| match &message.inner {
-            ChatCompletionRequestMessageRaw::Assistant(assistant) => {
-                assistant.tool_calls.as_ref().is_some_and(|tool_calls| {
-                    tool_calls.iter().any(|tool_call| match &tool_call.inner {
-                        ChatCompletionMessageToolCallsRaw::Function(function) => {
-                            is_memory_write_tool(function.function.name.as_str())
-                        }
-                        ChatCompletionMessageToolCallsRaw::Custom(custom) => {
-                            is_memory_write_tool(custom.custom_tool.name.as_str())
-                        }
-                    })
-                })
-            }
-            _ => false,
+        self.context.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, MessagePart::ToolCall { name, .. } if is_memory_write_tool(name))
+            })
         })
     }
-}
-
-fn propagated_reasoning_content(choice: &ChatChoice) -> Option<String> {
-    choice
-        .inner
-        .message
-        .other
-        .get("reasoning_content")?
-        .as_str()
-        .filter(|reasoning_content| !reasoning_content.trim().is_empty())
-        .map(|reasoning_content| reasoning_content.to_string())
 }
 
 fn is_memory_write_tool(tool_name: &str) -> bool {
@@ -978,44 +925,6 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_content_extra_carries_reasoning_for_mimo() {
-        let choice: llmy_client::client::RawExtensibleChatChoice =
-            serde_json::from_value(serde_json::json!({
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "call the tool",
-                    "reasoning_content": "I need the tool."
-                },
-                "finish_reason": "tool_calls"
-            }))
-            .unwrap();
-
-        assert_eq!(
-            propagated_reasoning_content(&choice),
-            Some("I need the tool.".to_string())
-        );
-    }
-
-    #[test]
-    fn reasoning_content_extra_skips_blank_reasoning_for_mimo() {
-        let model = OpenAIModel::from_str("mimo-v2.5-pro").unwrap();
-        let choice: llmy_client::client::RawExtensibleChatChoice =
-            serde_json::from_value(serde_json::json!({
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "ok",
-                    "reasoning_content": "   "
-                },
-                "finish_reason": "stop"
-            }))
-            .unwrap();
-
-        assert_eq!(propagated_reasoning_content(&choice), None);
-    }
-
-    #[test]
     fn normalize_compact_summary_flattens_whitespace() {
         let normalized =
             normalize_compact_summary("current task\n\nfix compaction   path\tand preserve memory");
@@ -1040,17 +949,14 @@ mod tests {
             .await;
 
         assert_eq!(compacted.context.len(), 1);
-        match &compacted.context[0].inner {
-            ChatCompletionRequestMessageRaw::User(user) => {
-                assert_eq!(
-                    user.content,
-                    ChatCompletionRequestUserMessageContent::Text(
-                        "Compacted context: single paragraph summary".to_string(),
-                    )
-                );
-            }
-            other => panic!("expected compacted user message, got {:?}", other),
-        }
+        assert_eq!(
+            compacted.context[0].role,
+            llmy_client::client::MessageRole::User
+        );
+        assert_eq!(
+            compacted.context[0].text(),
+            "Compacted context: single paragraph summary"
+        );
         assert!(compacted.last_step.is_none());
         assert!(compacted.checkpoints.is_empty());
     }
@@ -1115,8 +1021,8 @@ mod tests {
         let compacted = agent.fresh_agent(None).await;
         let refreshed_conversation = compacted.conversation_context();
 
-        let snapshot_prompt = completion_to_string(&conversation[0]);
-        let refreshed_prompt = completion_to_string(&refreshed_conversation[0]);
+        let snapshot_prompt = conversation[0].text();
+        let refreshed_prompt = refreshed_conversation[0].text();
 
         assert!(snapshot_prompt.contains("title: before compact"));
         assert!(!snapshot_prompt.contains("title: after snapshot"));
@@ -1164,22 +1070,28 @@ mod tests {
         agent
     }
 
-    fn breakpoint_marked(msg: &RawExtensibleChatRequestMessage) -> bool {
-        serde_json::to_string(msg)
-            .unwrap()
-            .contains("prompt_cache_breakpoint")
+    fn breakpoint_marked(msg: &Message) -> bool {
+        msg.cache_breakpoint
     }
 
     #[test]
     fn context_mut_marks_a_breakpoint_on_one_message() {
         let mut agent = cache_test_agent();
-        assert!(agent.context_mut()[0].breakpoint());
+        agent.context_mut()[0].breakpoint();
 
         let ctx = agent.conversation_context();
         // System prompt is synthesized and unmarked; only message 0 is marked.
         assert!(!breakpoint_marked(&ctx[0]));
         assert!(breakpoint_marked(&ctx[1]));
         assert!(!breakpoint_marked(&ctx[2]));
+
+        // The marker lowers into the chat wire form too.
+        let chat = Message::many_to_chat(&ctx);
+        assert!(
+            serde_json::to_string(&chat[1])
+                .unwrap()
+                .contains("prompt_cache_breakpoint")
+        );
     }
 
     #[test]
@@ -1222,7 +1134,7 @@ mod tests {
 
         let mut req = llm
             .build_chat_request(
-                agent.conversation_context(),
+                Message::many_to_chat(&agent.conversation_context()),
                 None,
                 &cache_test_settings(),
                 None,
@@ -1246,7 +1158,12 @@ mod tests {
             assert_eq!(agent.breakpoint_mode(), Some(expected));
 
             let mut req = llm
-                .build_chat_request(agent.conversation_context(), None, &settings, None)
+                .build_chat_request(
+                    Message::many_to_chat(&agent.conversation_context()),
+                    None,
+                    &settings,
+                    None,
+                )
                 .unwrap();
             agent.apply_cache_options(&llm, &mut req);
             assert_eq!(
@@ -1266,7 +1183,7 @@ mod tests {
 
         let mut req = llm
             .build_chat_request(
-                agent.conversation_context(),
+                Message::many_to_chat(&agent.conversation_context()),
                 None,
                 &cache_test_settings(),
                 None,

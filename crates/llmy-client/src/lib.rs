@@ -9,6 +9,7 @@ pub mod client;
 pub mod context;
 pub mod debug;
 pub mod filters;
+pub mod message;
 pub mod model;
 pub mod req;
 pub mod resp;
