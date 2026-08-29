@@ -132,6 +132,15 @@ macro_rules! make_openai_args {
             #[arg(long = concat!($long, "llm-retry"), env = concat!($prefix, "LLM_RETRY"), default_value_t = 5)]
             pub llm_retry: u64,
 
+            /// Cap on concurrently in-flight LLM requests through this client
+            /// (shared by every scope/clone of it); 0 = unlimited.
+            #[arg(
+                long = concat!($long, "llm-concurrent"),
+                env = concat!($prefix, "LLM_CONCURRENT"),
+                default_value_t = 0,
+            )]
+            pub llm_concurrent: usize,
+
             #[arg(long = concat!($long, "llm-max-completion-tokens"), env = concat!($prefix, "LLM_MAX_COMPLETION_TOKENS"))]
             pub llm_max_completion_tokens: Option<u32>,
 
@@ -239,6 +248,7 @@ macro_rules! make_openai_args {
                     llm_presence_penalty: self.llm_presence_penalty,
                     llm_prompt_timeout: self.llm_prompt_timeout,
                     llm_retry: self.llm_retry,
+                    llm_concurrent: self.llm_concurrent,
                     llm_max_completion_tokens: self.llm_max_completion_tokens,
                     llm_tool_choice: self.llm_tool_choice.clone(),
                     llm_stream: self.llm_stream,

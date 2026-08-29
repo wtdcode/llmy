@@ -1049,6 +1049,7 @@ mod tests {
             billing_log_tokens: 100_000,
             token_estimate_pct: 10.0,
             allow_implicit_convert: false,
+            llm_concurrent: 0,
         }
     }
 

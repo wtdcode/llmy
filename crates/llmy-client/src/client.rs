@@ -749,6 +749,7 @@ impl LLM {
         }
 
         let cache_keys = CacheKeys::new(settings.cache_key_config());
+        let concurrency = LLMInner::concurrency_limiter(settings.llm_concurrent);
 
         LLM {
             llm: Arc::new(LLMInner {
@@ -762,6 +763,7 @@ impl LLM {
                 default_settings: settings,
                 content_filter: Arc::new(StdRwLock::new(content_filter)),
                 cache_keys,
+                concurrency,
             }),
         }
     }
@@ -868,6 +870,9 @@ pub struct LLMInner {
     /// Auto `prompt_cache_key` selection, shared with every scope cut from this
     /// client so a sub-agent continuing a conversation keeps its routing.
     cache_keys: CacheKeys,
+    /// Global in-flight request limiter (`llm_concurrent`), shared with every
+    /// scope/clone of this client; `None` when unlimited.
+    concurrency: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl Drop for LLMInner {
@@ -906,6 +911,7 @@ impl LLMInner {
             default_settings: self.default_settings.clone(),
             content_filter: self.content_filter.clone(),
             cache_keys: self.cache_keys.clone(),
+            concurrency: self.concurrency.clone(),
         }
     }
 
@@ -1017,6 +1023,28 @@ impl LLMInner {
     /// Snapshot of the auto cache key policy in force for this client.
     pub fn cache_key_config(&self) -> crate::cache_key::CacheKeyConfig {
         self.cache_keys.config()
+    }
+
+    /// The limiter an `llm_concurrent` value describes: `None` when 0
+    /// (unlimited).
+    fn concurrency_limiter(limit: usize) -> Option<Arc<tokio::sync::Semaphore>> {
+        (limit > 0).then(|| Arc::new(tokio::sync::Semaphore::new(limit)))
+    }
+
+    /// Take a slot on the global concurrency limiter; trivially `None` when
+    /// the client is unlimited. Holding the permit spans the wire round trip,
+    /// so excess requests queue here instead of piling onto the endpoint.
+    async fn acquire_concurrency_slot(
+        &self,
+    ) -> Result<Option<tokio::sync::SemaphorePermit<'_>>, LLMYError> {
+        match &self.concurrency {
+            Some(semaphore) => {
+                Ok(Some(semaphore.acquire().await.map_err(|_| {
+                    LLMYError::Other(eyre!("the concurrency limiter was closed"))
+                })?))
+            }
+            None => Ok(None),
+        }
     }
 
     fn apply_filter_output(&self, resp: &mut RawExtensibleChatCompletionResponse) {
@@ -1355,7 +1383,17 @@ impl LLMInner {
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
     ) -> Result<(RawExtensibleChatCompletionResponse, Message), LLMYError> {
-        // Fail fast: if we're already over budget, don't issue the request.
+        // A limited client queues right at the attempt's entry. Nothing about
+        // the attempt (budget check, debug row, token estimate, wire clock)
+        // happens until it owns a slot; the permit then spans the whole round
+        // trip (streaming included — the stream is consumed inside `llm_fut`),
+        // keeping queue wait out of the tok/s math and the request timeout.
+        let _concurrency_permit = self.acquire_concurrency_slot().await?;
+
+        // Check the budget only once the slot is owned: usage recorded by
+        // requests that finished while this one queued counts against it, so
+        // an over-cap request can't slip out on a pre-queue check gone stale.
+        // A refused request holds its slot only for the length of this read.
         self.billing.read().unwrap().check_cap(self.node)?;
 
         if let Some(claim) = given_claim.as_ref() {
@@ -1865,6 +1903,7 @@ mod tests {
             billing_log_tokens: 100_000,
             token_estimate_pct: 10.0,
             allow_implicit_convert: false,
+            llm_concurrent: 0,
         }
     }
 
@@ -1887,6 +1926,18 @@ mod tests {
 
     fn test_llm() -> LLM {
         test_llm_with(test_settings(None))
+    }
+
+    #[test]
+    fn a_zero_concurrency_setting_means_no_limiter() {
+        assert!(LLMInner::concurrency_limiter(0).is_none());
+        let limiter = LLMInner::concurrency_limiter(2).expect("limited");
+        let _a = limiter.try_acquire().expect("slot 1");
+        let _b = limiter.try_acquire().expect("slot 2");
+        assert!(
+            limiter.try_acquire().is_err(),
+            "a third in-flight request must queue"
+        );
     }
 
     #[test]

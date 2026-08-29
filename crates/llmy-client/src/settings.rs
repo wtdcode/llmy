@@ -89,6 +89,10 @@ pub struct LLMSettings {
     pub llm_presence_penalty: Option<f32>,
     pub llm_prompt_timeout: u64,
     pub llm_retry: u64,
+    /// Cap on concurrently in-flight requests through one client (all its
+    /// scopes/clones share the limiter); 0 = unlimited. Applied when the
+    /// client is constructed — per-request settings overrides don't resize it.
+    pub llm_concurrent: usize,
     pub llm_max_completion_tokens: Option<u32>,
     pub llm_tool_choice: Option<LLMToolChoice>,
     pub llm_stream: bool,
