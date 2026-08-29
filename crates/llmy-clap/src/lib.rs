@@ -7,10 +7,20 @@ use llmy_types::error::LLMYError;
 /// `--azure-openai-endpoint` is provided.
 const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1";
 
+/// Default Azure `api-version` query parameter, used when neither
+/// `--azure-api-version` nor the SDK-compatible `OPENAI_API_VERSION` env
+/// supplies one.
+const DEFAULT_AZURE_API_VERSION: &str = "2025-01-01-preview";
+
 macro_rules! make_openai_args {
     ($struct_name:ident, $prefix:literal, $long:literal) => {
         #[derive(Args, Clone, Debug)]
         pub struct $struct_name {
+            /// OpenAI-style chat-completion endpoint, `/v1` included. The
+            /// OpenAI SDK's `OPENAI_BASE_URL` env is honoured as an alias at
+            /// resolve time (same shape — the SDK's default is
+            /// `https://api.openai.com/v1` too); setting both envs is an
+            /// error.
             #[arg(
                 long = concat!($long, "openai-url"),
                 env = concat!($prefix, "OPENAI_API_URL"),
@@ -20,10 +30,10 @@ macro_rules! make_openai_args {
             #[arg(long = concat!($long, "azure-openai-endpoint"), env = concat!($prefix, "AZURE_OPENAI_ENDPOINT"))]
             pub azure_openai_endpoint: Option<String>,
 
-            /// Generic API key (`LLM_API_KEY`). The deprecated
-            /// `OPENAI_API_KEY` env is still honoured at resolve time, with a
-            /// removal warning; the anthropic-specific key wins on that
-            /// protocol.
+            /// Generic API key (`LLM_API_KEY`). The OpenAI SDK's
+            /// `OPENAI_API_KEY` env is honoured as an alias at resolve time;
+            /// setting both envs is an error. The anthropic-specific
+            /// credentials win on that protocol.
             // `hide_env_values` so `--help` does not print the key it picked up.
             #[arg(
                 long = concat!($long, "openai-key"),
@@ -36,17 +46,26 @@ macro_rules! make_openai_args {
             #[arg(long = concat!($long, "azure-deployment"), env = concat!($prefix, "AZURE_API_DEPLOYMENT"))]
             pub azure_deployment: Option<String>,
 
-            #[arg(long = concat!($long, "azure-api-version"), env = concat!($prefix, "AZURE_API_VERSION"), default_value = "2025-01-01-preview")]
-            pub azure_api_version: String,
+            /// Azure `api-version` query parameter; defaults to
+            /// `2025-01-01-preview`. The Azure SDK's `OPENAI_API_VERSION` env
+            /// is honoured as an alias at resolve time; setting both envs is
+            /// an error.
+            #[arg(long = concat!($long, "azure-api-version"), env = concat!($prefix, "AZURE_API_VERSION"))]
+            pub azure_api_version: Option<String>,
 
             /// Anthropic Messages protocol endpoint (e.g.
             /// `https://api.anthropic.com/v1`). Mutually exclusive with the
             /// other endpoint flags; setting it switches the wire protocol.
+            /// The Anthropic SDK's `ANTHROPIC_BASE_URL` env is honoured as an
+            /// alias at resolve time (SDK shape: without `/v1`, which gets
+            /// appended); setting both envs is an error.
             #[arg(long = concat!($long, "anthropic-url"), env = concat!($prefix, "ANTHROPIC_API_URL"))]
             pub anthropic_url: Option<String>,
 
-            /// API key for the Anthropic endpoint; falls back to the
-            /// `openai-key` flag when unset.
+            /// API key for the Anthropic endpoint, sent as `x-api-key`; falls
+            /// back to the `openai-key` flag when unset. The Anthropic SDK's
+            /// `ANTHROPIC_AUTH_TOKEN` env is honoured too and switches auth to
+            /// `Authorization: Bearer`; setting both envs is an error.
             #[arg(
                 long = concat!($long, "anthropic-key"),
                 env = concat!($prefix, "ANTHROPIC_API_KEY"),
@@ -65,9 +84,9 @@ macro_rules! make_openai_args {
             #[arg(long = concat!($long, "responses-url"), env = concat!($prefix, "RESPONSES_API_URL"))]
             pub responses_url: Option<String>,
 
-            /// Total spend cap in USD; defaults to 10. The deprecated
-            /// `OPENAI_BILLING_CAP` env is still honoured at resolve time,
-            /// with a removal warning.
+            /// Total spend cap in USD; defaults to 10. The `OPENAI_BILLING_CAP`
+            /// env is honoured as an alias at resolve time; setting both envs
+            /// is an error.
             #[arg(
                 long = concat!($long, "biling-cap"),
                 visible_alias = concat!($long, "llm-billing-cap"),
@@ -75,8 +94,8 @@ macro_rules! make_openai_args {
             )]
             pub biling_cap: Option<rust_decimal::Decimal>,
 
-            /// Model id. The deprecated `OPENAI_API_MODEL` env is still
-            /// honoured at resolve time, with a removal warning.
+            /// Model id. The `OPENAI_API_MODEL` env is honoured as an alias
+            /// at resolve time; setting both envs is an error.
             #[arg(
                 long = concat!($long, "model"),
                 env = concat!($prefix, "LLM_MODEL"),
@@ -235,20 +254,43 @@ macro_rules! make_openai_args {
                 }
             }
 
+            /// Resolve-time env aliasing: `alias` (another SDK's conventional
+            /// name) is honoured when the clap-wired `primary` env is unset.
+            /// Both set at once is refused — silently preferring one would
+            /// invite config drift. Telling the user which env actually served
+            /// is left to the caller, which knows whether a CLI flag overrode
+            /// the value anyway.
+            fn compat_env(primary: &str, alias: &str) -> Result<Option<String>, LLMYError> {
+                let alias_value = std::env::var(alias).ok();
+                if std::env::var(primary).is_ok() {
+                    if alias_value.is_some() {
+                        return Err(LLMYError::Other(eyre!(
+                            "both {primary} and {alias} are set; unset one of them"
+                        )));
+                    }
+                    return Ok(None);
+                }
+                Ok(alias_value)
+            }
+
             /// The model id: the parsed `--model`/`LLM_MODEL` value, else the
-            /// deprecated `OPENAI_API_MODEL` env (with a removal warning).
+            /// `OPENAI_API_MODEL` env. Both envs set at once is an error.
             pub fn resolved_model(&self) -> Result<Option<OpenAIModel>, LLMYError> {
+                let alias = Self::compat_env(
+                    concat!($prefix, "LLM_MODEL"),
+                    concat!($prefix, "OPENAI_API_MODEL"),
+                )?;
                 if let Some(model) = &self.model {
                     return Ok(Some(model.clone()));
                 }
-                let Ok(legacy) = std::env::var(concat!($prefix, "OPENAI_API_MODEL")) else {
+                let Some(value) = alias else {
                     return Ok(None);
                 };
-                tracing::warn!(concat!(
-                    $prefix, "OPENAI_API_MODEL is deprecated and will be removed; use ",
-                    $prefix, "LLM_MODEL instead"
+                tracing::info!(concat!(
+                    "model read from ", $prefix, "OPENAI_API_MODEL; ",
+                    $prefix, "LLM_MODEL is the preferred name"
                 ));
-                let model = legacy.parse::<OpenAIModel>().map_err(|e| {
+                let model = value.parse::<OpenAIModel>().map_err(|e| {
                     LLMYError::Other(eyre!(
                         concat!("invalid ", $prefix, "OPENAI_API_MODEL: {}"),
                         e
@@ -258,43 +300,90 @@ macro_rules! make_openai_args {
             }
 
             /// The generic API key: the parsed `--openai-key`/`LLM_API_KEY`
-            /// value, else the deprecated `OPENAI_API_KEY` env (with a removal
-            /// warning).
-            pub fn resolved_key(&self) -> Option<String> {
+            /// value, else the `OPENAI_API_KEY` env (the OpenAI SDK's name).
+            /// Both envs set at once is an error.
+            pub fn resolved_key(&self) -> Result<Option<String>, LLMYError> {
+                let alias = Self::compat_env(
+                    concat!($prefix, "LLM_API_KEY"),
+                    concat!($prefix, "OPENAI_API_KEY"),
+                )?;
                 if let Some(key) = &self.openai_key {
-                    return Some(key.clone());
+                    return Ok(Some(key.clone()));
                 }
-                let legacy = std::env::var(concat!($prefix, "OPENAI_API_KEY")).ok()?;
-                tracing::warn!(concat!(
-                    $prefix, "OPENAI_API_KEY is deprecated and will be removed; use ",
-                    $prefix, "LLM_API_KEY instead"
-                ));
-                Some(legacy)
+                Ok(alias.inspect(|_| {
+                    tracing::info!(concat!(
+                        "API key read from ", $prefix, "OPENAI_API_KEY; ",
+                        $prefix, "LLM_API_KEY is the preferred name"
+                    ));
+                }))
             }
 
             /// The billing cap: the parsed `--biling-cap`/`LLM_BILLING_CAP`
-            /// value, else the deprecated `OPENAI_BILLING_CAP` env (with a
-            /// removal warning), else 10 USD.
+            /// value, else the `OPENAI_BILLING_CAP` env, else 10 USD. Both
+            /// envs set at once is an error.
             pub fn resolved_billing_cap(&self) -> Result<rust_decimal::Decimal, LLMYError> {
+                let alias = Self::compat_env(
+                    concat!($prefix, "LLM_BILLING_CAP"),
+                    concat!($prefix, "OPENAI_BILLING_CAP"),
+                )?;
                 if let Some(cap) = self.biling_cap {
                     return Ok(cap);
                 }
-                match std::env::var(concat!($prefix, "OPENAI_BILLING_CAP")) {
-                    Ok(legacy) => {
-                        tracing::warn!(concat!(
-                            $prefix,
-                            "OPENAI_BILLING_CAP is deprecated and will be removed; use ",
-                            $prefix, "LLM_BILLING_CAP instead"
-                        ));
-                        legacy.parse::<rust_decimal::Decimal>().map_err(|e| {
-                            LLMYError::Other(eyre!(
-                                concat!("invalid ", $prefix, "OPENAI_BILLING_CAP: {}"),
-                                e
-                            ))
-                        })
-                    }
-                    Err(_) => Ok(rust_decimal::dec!(10.0)),
+                let Some(value) = alias else {
+                    return Ok(rust_decimal::dec!(10.0));
+                };
+                tracing::info!(concat!(
+                    "billing cap read from ", $prefix, "OPENAI_BILLING_CAP; ",
+                    $prefix, "LLM_BILLING_CAP is the preferred name"
+                ));
+                value.parse::<rust_decimal::Decimal>().map_err(|e| {
+                    LLMYError::Other(eyre!(
+                        concat!("invalid ", $prefix, "OPENAI_BILLING_CAP: {}"),
+                        e
+                    ))
+                })
+            }
+
+            /// The chat-completion endpoint: `--openai-url`/`OPENAI_API_URL`,
+            /// else the OpenAI SDK's `OPENAI_BASE_URL`. Both envs set at once
+            /// is an error.
+            pub fn resolved_openai_url(&self) -> Result<Option<String>, LLMYError> {
+                let alias = Self::compat_env(
+                    concat!($prefix, "OPENAI_API_URL"),
+                    concat!($prefix, "OPENAI_BASE_URL"),
+                )?;
+                if let Some(url) = &self.openai_url {
+                    return Ok(Some(url.clone()));
                 }
+                Ok(alias.inspect(|_| {
+                    tracing::info!(concat!(
+                        "endpoint read from ", $prefix, "OPENAI_BASE_URL; ",
+                        $prefix, "OPENAI_API_URL is the preferred name"
+                    ));
+                }))
+            }
+
+            /// The Anthropic endpoint: `--anthropic-url`/`ANTHROPIC_API_URL`,
+            /// else the Anthropic SDK's `ANTHROPIC_BASE_URL`. Both envs set at
+            /// once is an error. The two differ in shape: `ANTHROPIC_API_URL`
+            /// carries the `/v1` segment, the SDK's base url does not (the SDK
+            /// appends `/v1/messages` itself), so the alias value gains `/v1`
+            /// here.
+            pub fn resolved_anthropic_url(&self) -> Result<Option<String>, LLMYError> {
+                let alias = Self::compat_env(
+                    concat!($prefix, "ANTHROPIC_API_URL"),
+                    concat!($prefix, "ANTHROPIC_BASE_URL"),
+                )?;
+                if let Some(url) = &self.anthropic_url {
+                    return Ok(Some(url.clone()));
+                }
+                Ok(alias.map(|url| {
+                    tracing::info!(concat!(
+                        "endpoint read from ", $prefix, "ANTHROPIC_BASE_URL; ",
+                        $prefix, "ANTHROPIC_API_URL is the preferred name"
+                    ));
+                    format!("{}/v1", url.trim_end_matches('/'))
+                }))
             }
 
             /// Build the upstream config from the endpoint flags:
@@ -304,16 +393,22 @@ macro_rules! make_openai_args {
             /// - only `anthropic-url`        => Anthropic Messages protocol
             /// - only `responses-url`        => OpenAI Responses protocol
             /// - more than one               => error (ambiguous)
+            ///
+            /// The Python SDKs' env names serve as resolve-time aliases:
+            /// `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`
+            /// (bearer auth), `AZURE_OPENAI_API_KEY` and `OPENAI_API_VERSION`.
             pub fn to_config(&self) -> Result<SupportedConfig, LLMYError> {
-                let key = self.resolved_key().unwrap_or_default();
+                let key = self.resolved_key()?.unwrap_or_default();
+                let openai_url = self.resolved_openai_url()?;
+                let anthropic_url = self.resolved_anthropic_url()?;
                 let mut endpoints = Vec::new();
-                if self.openai_url.is_some() {
+                if openai_url.is_some() {
                     endpoints.push(concat!("--", $long, "openai-url"));
                 }
                 if self.azure_openai_endpoint.is_some() {
                     endpoints.push(concat!("--", $long, "azure-openai-endpoint"));
                 }
-                if self.anthropic_url.is_some() {
+                if anthropic_url.is_some() {
                     endpoints.push(concat!("--", $long, "anthropic-url"));
                 }
                 if self.responses_url.is_some() {
@@ -325,11 +420,33 @@ macro_rules! make_openai_args {
                         endpoints.join(", ")
                     )));
                 }
-                if let Some(url) = &self.anthropic_url {
-                    // A dedicated Anthropic key wins; otherwise the generic key
-                    // flag serves, so proxies fronting several protocols need
-                    // only one credential.
-                    let key = self.anthropic_key.clone().unwrap_or(key);
+                if let Some(url) = &anthropic_url {
+                    // A dedicated Anthropic credential wins; otherwise the
+                    // generic key serves, so proxies fronting several
+                    // protocols need only one credential. The Anthropic SDK's
+                    // `ANTHROPIC_AUTH_TOKEN` means bearer auth, not `x-api-key`.
+                    let auth_token = Self::compat_env(
+                        concat!($prefix, "ANTHROPIC_API_KEY"),
+                        concat!($prefix, "ANTHROPIC_AUTH_TOKEN"),
+                    )?;
+                    if let Some(key) = &self.anthropic_key {
+                        return Ok(SupportedConfig::new_anthropic(
+                            url,
+                            key,
+                            &self.anthropic_version,
+                        ));
+                    }
+                    if let Some(token) = auth_token {
+                        tracing::info!(concat!(
+                            "anthropic bearer token read from ",
+                            $prefix, "ANTHROPIC_AUTH_TOKEN"
+                        ));
+                        return Ok(SupportedConfig::new_anthropic_bearer(
+                            url,
+                            &token,
+                            &self.anthropic_version,
+                        ));
+                    }
                     return Ok(SupportedConfig::new_anthropic(
                         url,
                         &key,
@@ -340,6 +457,17 @@ macro_rules! make_openai_args {
                     return Ok(SupportedConfig::new_responses(url, key.as_str()));
                 }
                 if let Some(ep) = &self.azure_openai_endpoint {
+                    // The Azure SDK's own key env wins over the generic key,
+                    // mirroring how the dedicated anthropic credentials behave.
+                    let key = match std::env::var(concat!($prefix, "AZURE_OPENAI_API_KEY")) {
+                        Ok(azure_key) => {
+                            tracing::info!(concat!(
+                                "azure API key read from ", $prefix, "AZURE_OPENAI_API_KEY"
+                            ));
+                            azure_key
+                        }
+                        Err(_) => key,
+                    };
                     // Azure deployment names are user-chosen and almost never
                     // contain `/`; fall back to the bare model name, not the
                     // canonical `owner/name` form. The model is only needed
@@ -358,17 +486,36 @@ macro_rules! make_openai_args {
                             .model_name()
                             .to_string(),
                     };
+                    // `OPENAI_API_VERSION` is the Azure SDK's name for the
+                    // api-version query parameter.
+                    let api_version_alias = Self::compat_env(
+                        concat!($prefix, "AZURE_API_VERSION"),
+                        concat!($prefix, "OPENAI_API_VERSION"),
+                    )?;
+                    let api_version = match &self.azure_api_version {
+                        Some(version) => version.clone(),
+                        None => match api_version_alias {
+                            Some(version) => {
+                                tracing::info!(concat!(
+                                    "azure api-version read from ", $prefix,
+                                    "OPENAI_API_VERSION; ", $prefix,
+                                    "AZURE_API_VERSION is the preferred name"
+                                ));
+                                version
+                            }
+                            None => DEFAULT_AZURE_API_VERSION.to_string(),
+                        },
+                    };
                     return Ok(SupportedConfig::new_azure(
                         ep,
                         key.as_str(),
                         &deployment,
-                        &self.azure_api_version,
+                        &api_version,
                     ));
                 }
-                let url = self.openai_url.as_deref().unwrap_or(DEFAULT_OPENAI_URL);
+                let url = openai_url.as_deref().unwrap_or(DEFAULT_OPENAI_URL);
                 Ok(SupportedConfig::new(url, key.as_str()))
             }
-
 
             async fn llm_new_inner(&self, model: OpenAIModel) -> Result<LLM, LLMYError> {
                 let config = self.to_config()?;
@@ -426,8 +573,17 @@ mod tests {
             .llm
     }
 
+    /// One test mutates `OPT_OPT_*` env vars and every `parse`/`to_config`
+    /// reads them; a shared lock keeps `cargo test`'s parallel threads from
+    /// observing each other's environment.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn each_endpoint_flag_selects_its_protocol() {
+        let _env = env_lock();
         let anthropic = parse(&["--opt-opt-anthropic-url", "https://api.anthropic.com/v1"])
             .to_config()
             .unwrap();
@@ -446,6 +602,7 @@ mod tests {
 
     #[test]
     fn conflicting_endpoint_flags_are_an_error() {
+        let _env = env_lock();
         let err = parse(&[
             "--opt-opt-anthropic-url",
             "https://api.anthropic.com/v1",
@@ -461,6 +618,7 @@ mod tests {
 
     #[test]
     fn the_anthropic_version_has_a_sane_default() {
+        let _env = env_lock();
         let config = parse(&["--opt-opt-anthropic-url", "https://api.anthropic.com/v1"])
             .to_config()
             .unwrap();
@@ -474,6 +632,7 @@ mod tests {
 
     #[test]
     fn implicit_convert_is_off_unless_asked_for() {
+        let _env = env_lock();
         assert!(!parse(&[]).settings().allow_implicit_convert);
         assert!(
             parse(&["--opt-opt-allow-implicit-convert"])
@@ -483,46 +642,119 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_openai_envs_still_resolve_with_a_warning() {
-        // SAFETY: test-local env keys of the opt-opt flavor, removed before
-        // the test ends; no other test asserts on these settings.
-        unsafe {
-            std::env::set_var("OPT_OPT_LLM_MODEL", "captest,1000000,1000000");
-            std::env::set_var("OPT_OPT_OPENAI_API_MODEL", "other,1000,1000");
-        }
-        let both = parse(&[]).resolved_model();
+    fn sdk_alias_envs_resolve_but_setting_both_is_refused() {
+        let _env = env_lock();
+        // SAFETY (all set_var/remove_var here): mutation is confined to
+        // `OPT_OPT_*` names and guarded by `env_lock`, so no parallel test
+        // observes the intermediate states.
+
+        // The alias alone resolves, value intact...
+        unsafe { std::env::set_var("OPT_OPT_OPENAI_API_MODEL", "other,1000,1000") };
+        assert!(
+            parse(&[])
+                .resolved_model()
+                .unwrap()
+                .unwrap()
+                .to_string()
+                .contains("other")
+        );
+        // ...primary + alias at once is ambiguous...
+        unsafe { std::env::set_var("OPT_OPT_LLM_MODEL", "captest,1000000,1000000") };
+        let err = parse(&[]).resolved_model().unwrap_err().to_string();
+        assert!(err.contains("OPT_OPT_LLM_MODEL"), "{err}");
+        assert!(err.contains("OPT_OPT_OPENAI_API_MODEL"), "{err}");
         unsafe {
             std::env::remove_var("OPT_OPT_LLM_MODEL");
-        }
-        let legacy_only = parse(&[]).resolved_model();
-        unsafe {
             std::env::remove_var("OPT_OPT_OPENAI_API_MODEL");
         }
-
-        // The clap-wired name wins when both are set...
-        assert!(both.unwrap().unwrap().to_string().contains("captest"));
-        // ...the deprecated one still resolves (warning aside) on its own...
-        assert!(legacy_only.unwrap().unwrap().to_string().contains("other"));
         // ...and nothing set resolves to nothing.
         assert!(parse(&[]).resolved_model().unwrap().is_none());
 
         // Key and cap follow the same rule.
+        unsafe { std::env::set_var("OPT_OPT_OPENAI_API_KEY", "legacy-key") };
+        assert_eq!(
+            parse(&[]).resolved_key().unwrap().as_deref(),
+            Some("legacy-key")
+        );
+        unsafe { std::env::set_var("OPT_OPT_LLM_API_KEY", "primary-key") };
+        assert!(parse(&[]).resolved_key().is_err());
         unsafe {
-            std::env::set_var("OPT_OPT_OPENAI_API_KEY", "legacy-key");
-            std::env::set_var("OPT_OPT_OPENAI_BILLING_CAP", "25");
-        }
-        let key = parse(&[]).resolved_key();
-        let cap = parse(&[]).resolved_billing_cap();
-        unsafe {
+            std::env::remove_var("OPT_OPT_LLM_API_KEY");
             std::env::remove_var("OPT_OPT_OPENAI_API_KEY");
-            std::env::remove_var("OPT_OPT_OPENAI_BILLING_CAP");
         }
-        assert_eq!(key.as_deref(), Some("legacy-key"));
-        assert_eq!(cap.unwrap(), rust_decimal::dec!(25));
+        unsafe { std::env::set_var("OPT_OPT_OPENAI_BILLING_CAP", "25") };
+        assert_eq!(
+            parse(&[]).resolved_billing_cap().unwrap(),
+            rust_decimal::dec!(25)
+        );
+        unsafe { std::env::remove_var("OPT_OPT_OPENAI_BILLING_CAP") };
         assert_eq!(
             parse(&[]).resolved_billing_cap().unwrap(),
             rust_decimal::dec!(10.0)
         );
+
+        // The OpenAI SDK's base-url env resolves...
+        unsafe { std::env::set_var("OPT_OPT_OPENAI_BASE_URL", "https://proxy.example/v1") };
+        assert_eq!(
+            parse(&[]).resolved_openai_url().unwrap().as_deref(),
+            Some("https://proxy.example/v1")
+        );
+        // ...counts as an endpoint choice for the exclusivity check...
+        let err = parse(&["--opt-opt-responses-url", "https://api.openai.com/v1"])
+            .to_config()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--opt-opt-openai-url"), "{err}");
+        // ...and conflicts with our own name for the same endpoint.
+        unsafe { std::env::set_var("OPT_OPT_OPENAI_API_URL", "https://other.example/v1") };
+        assert!(parse(&[]).resolved_openai_url().is_err());
+        unsafe {
+            std::env::remove_var("OPT_OPT_OPENAI_API_URL");
+            std::env::remove_var("OPT_OPT_OPENAI_BASE_URL");
+        }
+
+        // The Anthropic SDK's names: the base url picks the protocol, the
+        // auth token authenticates it, and token + key at once is ambiguous.
+        unsafe {
+            std::env::set_var("OPT_OPT_ANTHROPIC_BASE_URL", "https://claude.example");
+            std::env::set_var("OPT_OPT_ANTHROPIC_AUTH_TOKEN", "sk-bearer");
+        }
+        // The SDK's base url carries no `/v1`; resolving appends it.
+        assert_eq!(
+            parse(&[]).resolved_anthropic_url().unwrap().as_deref(),
+            Some("https://claude.example/v1")
+        );
+        assert_eq!(parse(&[]).to_config().unwrap().endpoint_kind(), "anthropic");
+        unsafe { std::env::set_var("OPT_OPT_ANTHROPIC_API_KEY", "sk-key") };
+        assert!(parse(&[]).to_config().is_err());
+        unsafe {
+            std::env::remove_var("OPT_OPT_ANTHROPIC_API_KEY");
+            std::env::remove_var("OPT_OPT_ANTHROPIC_AUTH_TOKEN");
+            std::env::remove_var("OPT_OPT_ANTHROPIC_BASE_URL");
+        }
+
+        // The Azure SDK's key and api-version names.
+        let azure_flags = [
+            "--opt-opt-azure-openai-endpoint",
+            "https://example.openai.azure.com",
+            "--opt-opt-azure-deployment",
+            "dep",
+        ];
+        unsafe {
+            std::env::set_var("OPT_OPT_AZURE_OPENAI_API_KEY", "azure-key");
+            std::env::set_var("OPT_OPT_OPENAI_API_VERSION", "2024-06-01");
+        }
+        assert_eq!(
+            parse(&azure_flags).to_config().unwrap().endpoint_kind(),
+            "azure"
+        );
+        unsafe { std::env::set_var("OPT_OPT_AZURE_API_VERSION", "2025-01-01-preview") };
+        assert!(parse(&azure_flags).to_config().is_err());
+        unsafe {
+            std::env::remove_var("OPT_OPT_AZURE_API_VERSION");
+            std::env::remove_var("OPT_OPT_OPENAI_API_VERSION");
+            std::env::remove_var("OPT_OPT_AZURE_OPENAI_API_KEY");
+        }
 
         // The spelled-out flag aliases land in the same fields.
         assert_eq!(

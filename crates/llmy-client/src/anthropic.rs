@@ -70,7 +70,8 @@ const ANTHROPIC_PROTOCOL: &str = "anthropic";
 // ---------------------------------------------------------------------------
 
 /// Configuration teaching the shared `async_openai` HTTP client to speak the
-/// Anthropic Messages protocol: auth goes in `x-api-key` (not `Authorization`),
+/// Anthropic Messages protocol: auth goes in `x-api-key` (or `Authorization:
+/// Bearer` for an auth-token credential),
 /// every request carries `anthropic-version`, and the one POST path the client
 /// uses (`/chat/completions`) maps onto `/messages`.
 ///
@@ -79,15 +80,35 @@ const ANTHROPIC_PROTOCOL: &str = "anthropic";
 #[derive(Clone, Debug)]
 pub struct AnthropicConfig {
     api_base: String,
-    api_key: SecretString,
+    auth: AnthropicAuth,
     version: String,
+}
+
+/// How the endpoint authenticates: an API key sent as `x-api-key` (the
+/// protocol's canonical scheme), or a bearer token in `Authorization` — the
+/// scheme the Anthropic SDK ties to `ANTHROPIC_AUTH_TOKEN`.
+#[derive(Clone, Debug)]
+enum AnthropicAuth {
+    ApiKey(SecretString),
+    Bearer(SecretString),
 }
 
 impl AnthropicConfig {
     pub fn new(api_base: &str, api_key: &str, version: &str) -> Self {
         Self {
             api_base: api_base.trim_end_matches('/').to_string(),
-            api_key: SecretString::from(api_key.to_string()),
+            auth: AnthropicAuth::ApiKey(SecretString::from(api_key.to_string())),
+            version: version.to_string(),
+        }
+    }
+
+    /// Like [`Self::new`], but authenticating with `Authorization: Bearer`
+    /// instead of `x-api-key` — what the Anthropic SDK does with a credential
+    /// from `ANTHROPIC_AUTH_TOKEN`.
+    pub fn new_bearer(api_base: &str, token: &str, version: &str) -> Self {
+        Self {
+            api_base: api_base.trim_end_matches('/').to_string(),
+            auth: AnthropicAuth::Bearer(SecretString::from(token.to_string())),
             version: version.to_string(),
         }
     }
@@ -101,11 +122,22 @@ impl async_openai::config::Config for AnthropicConfig {
     fn headers(&self) -> http::HeaderMap {
         use secrecy::ExposeSecret;
         let mut headers = http::HeaderMap::new();
-        // An unencodable key/version could not authenticate anyway; sending the
-        // request without the header surfaces the provider's own auth error
-        // instead of panicking here.
-        if let Ok(value) = http::HeaderValue::from_str(self.api_key.expose_secret()) {
-            headers.insert("x-api-key", value);
+        // An unencodable credential/version could not authenticate anyway;
+        // sending the request without the header surfaces the provider's own
+        // auth error instead of panicking here.
+        match &self.auth {
+            AnthropicAuth::ApiKey(key) => {
+                if let Ok(value) = http::HeaderValue::from_str(key.expose_secret()) {
+                    headers.insert("x-api-key", value);
+                }
+            }
+            AnthropicAuth::Bearer(token) => {
+                if let Ok(value) =
+                    http::HeaderValue::from_str(&format!("Bearer {}", token.expose_secret()))
+                {
+                    headers.insert(http::header::AUTHORIZATION, value);
+                }
+            }
         }
         if let Ok(value) = http::HeaderValue::from_str(&self.version) {
             headers.insert("anthropic-version", value);
@@ -133,7 +165,11 @@ impl async_openai::config::Config for AnthropicConfig {
     }
 
     fn api_key(&self) -> &SecretString {
-        &self.api_key
+        // The generic client only reads this for logging/reuse; either auth
+        // scheme's credential is the secret in play.
+        match &self.auth {
+            AnthropicAuth::ApiKey(secret) | AnthropicAuth::Bearer(secret) => secret,
+        }
     }
 }
 
@@ -1786,6 +1822,20 @@ mod tests {
         assert!(headers.get("authorization").is_none());
         // The Debug rendering must not leak the key.
         assert!(!format!("{config:?}").contains("sk-ant-test"));
+    }
+
+    #[test]
+    fn a_bearer_config_signs_with_authorization_instead_of_x_api_key() {
+        let config = AnthropicConfig::new_bearer(
+            "https://llm.example/v1",
+            "sk-token",
+            DEFAULT_ANTHROPIC_VERSION,
+        );
+        let headers = config.headers();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer sk-token");
+        assert!(headers.get("x-api-key").is_none());
+        // The Debug rendering must not leak the token either.
+        assert!(!format!("{config:?}").contains("sk-token"));
     }
 
     #[test]

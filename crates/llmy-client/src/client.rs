@@ -99,6 +99,12 @@ impl SupportedConfig {
         Self::Anthropic(AnthropicConfig::new(endpoint, key, version))
     }
 
+    /// [`Self::new_anthropic`] with bearer auth (`Authorization: Bearer`)
+    /// instead of `x-api-key` — the scheme behind `ANTHROPIC_AUTH_TOKEN`.
+    pub fn new_anthropic_bearer(endpoint: &str, token: &str, version: &str) -> Self {
+        Self::Anthropic(AnthropicConfig::new_bearer(endpoint, token, version))
+    }
+
     /// OpenAI Responses protocol at an OpenAI-style base URL.
     pub fn new_responses(endpoint: &str, key: &str) -> Self {
         let cfg = OpenAIConfig::new()
