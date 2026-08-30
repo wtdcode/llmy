@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.23.1"
+version = "0.23.2"
 edition = "2024"
 license = "MIT"
 readme = "Readme.md"
@@ -46,14 +46,14 @@ axum = "0.8"
 rmcp = { version = "1", default-features = false }
 rust_decimal = { version = "1" }
 
-llmy-clap = {version = "0.23.1", path = "./crates/llmy-clap", default-features = false}
-llmy-client = {version = "0.23.1", path = "./crates/llmy-client", default-features = false}
-llmy-types = {version = "0.23.1", path = "./crates/llmy-types", default-features = false}
-llmy-tokenizer = {version = "0.23.1", path = "./crates/llmy-tokenizer"}
-llmy-agent = {version = "0.23.1", path = "./crates/llmy-agent", default-features = false}
-llmy-agent-tools = {version = "0.23.1", path = "./crates/llmy-agent-tools", default-features = false}
-llmy-agent-derive = {version = "0.23.1", path = "./crates/llmy-agent-derive"}
-llmy-harness = {version = "0.23.1", path = "./crates/llmy-harness", default-features = false}
+llmy-clap = {version = "0.23.2", path = "./crates/llmy-clap", default-features = false}
+llmy-client = {version = "0.23.2", path = "./crates/llmy-client", default-features = false}
+llmy-types = {version = "0.23.2", path = "./crates/llmy-types", default-features = false}
+llmy-tokenizer = {version = "0.23.2", path = "./crates/llmy-tokenizer"}
+llmy-agent = {version = "0.23.2", path = "./crates/llmy-agent", default-features = false}
+llmy-agent-tools = {version = "0.23.2", path = "./crates/llmy-agent-tools", default-features = false}
+llmy-agent-derive = {version = "0.23.2", path = "./crates/llmy-agent-derive"}
+llmy-harness = {version = "0.23.2", path = "./crates/llmy-harness", default-features = false}
 
-llmy = {version = "0.23.1", path = "./crates/llmy", default-features = false}
-llm-cli = {version = "0.23.1", path = "./crates/llmy-cli"}
+llmy = {version = "0.23.2", path = "./crates/llmy", default-features = false}
+llm-cli = {version = "0.23.2", path = "./crates/llmy-cli"}
