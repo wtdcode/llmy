@@ -32,6 +32,10 @@ struct AgentMemoryRuntime {
 pub struct AgentConfig {
     pub sequential_tool_call: bool,
     pub allow_empty_tool_calls: bool,
+    /// How many times a step re-asks the model after a turn is discarded by a
+    /// tool rejection ([`LLMYError::ToolCallRejected`]) before giving up and
+    /// surfacing the rejection to the caller.
+    pub tool_reject_retries: u64,
 }
 
 impl Default for AgentConfig {
@@ -39,6 +43,7 @@ impl Default for AgentConfig {
         Self {
             sequential_tool_call: false,
             allow_empty_tool_calls: false,
+            tool_reject_retries: 32,
         }
     }
 }
@@ -316,115 +321,170 @@ impl Agent {
 
         let current_context = self.context.clone();
         let conversation = self.conversation_context();
-        let tools = (self.tools.len() != 0).then(|| self.tools.openai_objects());
         let cache_key = self.cache_key.as_deref();
         let settings = settings.unwrap_or_else(|| llm.default_settings.clone());
         let timeout = settings.timeout();
         let retry = settings.llm_retry;
-        // The context is protocol-neutral; the client builds the backend's
-        // native request from it directly.
-        let mut req = llm.build_conversation_request(&conversation, cache_key, &settings, tools)?;
-        if let LLMRequest::Chat(chat) = &mut req {
-            self.apply_cache_options(llm, chat);
-        }
-        let (mut resp, assistant_native) = llm
-            .complete_request_message_once_with_retry(req, debug_prefix, Some(timeout), Some(retry))
-            .await?;
 
-        if resp.choices.is_empty() {
-            return Err(LLMYError::EmptyChoice);
-        }
+        // A turn discarded by a tool rejection is retried from an unchanged
+        // context: same conversation, same request — nothing about the
+        // rejected attempt (assistant turn, tool outputs, rejection reason)
+        // leaks into what the model sees next.
+        let mut reject_attempts: u64 = 0;
+        let (step_result, extra_messages, assistant_message) = loop {
+            let tools = (self.tools.len() != 0).then(|| self.tools.openai_objects());
+            // The context is protocol-neutral; the client builds the backend's
+            // native request from it directly.
+            let mut req =
+                llm.build_conversation_request(&conversation, cache_key, &settings, tools)?;
+            if let LLMRequest::Chat(chat) = &mut req {
+                self.apply_cache_options(llm, chat);
+            }
+            let (mut resp, assistant_native) = llm
+                .complete_request_message_once_with_retry(
+                    req,
+                    debug_prefix,
+                    Some(timeout),
+                    Some(retry),
+                )
+                .await?;
 
-        if resp.choices.len() != 1 {
-            tracing::warn!(
-                "We expect exactly one choice per call but get {} choices",
-                resp.choices.len()
-            );
-        }
+            if resp.choices.is_empty() {
+                return Err(LLMYError::EmptyChoice);
+            }
 
-        let choice: ChatChoice = resp.choices.pop().unwrap();
+            if resp.choices.len() != 1 {
+                tracing::warn!(
+                    "We expect exactly one choice per call but get {} choices",
+                    resp.choices.len()
+                );
+            }
 
-        if let Some(refused) = choice.message.refusal.clone() {
-            return Err(LLMYError::Filtered(refused));
-        }
+            let choice: ChatChoice = resp.choices.pop().unwrap();
 
-        let reason = choice
-            .finish_reason
-            .ok_or_else(|| eyre!("no finish reason?!"))?;
+            if let Some(refused) = choice.message.refusal.clone() {
+                return Err(LLMYError::Filtered(refused));
+            }
 
-        let mut assistant_content = choice.message.content.clone();
-        let mut content_override: Option<String> = None;
+            let reason = choice
+                .finish_reason
+                .ok_or_else(|| eyre!("no finish reason?!"))?;
 
-        let (step_result, extra_messages): (StepResult, Vec<Message>) = match reason {
-            FinishReason::ToolCalls | FinishReason::FunctionCall => {
-                let calls = chat_choice_to_toolcalls(&choice);
-                let mut out = vec![];
-                if calls.is_empty() {
-                    if config.allow_empty_tool_calls {
-                        tracing::warn!("no tool calls but give tool call reason");
-                        let nudge = "Your previous tool call format is incorrect, please stick to json format and retry. Nothing is executed for your tool call request.".to_string();
-                        assistant_content = Some(nudge.clone());
-                        content_override = Some(nudge);
-                    } else {
-                        return Err(eyre!("no tool calls but give tool call reason").into());
-                    }
-                } else {
-                    let calls = self.invoke_tool_calls(calls, &config).await;
+            let mut assistant_content = choice.message.content.clone();
+            let mut content_override: Option<String> = None;
 
-                    for (call, tool_out) in calls.into_iter() {
-                        if let Some(tool_out) = tool_out {
-                            match tool_out {
-                                Ok(tool_out) => {
-                                    out.push(Message::from_chat_request(&tool_out));
-                                }
-                                Err(LLMYError::IncorrectToolCall(_, _, e)) => {
-                                    tracing::warn!(
-                                        "Incorrect tool call detected for {}, schema is {:?}, we will ask LLM to retry.",
-                                        call,
-                                        &e
-                                    );
-                                    out.push(Message::tool_result(
-                                        call.tool_id.clone(),
-                                        format!(
-                                            "Tool call to {} does not conform to schema {:?}",
-                                            call, e
-                                        ),
-                                    ));
-                                }
-                                Err(e) => return Err(e),
-                            }
+            match reason {
+                FinishReason::ToolCalls | FinishReason::FunctionCall => {
+                    let calls = chat_choice_to_toolcalls(&choice);
+                    let mut out = vec![];
+                    if calls.is_empty() {
+                        if config.allow_empty_tool_calls {
+                            tracing::warn!("no tool calls but give tool call reason");
+                            let nudge = "Your previous tool call format is incorrect, please stick to json format and retry. Nothing is executed for your tool call request.".to_string();
+                            assistant_content = Some(nudge.clone());
+                            content_override = Some(nudge);
                         } else {
-                            tracing::warn!("Tool call {} is not defined", call);
-                            out.push(Message::tool_result(
-                                call.tool_id.clone(),
-                                format!("The tool of {} is not defined", call),
-                            ));
+                            return Err(eyre!("no tool calls but give tool call reason").into());
+                        }
+                    } else {
+                        // Phase one: gate the whole batch before anything
+                        // runs, so a rejection here costs zero side effects.
+                        if let Err(rejected) = self.tools.validate_calls(&calls).await {
+                            reject_attempts += 1;
+                            tracing::warn!(
+                                "tool call rejected in validation ({}/{}), discarding the turn: {}",
+                                reject_attempts,
+                                config.tool_reject_retries,
+                                rejected
+                            );
+                            if reject_attempts > config.tool_reject_retries {
+                                return Err(rejected);
+                            }
+                            continue;
+                        }
+
+                        // Phase two: execute. A rejection surfacing here
+                        // means execution already started (side effects may
+                        // exist), so re-asking would make the model repeat
+                        // them — it degrades to a soft tool result instead;
+                        // only the validate phase may discard the turn.
+                        let calls = self.invoke_tool_calls(calls, &config).await;
+                        for (call, tool_out) in calls.into_iter() {
+                            if let Some(tool_out) = tool_out {
+                                match tool_out {
+                                    Ok(tool_out) => {
+                                        out.push(Message::from_chat_request(&tool_out));
+                                    }
+                                    Err(LLMYError::IncorrectToolCall(_, _, e)) => {
+                                        tracing::warn!(
+                                            "Incorrect tool call detected for {}, schema is {:?}, we will ask LLM to retry.",
+                                            call,
+                                            &e
+                                        );
+                                        out.push(Message::tool_result(
+                                            call.tool_id.clone(),
+                                            format!(
+                                                "Tool call to {} does not conform to schema {:?}",
+                                                call, e
+                                            ),
+                                        ));
+                                    }
+                                    Err(LLMYError::ToolCallRejected(_, reject_reason)) => {
+                                        tracing::warn!(
+                                            "Tool call {} rejected mid-run (reason: {}); returning a soft rejection result.",
+                                            call,
+                                            reject_reason
+                                        );
+                                        out.push(Message::tool_result(
+                                            call.tool_id.clone(),
+                                            format!(
+                                                "Tool call to {} was rejected by the tool.",
+                                                call
+                                            ),
+                                        ));
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            } else {
+                                tracing::warn!("Tool call {} is not defined", call);
+                                out.push(Message::tool_result(
+                                    call.tool_id.clone(),
+                                    format!("The tool of {} is not defined", call),
+                                ));
+                            }
                         }
                     }
+
+                    // The protocol-faithful assistant turn goes into the
+                    // context — typed parts (signed thinking, encrypted
+                    // reasoning, tool-call extras) included; only the
+                    // empty-tool-call retry nudge replaces it with synthetic
+                    // content.
+                    let assistant_message = match content_override {
+                        Some(content) => Message::assistant(content),
+                        None => assistant_native,
+                    };
+                    break (
+                        StepResult::Toolcalled(assistant_content.clone()),
+                        out,
+                        assistant_message,
+                    );
                 }
-
-                (StepResult::Toolcalled(assistant_content.clone()), out)
+                FinishReason::ContentFilter => {
+                    tracing::warn!("Our response is filtered?! {:?}", &resp);
+                    return Err(LLMYError::Filtered(
+                        choice.message.content.clone().unwrap_or_default(),
+                    ));
+                }
+                FinishReason::Stop => {
+                    break (
+                        StepResult::Stop(choice.message.content.clone().unwrap_or_default()),
+                        vec![],
+                        assistant_native,
+                    );
+                }
+                FinishReason::Length => return Err(LLMYError::OutputLength),
             }
-            FinishReason::ContentFilter => {
-                tracing::warn!("Our response is filtered?! {:?}", &resp);
-                return Err(LLMYError::Filtered(
-                    choice.message.content.clone().unwrap_or_default(),
-                ));
-            }
-            FinishReason::Stop => (
-                StepResult::Stop(choice.message.content.clone().unwrap_or_default()),
-                vec![],
-            ),
-            FinishReason::Length => return Err(LLMYError::OutputLength),
-        };
-
-        // The protocol-faithful assistant turn goes into the context — typed
-        // parts (signed thinking, encrypted reasoning, tool-call extras)
-        // included; only the empty-tool-call retry nudge replaces it with
-        // synthetic content.
-        let assistant_message = match content_override {
-            Some(content) => Message::assistant(content),
-            None => assistant_native,
         };
 
         self.checkpoints
@@ -718,6 +778,143 @@ mod tests {
         }
     }
 
+    /// A tool whose `validate` rejects a marker payload; `invoke` records an
+    /// event so tests can prove a rejection cost zero executions.
+    #[derive(Debug, Clone)]
+    struct PickyTool {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Tool for PickyTool {
+        type ARGUMENTS = String;
+        const NAME: &str = "picky_tool";
+        const DESCRIPTION: Option<&str> = Some("test tool");
+
+        async fn invoke(&self, _arguments: Self::ARGUMENTS) -> Result<String, LLMYError> {
+            self.events.lock().await.push("picky_ran".to_string());
+            Ok("ok".to_string())
+        }
+
+        async fn validate(&self, arguments: Self::ARGUMENTS) -> Result<(), String> {
+            if arguments == "bad" {
+                return Err("the payload is marked bad".to_string());
+            }
+            Ok(())
+        }
+    }
+
+    /// A tool that only discovers its rejection during execution.
+    #[derive(Debug, Clone)]
+    struct MidRunRejectTool;
+
+    impl Tool for MidRunRejectTool {
+        type ARGUMENTS = ();
+        const NAME: &str = "mid_run_reject_tool";
+        const DESCRIPTION: Option<&str> = Some("test tool");
+
+        async fn invoke(&self, _arguments: Self::ARGUMENTS) -> Result<String, LLMYError> {
+            Err(LLMYError::tool_call_rejected(
+                Self::NAME,
+                "null",
+                "refused during execution",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_validation_rejection_gates_the_whole_batch_before_any_execution() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolBox::new();
+        tools.add_tool(PickyTool {
+            events: events.clone(),
+        });
+        tools.add_tool(FastRecordingTool {
+            events: events.clone(),
+        });
+
+        let mut bad = tool_call("picky_tool", "id-1");
+        bad.tool_args = "\"bad\"".to_string();
+        let calls = vec![bad, tool_call("fast_recording_tool", "id-2")];
+
+        let rejected = tools.validate_calls(&calls).await.unwrap_err();
+        match rejected {
+            LLMYError::ToolCallRejected(call, reject_reason) => {
+                // Bound to the real wire call, reason preserved.
+                assert_eq!(call.tool_id, "id-1");
+                assert_eq!(call.tool_name, "picky_tool");
+                assert_eq!(reject_reason, "the payload is marked bad");
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        // Phase one ran no tool at all.
+        assert!(events.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn schema_mismatch_and_unknown_tools_are_not_rejections() {
+        let mut tools = ToolBox::new();
+        tools.add_tool(ZebraTool);
+
+        // Unparseable args keep their soft `IncorrectToolCall` path...
+        let mut garbled = tool_call("zebra_tool", "id-1");
+        garbled.tool_args = "not json at all".to_string();
+        // ...valid JSON of the wrong shape does too...
+        let mut wrong_shape = tool_call("zebra_tool", "id-2");
+        wrong_shape.tool_args = "123".to_string();
+        // ...and unknown tools keep their "not defined" tool_result path.
+        let unknown = tool_call("no_such_tool", "id-3");
+
+        tools
+            .validate_calls(&[garbled, wrong_shape, unknown])
+            .await
+            .expect("none of these is a rejection");
+    }
+
+    #[tokio::test]
+    async fn a_mid_run_rejection_is_soft_and_does_not_stop_the_batch() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolBox::new();
+        tools.add_tool(MidRunRejectTool);
+        tools.add_tool(FastRecordingTool {
+            events: events.clone(),
+        });
+        let config = AgentConfig {
+            sequential_tool_call: true,
+            allow_empty_tool_calls: false,
+            tool_reject_retries: 3,
+        };
+        let agent = Agent::new_with_config(
+            "base system prompt".to_string(),
+            tools,
+            Some("cache".to_string()),
+            config.clone(),
+        );
+
+        let results = agent
+            .invoke_tool_calls(
+                vec![
+                    tool_call("mid_run_reject_tool", "id-1"),
+                    tool_call("fast_recording_tool", "id-2"),
+                ],
+                &config,
+            )
+            .await;
+
+        // Execution already started, so the rejection is just one call's
+        // result; the rest of the batch still runs.
+        assert_eq!(results.len(), 2);
+        assert!(matches!(
+            results[0].1,
+            Some(Err(LLMYError::ToolCallRejected(..)))
+        ));
+        assert_eq!(events.lock().await.clone(), vec!["fast".to_string()]);
+    }
+
+    #[test]
+    fn tool_reject_retries_defaults_to_thirty_two() {
+        assert_eq!(AgentConfig::default().tool_reject_retries, 32);
+    }
+
     #[test]
     fn agent_config_defaults_to_parallel_tool_calls() {
         assert!(!AgentConfig::default().sequential_tool_call);
@@ -744,6 +941,7 @@ mod tests {
         let config = AgentConfig {
             sequential_tool_call: true,
             allow_empty_tool_calls: false,
+            tool_reject_retries: 3,
         };
         let agent = Agent::new_with_config(
             "base system prompt".to_string(),

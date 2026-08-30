@@ -99,8 +99,15 @@ pub enum LLMYError {
     Billing(BillingExhausted),
     #[error("incorrect tool call for tool {0} with args {1} given schema {2:?}")]
     IncorrectToolCall(String, String, schemars::Schema),
-    #[error("toolcall {0} has nested error: {1}")]
-    ToolCallError(GeneralToolCall, Box<LLMYError>),
+    /// A well-formed tool call that the tool itself refused: the arguments
+    /// parse, but their content fails the tool's own requirements. Raised
+    /// from `validate` (nothing has run yet), the agent loop discards the
+    /// whole model turn and asks again; raised from `invoke` (execution
+    /// started, side effects may exist), it degrades to a soft tool result
+    /// like an `IncorrectToolCall`. The reason is for logs only and is never
+    /// fed back to the model.
+    #[error("tool call rejected: {0}: {1}")]
+    ToolCallRejected(GeneralToolCall, String),
     #[error("response filtered: {0}")]
     Filtered(String),
     #[error("no choice is returned")]
@@ -132,6 +139,24 @@ impl From<OpenAIError> for LLMYError {
 }
 
 impl LLMYError {
+    /// A rejection raised from inside a tool's own code, where the wire
+    /// `tool_id` is not known; the agent loop rebinds the error to the real
+    /// call before logging or propagating it.
+    pub fn tool_call_rejected(
+        tool_name: impl Into<String>,
+        tool_args: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::ToolCallRejected(
+            GeneralToolCall {
+                tool_id: String::new(),
+                tool_name: tool_name.into(),
+                tool_args: tool_args.into(),
+            },
+            reason.into(),
+        )
+    }
+
     pub fn billing_exhaustion(&self) -> Option<BillingExhausted> {
         match self {
             Self::Billing(exhausted) => Some(exhausted.clone()),
@@ -152,7 +177,7 @@ impl LLMYError {
             Self::STDJSON(_) => "json",
             Self::Billing(_) => "billing",
             Self::IncorrectToolCall(..) => "incorrect_tool_call",
-            Self::ToolCallError(..) => "tool_call",
+            Self::ToolCallRejected(..) => "tool_call_rejected",
             Self::Filtered(_) => "filtered",
             Self::EmptyChoice => "empty_choice",
             Self::OutputLength => "output_length",

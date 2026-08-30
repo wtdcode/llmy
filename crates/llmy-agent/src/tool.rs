@@ -81,6 +81,25 @@ pub trait ToolDyn: DynClone + Debug + Send + Sync + std::any::Any {
             Arc::new(input_schema),
         )
     }
+    /// Phase-one gate the agent loop runs on every call of a turn before any
+    /// tool executes, on the same parsed arguments the execution path uses.
+    /// The arguments are assumed to conform to the tool's schema — schema
+    /// verdicts belong to the execution path (`IncorrectToolCall`), never to
+    /// validate. `Err(reason)` rejects the call: the
+    /// loop wraps it into [`LLMYError::ToolCallRejected`] bound to the wire
+    /// call, discards the whole model turn (no tool in the batch runs) and
+    /// asks again — the reason is logged, never fed back to the model.
+    ///
+    /// Contract: `validate` may be called any number of times, must return a
+    /// stable verdict for the same arguments, and must have no side effects.
+    /// The default accepts everything.
+    fn validate(
+        &self,
+        arguments: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        let _ = arguments;
+        Box::pin(async { Ok(()) })
+    }
     /// Invokes the tool with raw JSON-encoded `arguments`. The string is
     /// deserialized into the tool's `ARGUMENTS` type by the blanket impl on
     /// top of [`Tool`].
@@ -182,6 +201,28 @@ pub trait Tool: Send + Sync + DynClone + Debug {
         &self,
         arguments: Self::ARGUMENTS,
     ) -> impl Future<Output = Result<String, LLMYError>> + Send;
+
+    /// Phase-one gate on the same deserialized `arguments` [`Self::invoke`]
+    /// receives, run by the agent loop before any tool of the turn executes.
+    /// The arguments are already schema-checked — assume they conform; a
+    /// mismatch never reaches here (the execution path reports it as
+    /// [`LLMYError::IncorrectToolCall`]).
+    /// `Err(reason)` rejects the call: the loop wraps it into
+    /// [`LLMYError::ToolCallRejected`] bound to the wire call and discards
+    /// the whole model turn — nothing has run yet, so the rejection costs
+    /// zero side effects — then asks again; the reason is logged,
+    /// never fed back to the model.
+    ///
+    /// Contract: `validate` may be called any number of times, must return a
+    /// stable verdict for the same arguments, and must have no side effects.
+    /// The default accepts everything.
+    fn validate(
+        &self,
+        arguments: Self::ARGUMENTS,
+    ) -> impl Future<Output = Result<(), String>> + Send {
+        let _ = arguments;
+        async { Ok(()) }
+    }
 }
 
 impl<T: Tool + DynClone + 'static> ToolDyn for T {
@@ -213,6 +254,29 @@ impl<T: Tool + DynClone + 'static> ToolDyn for T {
             }
         })
     }
+
+    fn validate(
+        &self,
+        arguments: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            match serde_json::from_value::<T::ARGUMENTS>(arguments) {
+                Ok(args) => Tool::validate(self, args).await,
+                // The loop gates arguments on [`ToolDyn::schema`] before
+                // calling validate, so a failed parse here means schemars and
+                // serde disagree about an edge of the type. Theoretically
+                // unreachable; abstain and let the execution path report it.
+                Err(e) => {
+                    tracing::error!(
+                        "validate for {} got arguments its schema admits but its type refuses: {}",
+                        T::NAME,
+                        e
+                    );
+                    Ok(())
+                }
+            }
+        })
+    }
 }
 
 /// A name-keyed registry of tools available to an agent.
@@ -235,6 +299,41 @@ impl ToolBox {
     /// Returns the number of registered tools.
     pub fn len(&self) -> usize {
         self.tools.len()
+    }
+
+    /// Phase-one batch gate: runs every call's [`ToolDyn::validate`] before
+    /// anything executes, so a rejection costs zero side effects across the
+    /// whole turn. The first rejection comes back as
+    /// [`LLMYError::ToolCallRejected`] bound to its wire call. Unknown tools,
+    /// unparseable arguments and arguments that fail the tool's own
+    /// [`ToolDyn::schema`] are skipped, not rejected — schema problems keep
+    /// their existing `IncorrectToolCall` soft path in the execution phase —
+    /// so `validate` only ever runs on conforming arguments.
+    pub async fn validate_calls(&self, calls: &[GeneralToolCall]) -> Result<(), LLMYError> {
+        for call in calls {
+            let Some(tool) = self.tools.get(&call.tool_name) else {
+                continue;
+            };
+            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.tool_args) else {
+                continue;
+            };
+            // Gate on the schema the tool advertises to the model
+            // ([`ToolDyn::schema`]), upholding validate's assumption that its
+            // arguments conform. An uncompilable schema cannot gate anything
+            // and falls through to validate's own abstention.
+            let schema =
+                serde_json::to_value(tool.schema()).unwrap_or(serde_json::Value::Bool(true));
+            let conforms = jsonschema::validator_for(&schema)
+                .map(|validator| validator.is_valid(&arguments))
+                .unwrap_or(true);
+            if !conforms {
+                continue;
+            }
+            if let Err(reason) = tool.validate(arguments).await {
+                return Err(LLMYError::ToolCallRejected(call.clone(), reason));
+            }
+        }
+        Ok(())
     }
 
     /// Renders the registered tool names, optionally with their descriptions.
@@ -372,7 +471,7 @@ impl ToolBox {
 
         for call in calls {
             let tc: GeneralToolCall = call.clone();
-            tracing::info!("Calling {}", &tc);
+            tracing::debug!("Calling {}", &tc);
             out.push((tc, self.invoke(call.tool_name, call.tool_args).await));
         }
 

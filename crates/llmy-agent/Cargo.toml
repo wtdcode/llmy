@@ -21,6 +21,7 @@ rmcp = {workspace = true, features = ["server", "transport-io", "transport-strea
 llmy-agent-derive.workspace = true
 llmy-client.workspace = true
 llmy-types.workspace = true
+jsonschema = "0.52.1"
 
 [features]
 default = ["rustls"]
