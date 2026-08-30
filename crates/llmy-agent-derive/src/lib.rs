@@ -22,6 +22,7 @@ struct ToolArgs {
     arguments: Type,
     name: Option<LitStr>,
     invoke: Ident,
+    validate: Option<Ident>,
 }
 
 impl Parse for ToolArgs {
@@ -32,6 +33,7 @@ impl Parse for ToolArgs {
         let mut arguments = None;
         let mut name = None;
         let mut invoke = None;
+        let mut validate = None;
 
         for arg in args {
             let key = arg
@@ -63,6 +65,14 @@ impl Parse for ToolArgs {
                 "invoke" => {
                     assign_once(&mut invoke, parse_method_ident(&arg.value)?, "invoke", &arg)?;
                 }
+                "validate" => {
+                    assign_once(
+                        &mut validate,
+                        parse_method_ident(&arg.value)?,
+                        "validate",
+                        &arg,
+                    )?;
+                }
                 _ => {
                     return Err(Error::new_spanned(
                         &arg.path,
@@ -81,6 +91,7 @@ impl Parse for ToolArgs {
             invoke: invoke.ok_or_else(|| {
                 Error::new(Span::call_site(), "missing required `invoke` argument")
             })?,
+            validate,
         })
     }
 }
@@ -115,7 +126,7 @@ fn parse_method_ident(expr: &Expr) -> Result<Ident> {
 
     path.get_ident()
         .cloned()
-        .ok_or_else(|| Error::new_spanned(expr, "`invoke` must be a single method name"))
+        .ok_or_else(|| Error::new_spanned(expr, "expected a single method name"))
 }
 
 fn default_tool_name(ident: &Ident) -> LitStr {
@@ -133,6 +144,17 @@ fn expand_tool(args: ToolArgs, item_struct: ItemStruct) -> proc_macro2::TokenStr
     };
     let arguments = args.arguments;
     let invoke = args.invoke;
+    let validate = match args.validate {
+        Some(validate) => quote! {
+            fn validate(
+                &self,
+                arguments: Self::ARGUMENTS,
+            ) -> impl ::core::future::Future<Output = ::core::result::Result<(), ::std::string::String>> + Send {
+                self.#validate(arguments)
+            }
+        },
+        None => quote!(),
+    };
 
     quote! {
         #item_struct
@@ -148,6 +170,8 @@ fn expand_tool(args: ToolArgs, item_struct: ItemStruct) -> proc_macro2::TokenStr
             ) -> impl ::core::future::Future<Output = ::core::result::Result<::std::string::String, #error_path>> + Send {
                 self.#invoke(arguments)
             }
+
+            #validate
         }
     }
 }
@@ -233,6 +257,28 @@ mod tests {
         );
         assert_eq!(args.invoke.to_string(), "read_file");
         assert!(matches!(args.arguments, Type::Path(_)));
+    }
+
+    #[test]
+    fn parses_optional_validate_method() {
+        let args: ToolArgs = parse2(quote! {
+            arguments = ReadFileToolArgs,
+            invoke = read_file,
+            validate = check_file
+        })
+        .expect("tool args should parse");
+
+        assert_eq!(
+            args.validate.map(|ident| ident.to_string()).as_deref(),
+            Some("check_file")
+        );
+
+        let without: ToolArgs = parse2(quote! {
+            arguments = ReadFileToolArgs,
+            invoke = read_file
+        })
+        .expect("validate is optional");
+        assert!(without.validate.is_none());
     }
 
     #[test]

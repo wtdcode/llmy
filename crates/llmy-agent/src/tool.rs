@@ -179,8 +179,10 @@ dyn_clone::clone_trait_object!(ToolDyn);
 /// }
 /// ```
 ///
-/// The macro accepts `description`, `arguments`, `invoke` (required) and an
-/// optional `name` (defaulting to the struct identifier in `snake_case`).
+/// The macro accepts `description`, `arguments`, `invoke` (required), an
+/// optional `name` (defaulting to the struct identifier in `snake_case`),
+/// and an optional `validate` naming a method forwarded as
+/// [`Tool::validate`].
 pub trait Tool: Send + Sync + DynClone + Debug {
     /// The strongly-typed argument struct. It must implement
     /// [`serde::de::DeserializeOwned`] (to be parsed from the model's JSON

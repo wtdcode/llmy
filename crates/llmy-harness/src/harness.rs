@@ -910,6 +910,47 @@ mod tests {
         assert_eq!(events.lock().await.clone(), vec!["fast".to_string()]);
     }
 
+    /// A macro-declared tool wiring `validate` through the attribute.
+    #[derive(Debug, Clone)]
+    #[llmy_agent::tool(
+        description = "test tool",
+        arguments = String,
+        invoke = run_tool,
+        validate = check,
+    )]
+    struct MacroPickyTool;
+
+    impl MacroPickyTool {
+        async fn run_tool(&self, _arguments: String) -> Result<String, LLMYError> {
+            Ok("ok".to_string())
+        }
+
+        async fn check(&self, arguments: String) -> Result<(), String> {
+            if arguments == "bad" {
+                return Err("the payload is marked bad".to_string());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_macro_declared_validate_rejects_through_the_gate() {
+        let mut tools = ToolBox::new();
+        tools.add_tool(MacroPickyTool);
+
+        let mut bad = tool_call("macro_picky_tool", "id-1");
+        bad.tool_args = "\"bad\"".to_string();
+        let rejected = tools.validate_calls(&[bad]).await.unwrap_err();
+        assert!(matches!(rejected, LLMYError::ToolCallRejected(..)));
+
+        let mut fine = tool_call("macro_picky_tool", "id-2");
+        fine.tool_args = "\"fine\"".to_string();
+        tools
+            .validate_calls(&[fine])
+            .await
+            .expect("a conforming, acceptable call passes");
+    }
+
     #[test]
     fn tool_reject_retries_defaults_to_thirty_two() {
         assert_eq!(AgentConfig::default().tool_reject_retries, 32);
