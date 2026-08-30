@@ -220,6 +220,12 @@ pub type ResponsesTextConfig = WithOtherFields<ResponsesTextConfigRaw>;
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ResponsesRequestRaw {
     pub model: String,
+    /// The protocol's top-level system-instructions slot. The builders promote
+    /// the leading run of system messages here — leaving it unset invites
+    /// gateways to stuff their own persona into it — while a system message
+    /// later in the transcript stays in `input`, keeping its position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     pub input: Vec<ResponsesInputItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
@@ -429,8 +435,15 @@ impl ResponsesRequestRaw {
         Self::reject_unsupported(raw)?;
 
         let mut input: Vec<ResponsesInputItem> = Vec::new();
+        let mut instructions: Vec<String> = Vec::new();
         for msg in &raw.messages {
             match &msg.inner {
+                // The leading run of system messages takes the protocol's own
+                // `instructions` slot; one appearing after other messages
+                // stays in `input`, keeping its position.
+                ChatCompletionRequestMessageRaw::System(m) if input.is_empty() => {
+                    instructions.push(Self::system_text(&m.inner.content));
+                }
                 ChatCompletionRequestMessageRaw::System(m) => {
                     input.push(ResponsesInputItemRaw::message(
                         ResponsesRole::System,
@@ -480,6 +493,7 @@ impl ResponsesRequestRaw {
 
         Ok(WithOtherFields::new(Self {
             model: raw.model.clone(),
+            instructions: (!instructions.is_empty()).then(|| instructions.join("\n\n")),
             input,
             max_output_tokens,
             temperature: raw.temperature,
@@ -796,12 +810,30 @@ impl ResponsesRequestRaw {
         let tools = tools.map(Self::tools).transpose()?;
 
         let mut input = Vec::new();
+        let mut instructions: Vec<String> = Vec::new();
         for message in conversation {
+            // The leading run of system messages takes the protocol's own
+            // `instructions` slot (the anthropic protocol hoists system
+            // content the same way); anything later stays in `input`.
+            if input.is_empty()
+                && matches!(message.role, MessageRole::System)
+                && message
+                    .parts
+                    .iter()
+                    .all(|part| matches!(part, MessagePart::Text { .. }))
+            {
+                instructions.extend(message.parts.iter().filter_map(|part| match part {
+                    MessagePart::Text { text } => Some(text.clone()),
+                    _ => None,
+                }));
+                continue;
+            }
             Self::conversation_items(message, &mut input)?;
         }
 
         Ok(WithOtherFields::new(Self {
             model: model.to_string(),
+            instructions: (!instructions.is_empty()).then(|| instructions.join("\n\n")),
             input,
             max_output_tokens: settings.llm_max_completion_tokens,
             temperature: settings.llm_temperature,
@@ -982,7 +1014,12 @@ impl ResponsesRequestRaw {
 
     /// Prompt-text rendering of the whole input list.
     pub fn conversation_text(&self) -> String {
-        self.input.iter().map(Self::item_text).collect()
+        let mut out = String::new();
+        if let Some(instructions) = &self.instructions {
+            out.push_str(&format!("<SYSTEM>\n{instructions}\n</SYSTEM>\n"));
+        }
+        out.extend(self.input.iter().map(Self::item_text));
+        out
     }
 
     /// Tool definitions rendered for the folder debug view.
@@ -1029,7 +1066,12 @@ impl ResponsesRequestRaw {
     pub fn cache_shape(&self) -> CacheShape {
         CacheShape {
             tools_text: serde_json::to_string(&self.tools).unwrap_or_default(),
-            message_texts: self.input.iter().map(Self::item_text).collect(),
+            message_texts: self
+                .instructions
+                .iter()
+                .map(|instructions| format!("<SYSTEM>\n{instructions}\n</SYSTEM>\n"))
+                .chain(self.input.iter().map(Self::item_text))
+                .collect(),
             breakpoints: vec![],
             mode: PromptCacheMode::default(),
         }
@@ -1042,6 +1084,13 @@ impl ResponsesRequestRaw {
     /// `function_call_output` items become `tool` messages.
     pub fn into_chat_request(self) -> Result<RawExtensibleChatCompletionRequest, LLMYError> {
         let mut messages: Vec<ChatCompletionRequestMessage> = Vec::new();
+        if let Some(instructions) = self.instructions {
+            messages.push(WithOtherFields::new(
+                ChatCompletionRequestMessageRaw::System(
+                    ChatCompletionRequestSystemMessageRaw::new_text(instructions),
+                ),
+            ));
+        }
         for item in self.input {
             match item.into_inner() {
                 ResponsesInputItemRaw::Message { role, content } => {
@@ -1602,17 +1651,19 @@ mod tests {
         assert_eq!(value["tools"][0]["strict"], true);
         assert!(value["tools"][0].get("function").is_none());
 
+        // The leading system message takes the `instructions` slot instead
+        // of an input item.
+        assert!(value["instructions"].is_string(), "{value:?}");
         let input = value["input"].as_array().unwrap();
-        assert_eq!(input.len(), 5, "{input:?}");
-        assert_eq!(input[0]["role"], "system");
-        assert_eq!(input[1]["role"], "user");
-        assert_eq!(input[1]["content"], "look it up");
-        assert_eq!(input[2]["role"], "assistant");
-        assert_eq!(input[2]["content"], "on it");
-        assert_eq!(input[3]["type"], "function_call");
-        assert_eq!(input[3]["call_id"], "call_1");
-        assert_eq!(input[4]["type"], "function_call_output");
-        assert_eq!(input[4]["output"], "found it");
+        assert_eq!(input.len(), 4, "{input:?}");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "look it up");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[1]["content"], "on it");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "call_1");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["output"], "found it");
     }
 
     #[test]
@@ -1843,6 +1894,7 @@ mod tests {
     fn a_native_request_folds_back_into_chat_for_other_backends() {
         let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
             "model": "gpt-test",
+            "instructions": "stay factual",
             "input": [
                 {"type": "message", "role": "system", "content": "be terse"},
                 {"type": "message", "role": "user", "content": "look it up"},
@@ -1861,17 +1913,21 @@ mod tests {
         let chat = req.into_inner().into_chat_request().unwrap();
         let value = serde_json::to_value(&chat).unwrap();
         let messages = value["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert_eq!(messages.len(), 5, "{messages:?}");
+        // `instructions` folds back in front as a system message, ahead of
+        // the input's own system item.
         assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[0]["content"], "be terse");
-        assert_eq!(messages[1]["role"], "user");
-        assert_eq!(messages[1]["content"], "look it up");
+        assert_eq!(messages[0]["content"], "stay factual");
+        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(messages[1]["content"], "be terse");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "look it up");
         // The function_call item merges back into the assistant message.
-        assert_eq!(messages[2]["role"], "assistant");
-        assert_eq!(messages[2]["content"], "on it");
-        assert_eq!(messages[2]["tool_calls"][0]["id"], "call_1");
-        assert_eq!(messages[3]["role"], "tool");
-        assert_eq!(messages[3]["content"], "found");
+        assert_eq!(messages[3]["role"], "assistant");
+        assert_eq!(messages[3]["content"], "on it");
+        assert_eq!(messages[3]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[4]["role"], "tool");
+        assert_eq!(messages[4]["content"], "found");
 
         assert_eq!(value["max_completion_tokens"], 200);
         assert_eq!(value["reasoning_effort"], "low");

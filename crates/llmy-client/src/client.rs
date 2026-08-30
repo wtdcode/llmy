@@ -2538,9 +2538,10 @@ mod tests {
             .unwrap();
         assert_eq!(req.protocol(), "responses");
         let value = serde_json::to_value(&req).unwrap();
-        assert_eq!(value["input"][0]["role"], "system");
-        assert_eq!(value["input"][1]["role"], "user");
-        assert_eq!(value["input"][1]["content"], "user");
+        // The system prompt takes the protocol's own `instructions` slot.
+        assert_eq!(value["instructions"], "sys");
+        assert_eq!(value["input"][0]["role"], "user");
+        assert_eq!(value["input"][0]["content"], "user");
         assert_eq!(value["prompt_cache_key"], "key-9");
         assert_eq!(value["store"], false);
     }
