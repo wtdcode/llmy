@@ -942,6 +942,7 @@ mod tests {
         arguments = String,
         invoke = run_tool,
         validate = check,
+        strict = true,
     )]
     struct MacroPickyTool;
 
@@ -962,6 +963,10 @@ mod tests {
     async fn a_macro_declared_validate_rejects_through_the_gate() {
         let mut tools = ToolBox::new();
         tools.add_tool(MacroPickyTool);
+
+        // The macro-set `strict` flag reaches the advertised descriptor.
+        let descriptor = serde_json::to_value(&tools.openai_objects()).unwrap();
+        assert_eq!(descriptor[0]["function"]["strict"], true);
 
         let mut bad = tool_call("macro_picky_tool", "id-1");
         bad.tool_args = "\"bad\"".to_string();

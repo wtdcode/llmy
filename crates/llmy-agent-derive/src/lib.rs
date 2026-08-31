@@ -6,7 +6,8 @@ use quote::{ToTokens, format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{
-    Error, Expr, ExprLit, Ident, ItemStruct, Lit, LitStr, MetaNameValue, Result, Token, Type,
+    Error, Expr, ExprLit, Ident, ItemStruct, Lit, LitBool, LitStr, MetaNameValue, Result, Token,
+    Type,
 };
 
 #[proc_macro_attribute]
@@ -23,6 +24,7 @@ struct ToolArgs {
     name: Option<LitStr>,
     invoke: Ident,
     validate: Option<Ident>,
+    strict: Option<LitBool>,
 }
 
 impl Parse for ToolArgs {
@@ -34,6 +36,7 @@ impl Parse for ToolArgs {
         let mut name = None;
         let mut invoke = None;
         let mut validate = None;
+        let mut strict = None;
 
         for arg in args {
             let key = arg
@@ -73,6 +76,14 @@ impl Parse for ToolArgs {
                         &arg,
                     )?;
                 }
+                "strict" => {
+                    assign_once(
+                        &mut strict,
+                        parse_bool_literal(&arg.value, "strict")?,
+                        "strict",
+                        &arg,
+                    )?;
+                }
                 _ => {
                     return Err(Error::new_spanned(
                         &arg.path,
@@ -92,6 +103,7 @@ impl Parse for ToolArgs {
                 Error::new(Span::call_site(), "missing required `invoke` argument")
             })?,
             validate,
+            strict,
         })
     }
 }
@@ -121,6 +133,19 @@ fn parse_string_literal(expr: &Expr, key: &str) -> Result<LitStr> {
     }
 }
 
+fn parse_bool_literal(expr: &Expr, key: &str) -> Result<LitBool> {
+    match expr {
+        Expr::Lit(ExprLit {
+            lit: Lit::Bool(value),
+            ..
+        }) => Ok(value.clone()),
+        _ => Err(Error::new_spanned(
+            expr,
+            format!("`{key}` must be a bool literal"),
+        )),
+    }
+}
+
 fn parse_method_ident(expr: &Expr) -> Result<Ident> {
     let path: syn::Path = syn::parse2(expr.to_token_stream())?;
 
@@ -144,6 +169,10 @@ fn expand_tool(args: ToolArgs, item_struct: ItemStruct) -> proc_macro2::TokenStr
     };
     let arguments = args.arguments;
     let invoke = args.invoke;
+    let strict = match args.strict {
+        Some(strict) => quote!(const STRICT: bool = #strict;),
+        None => quote!(),
+    };
     let validate = match args.validate {
         Some(validate) => quote! {
             fn validate(
@@ -163,6 +192,7 @@ fn expand_tool(args: ToolArgs, item_struct: ItemStruct) -> proc_macro2::TokenStr
             type ARGUMENTS = #arguments;
             const NAME: &str = #name;
             const DESCRIPTION: Option<&str> = #description;
+            #strict
 
             fn invoke(
                 &self,
@@ -279,6 +309,28 @@ mod tests {
         })
         .expect("validate is optional");
         assert!(without.validate.is_none());
+        assert!(without.strict.is_none());
+    }
+
+    #[test]
+    fn parses_optional_strict_flag() {
+        let args: ToolArgs = parse2(quote! {
+            arguments = ReadFileToolArgs,
+            invoke = read_file,
+            strict = true
+        })
+        .expect("tool args should parse");
+        assert!(args.strict.expect("strict parsed").value());
+
+        let err = match parse2::<ToolArgs>(quote! {
+            arguments = ReadFileToolArgs,
+            invoke = read_file,
+            strict = "yes"
+        }) {
+            Ok(_) => panic!("a non-bool strict should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.to_string(), "`strict` must be a bool literal");
     }
 
     #[test]
