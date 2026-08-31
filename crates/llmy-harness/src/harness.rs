@@ -258,6 +258,29 @@ impl Agent {
         req.prompt_cache_options = Some(PromptCacheOptionsRaw::with_mode(mode));
     }
 
+    /// [`Agent::apply_cache_options`] for a native responses request — the
+    /// protocol took the same GPT-5.6 explicit-caching fields as chat.
+    fn apply_responses_cache_options(
+        &self,
+        llm: &LLM,
+        req: &mut llmy_client::responses::ResponsesRequest,
+    ) {
+        let Some(mode) = self.cache_mode else {
+            return;
+        };
+        let policy = llm.model.cache_policy();
+        if !policy.needs_breakpoints() {
+            tracing::warn!(
+                "dropping prompt cache mode {:?}: {} caches by {}, not by breakpoint",
+                mode,
+                llm.model,
+                policy
+            );
+            return;
+        }
+        req.prompt_cache_options = Some(PromptCacheOptionsRaw::with_mode(mode));
+    }
+
     pub fn render_context(&self) -> String {
         Message::many_to_chat(&self.conversation_context())
             .iter()
@@ -337,8 +360,10 @@ impl Agent {
             // native request from it directly.
             let mut req =
                 llm.build_conversation_request(&conversation, cache_key, &settings, tools)?;
-            if let LLMRequest::Chat(chat) = &mut req {
-                self.apply_cache_options(llm, chat);
+            match &mut req {
+                LLMRequest::Chat(chat) => self.apply_cache_options(llm, chat),
+                LLMRequest::Responses(resp) => self.apply_responses_cache_options(llm, resp),
+                LLMRequest::Anthropic(_) => {}
             }
             let (mut resp, assistant_native) = llm
                 .complete_request_message_once_with_retry(

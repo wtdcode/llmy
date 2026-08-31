@@ -28,7 +28,6 @@ use serde_json::Value;
 
 use crate::cache_key::CacheShape;
 use crate::message::{Message, MessagePart, MessageRole};
-use crate::req::PromptCacheMode;
 use crate::req::{
     ChatCompletionMessageToolCallRaw, ChatCompletionMessageToolCallsRaw,
     ChatCompletionRequestAssistantMessageContent,
@@ -52,6 +51,7 @@ use crate::req::{
     ChatCompletionToolRaw, FileObjectRaw, FunctionNameRaw, FunctionObjectRaw, ImageUrlRaw,
     ResponseFormatJsonSchemaRaw,
 };
+use crate::req::{PromptCacheBreakpoint, PromptCacheBreakpointRaw, PromptCacheOptions};
 use crate::resp::{
     ChatChoiceRaw, ChatCompletionMessageToolCalls, ChatCompletionResponseMessageRaw,
     CompletionTokensDetailsRaw, CompletionUsageRaw, CreateChatCompletionResponseRaw, FinishReason,
@@ -81,6 +81,10 @@ pub enum ResponsesRole {
 pub enum ResponsesInputPartRaw {
     InputText {
         text: String,
+        /// Explicit cache breakpoint on this block (GPT-5.6+ explicit
+        /// caching) — the same extension the chat protocol carries.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_cache_breakpoint: Option<PromptCacheBreakpoint>,
     },
     InputImage {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,6 +129,10 @@ pub enum ResponsesInputItemRaw {
     FunctionCallOutput {
         call_id: String,
         output: String,
+        /// Explicit cache breakpoint on this item (accepted by the API like
+        /// the chat tool-message breakpoint).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_cache_breakpoint: Option<PromptCacheBreakpoint>,
     },
     /// A replayed reasoning item; `encrypted_content` carries the model's own
     /// reasoning back on stateless requests.
@@ -223,7 +231,9 @@ pub struct ResponsesRequestRaw {
     /// The protocol's top-level system-instructions slot. The builders promote
     /// the leading run of system messages here — leaving it unset invites
     /// gateways to stuff their own persona into it — while a system message
-    /// later in the transcript stays in `input`, keeping its position.
+    /// later in the transcript stays in `input`, keeping its position. A
+    /// system message carrying a cache breakpoint also stays in `input`:
+    /// `instructions` cannot hold explicit breakpoints.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     pub input: Vec<ResponsesInputItem>,
@@ -252,6 +262,9 @@ pub struct ResponsesRequestRaw {
     pub text: Option<ResponsesTextConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    /// Request-wide explicit-caching policy (GPT-5.6+), same field as chat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<PromptCacheOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safety_identifier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -439,15 +452,18 @@ impl ResponsesRequestRaw {
         for msg in &raw.messages {
             match &msg.inner {
                 // The leading run of system messages takes the protocol's own
-                // `instructions` slot; one appearing after other messages
-                // stays in `input`, keeping its position.
-                ChatCompletionRequestMessageRaw::System(m) if input.is_empty() => {
+                // `instructions` slot; one appearing after other messages —
+                // or one carrying a cache breakpoint, which `instructions`
+                // cannot hold — stays in `input`.
+                ChatCompletionRequestMessageRaw::System(m)
+                    if input.is_empty() && !Self::system_has_breakpoint(&m.inner.content) =>
+                {
                     instructions.push(Self::system_text(&m.inner.content));
                 }
                 ChatCompletionRequestMessageRaw::System(m) => {
                     input.push(ResponsesInputItemRaw::message(
                         ResponsesRole::System,
-                        ResponsesInputContent::Text(Self::system_text(&m.inner.content)),
+                        Self::system_content(&m.inner.content),
                     ))
                 }
                 ChatCompletionRequestMessageRaw::Developer(m) => {
@@ -469,6 +485,11 @@ impl ResponsesRequestRaw {
                     ResponsesInputItemRaw::FunctionCallOutput {
                         call_id: m.inner.tool_call_id.clone(),
                         output: Self::tool_text(&m.inner.content),
+                        prompt_cache_breakpoint: m
+                            .inner
+                            .content
+                            .has_cache_breakpoint()
+                            .then(PromptCacheBreakpointRaw::explicit),
                     },
                 )),
                 ChatCompletionRequestMessageRaw::Function(_) => {
@@ -495,6 +516,7 @@ impl ResponsesRequestRaw {
             model: raw.model.clone(),
             instructions: (!instructions.is_empty()).then(|| instructions.join("\n\n")),
             input,
+            prompt_cache_options: raw.prompt_cache_options.clone(),
             max_output_tokens,
             temperature: raw.temperature,
             top_p: raw.top_p,
@@ -561,6 +583,42 @@ impl ResponsesRequestRaw {
         }
     }
 
+    fn system_has_breakpoint(content: &ChatCompletionRequestSystemMessageContent) -> bool {
+        match content {
+            ChatCompletionRequestSystemMessageContent::Text(_) => false,
+            ChatCompletionRequestSystemMessageContent::Array(parts) => {
+                parts.iter().any(|part| part.inner.has_cache_breakpoint())
+            }
+        }
+    }
+
+    /// System content for an `input` item: plain text when no part carries a
+    /// breakpoint, parts form (which can hold the markers) otherwise.
+    fn system_content(
+        content: &ChatCompletionRequestSystemMessageContent,
+    ) -> ResponsesInputContent {
+        match content {
+            ChatCompletionRequestSystemMessageContent::Array(parts)
+                if Self::system_has_breakpoint(content) =>
+            {
+                ResponsesInputContent::Parts(
+                    parts
+                        .iter()
+                        .map(|part| {
+                            let ChatCompletionRequestSystemMessageContentPartRaw::Text(text) =
+                                &part.inner;
+                            WithOtherFields::new(ResponsesInputPartRaw::InputText {
+                                text: text.inner.text.clone(),
+                                prompt_cache_breakpoint: text.inner.prompt_cache_breakpoint.clone(),
+                            })
+                        })
+                        .collect(),
+                )
+            }
+            content => ResponsesInputContent::Text(Self::system_text(content)),
+        }
+    }
+
     fn system_text(content: &ChatCompletionRequestSystemMessageContent) -> String {
         match content {
             ChatCompletionRequestSystemMessageContent::Text(text) => text.clone(),
@@ -619,6 +677,10 @@ impl ResponsesRequestRaw {
                             ChatCompletionRequestUserMessageContentPartRaw::Text(text) => {
                                 ResponsesInputPartRaw::InputText {
                                     text: text.inner.text.clone(),
+                                    prompt_cache_breakpoint: text
+                                        .inner
+                                        .prompt_cache_breakpoint
+                                        .clone(),
                                 }
                             }
                             ChatCompletionRequestUserMessageContentPartRaw::ImageUrl(image) => {
@@ -668,11 +730,19 @@ impl ResponsesRequestRaw {
                 .join("\n"),
             None => String::new(),
         };
+        let has_breakpoint = matches!(
+            &msg.content,
+            Some(ChatCompletionRequestAssistantMessageContent::Array(parts))
+                if parts.iter().any(|part| part.inner.has_cache_breakpoint())
+        );
         if !text.is_empty() {
             input.push(ResponsesInputItemRaw::message(
                 ResponsesRole::Assistant,
                 ResponsesInputContent::Text(text),
             ));
+            if has_breakpoint {
+                Self::mark_last_item_breakpoint(input);
+            }
         }
         for tool_call in msg.tool_calls.iter().flatten() {
             match &tool_call.inner {
@@ -817,6 +887,7 @@ impl ResponsesRequestRaw {
             // content the same way); anything later stays in `input`.
             if input.is_empty()
                 && matches!(message.role, MessageRole::System)
+                && !message.cache_breakpoint
                 && message
                     .parts
                     .iter()
@@ -829,12 +900,18 @@ impl ResponsesRequestRaw {
                 continue;
             }
             Self::conversation_items(message, &mut input)?;
+            // Message-level breakpoints land on the last block, mirroring the
+            // chat lowering and the anthropic `cache_control` placement.
+            if message.cache_breakpoint {
+                Self::mark_last_item_breakpoint(&mut input);
+            }
         }
 
         Ok(WithOtherFields::new(Self {
             model: model.to_string(),
             instructions: (!instructions.is_empty()).then(|| instructions.join("\n\n")),
             input,
+            prompt_cache_options: None,
             max_output_tokens: settings.llm_max_completion_tokens,
             temperature: settings.llm_temperature,
             top_p: settings.top_p,
@@ -878,7 +955,7 @@ impl ResponsesRequestRaw {
                 return;
             }
             let content = if let [part] = parts.as_slice()
-                && let ResponsesInputPartRaw::InputText { text } = &part.inner
+                && let ResponsesInputPartRaw::InputText { text, .. } = &part.inner
             {
                 ResponsesInputContent::Text(text.clone())
             } else {
@@ -892,6 +969,7 @@ impl ResponsesRequestRaw {
                 MessagePart::Text { text } => {
                     parts.push(WithOtherFields::new(ResponsesInputPartRaw::InputText {
                         text: text.clone(),
+                        prompt_cache_breakpoint: None,
                     }))
                 }
                 MessagePart::Image { url } => {
@@ -921,6 +999,7 @@ impl ResponsesRequestRaw {
                         ResponsesInputItemRaw::FunctionCallOutput {
                             call_id: id.clone(),
                             output: content.clone(),
+                            prompt_cache_breakpoint: None,
                         },
                     ));
                 }
@@ -975,7 +1054,9 @@ impl ResponsesRequestRaw {
                     ResponsesInputContent::Parts(parts) => {
                         for part in parts {
                             match &part.inner {
-                                ResponsesInputPartRaw::InputText { text } => body.push_str(text),
+                                ResponsesInputPartRaw::InputText { text, .. } => {
+                                    body.push_str(text)
+                                }
                                 ResponsesInputPartRaw::InputImage { image_url, .. } => body
                                     .push_str(&format!(
                                         "<img url=\"{}\"/>",
@@ -1002,7 +1083,9 @@ impl ResponsesRequestRaw {
                 "<toolcall name=\"{}\" id=\"{}\">\n{}\n</toolcall>\n",
                 name, call_id, arguments
             ),
-            ResponsesInputItemRaw::FunctionCallOutput { call_id, output } => format!(
+            ResponsesInputItemRaw::FunctionCallOutput {
+                call_id, output, ..
+            } => format!(
                 "<toolresult id=\"{}\">\n{}\n</toolresult>\n",
                 call_id, output
             ),
@@ -1013,6 +1096,70 @@ impl ResponsesRequestRaw {
     }
 
     /// Prompt-text rendering of the whole input list.
+    /// Mark an explicit cache breakpoint on the last input item, where the
+    /// protocol can hold one: the final `input_text` part of a message (plain
+    /// text content is upgraded to parts form to carry the marker), or a
+    /// `function_call_output` directly. Items with no slot (reasoning, raw
+    /// passthrough) are left untouched.
+    fn mark_last_item_breakpoint(input: &mut Vec<ResponsesInputItem>) {
+        let Some(item) = input.last_mut() else {
+            return;
+        };
+        match &mut item.inner {
+            ResponsesInputItemRaw::Message { content, .. } => {
+                match content {
+                    ResponsesInputContent::Text(text) => {
+                        *content = ResponsesInputContent::Parts(vec![WithOtherFields::new(
+                            ResponsesInputPartRaw::InputText {
+                                text: std::mem::take(text),
+                                prompt_cache_breakpoint: Some(PromptCacheBreakpointRaw::explicit()),
+                            },
+                        )]);
+                    }
+                    ResponsesInputContent::Parts(parts) => {
+                        if let Some(part) = parts.iter_mut().rev().find(|part| {
+                            matches!(part.inner, ResponsesInputPartRaw::InputText { .. })
+                        }) && let ResponsesInputPartRaw::InputText {
+                            prompt_cache_breakpoint,
+                            ..
+                        } = &mut part.inner
+                        {
+                            *prompt_cache_breakpoint = Some(PromptCacheBreakpointRaw::explicit());
+                        }
+                    }
+                }
+            }
+            ResponsesInputItemRaw::FunctionCallOutput {
+                prompt_cache_breakpoint,
+                ..
+            } => *prompt_cache_breakpoint = Some(PromptCacheBreakpointRaw::explicit()),
+            _ => {}
+        }
+    }
+
+    /// Whether any block of this input item carries an explicit breakpoint.
+    fn item_has_breakpoint(item: &ResponsesInputItem) -> bool {
+        match &item.inner {
+            ResponsesInputItemRaw::Message { content, .. } => match content {
+                ResponsesInputContent::Text(_) => false,
+                ResponsesInputContent::Parts(parts) => parts.iter().any(|part| {
+                    matches!(
+                        &part.inner,
+                        ResponsesInputPartRaw::InputText {
+                            prompt_cache_breakpoint: Some(_),
+                            ..
+                        }
+                    )
+                }),
+            },
+            ResponsesInputItemRaw::FunctionCallOutput {
+                prompt_cache_breakpoint,
+                ..
+            } => prompt_cache_breakpoint.is_some(),
+            _ => false,
+        }
+    }
+
     pub fn conversation_text(&self) -> String {
         let mut out = String::new();
         if let Some(instructions) = &self.instructions {
@@ -1060,10 +1207,11 @@ impl ResponsesRequestRaw {
     }
 
     /// The cache-relevant shape of this request — one block per input item —
-    /// so auto cache keys route native requests exactly like chat ones. The
-    /// protocol has no explicit breakpoints; the provider caches prefixes
-    /// transparently, which the default implicit mode models.
+    /// so auto cache keys route native requests exactly like chat ones.
+    /// Explicit breakpoints (GPT-5.6+) and the request's cache mode carry
+    /// over; indices account for the leading `instructions` block.
     pub fn cache_shape(&self) -> CacheShape {
+        let offset = usize::from(self.instructions.is_some());
         CacheShape {
             tools_text: serde_json::to_string(&self.tools).unwrap_or_default(),
             message_texts: self
@@ -1072,8 +1220,18 @@ impl ResponsesRequestRaw {
                 .map(|instructions| format!("<SYSTEM>\n{instructions}\n</SYSTEM>\n"))
                 .chain(self.input.iter().map(Self::item_text))
                 .collect(),
-            breakpoints: vec![],
-            mode: PromptCacheMode::default(),
+            breakpoints: self
+                .input
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| Self::item_has_breakpoint(item))
+                .map(|(index, _)| index + offset)
+                .collect(),
+            mode: self
+                .prompt_cache_options
+                .as_ref()
+                .and_then(|options| options.mode)
+                .unwrap_or_default(),
         }
     }
 
@@ -1132,10 +1290,18 @@ impl ResponsesRequestRaw {
                         ));
                     }
                 }
-                ResponsesInputItemRaw::FunctionCallOutput { call_id, output } => {
-                    messages.push(WithOtherFields::new(ChatCompletionRequestMessageRaw::Tool(
+                ResponsesInputItemRaw::FunctionCallOutput {
+                    call_id,
+                    output,
+                    prompt_cache_breakpoint,
+                } => {
+                    let mut tool = ChatCompletionRequestMessageRaw::Tool(
                         ChatCompletionRequestToolMessageRaw::new_text(output, call_id),
-                    )))
+                    );
+                    if prompt_cache_breakpoint.is_some() {
+                        tool.toggle_cache_breakpoint(true);
+                    }
+                    messages.push(WithOtherFields::new(tool))
                 }
                 // Reasoning replay has no chat slot; degrading it is the whole
                 // point of asking for the chat form, so it is dropped rather
@@ -1235,6 +1401,7 @@ impl ResponsesRequestRaw {
             parallel_tool_calls: self.parallel_tool_calls,
             safety_identifier: self.safety_identifier,
             prompt_cache_key: self.prompt_cache_key,
+            prompt_cache_options: self.prompt_cache_options,
             metadata: self.metadata,
             ..Default::default()
         };
@@ -1274,16 +1441,17 @@ impl ResponsesRequestRaw {
                             .into_iter()
                             .map(|part| {
                                 let mapped = match part.into_inner() {
-                                    ResponsesInputPartRaw::InputText { text } => {
-                                        ChatCompletionRequestUserMessageContentPartRaw::Text(
-                                            WithOtherFields::new(
-                                                ChatCompletionRequestMessageContentPartTextRaw {
-                                                    text,
-                                                    prompt_cache_breakpoint: None,
-                                                },
-                                            ),
-                                        )
-                                    }
+                                    ResponsesInputPartRaw::InputText {
+                                        text,
+                                        prompt_cache_breakpoint,
+                                    } => ChatCompletionRequestUserMessageContentPartRaw::Text(
+                                        WithOtherFields::new(
+                                            ChatCompletionRequestMessageContentPartTextRaw {
+                                                text,
+                                                prompt_cache_breakpoint,
+                                            },
+                                        ),
+                                    ),
                                     ResponsesInputPartRaw::InputImage { image_url, detail } => {
                                         let url = image_url.ok_or_else(|| {
                                             eyre!(
@@ -1352,7 +1520,7 @@ impl ResponsesRequestRaw {
             ResponsesInputContent::Parts(parts) => parts
                 .into_iter()
                 .map(|part| match part.into_inner() {
-                    ResponsesInputPartRaw::InputText { text } => Ok(text),
+                    ResponsesInputPartRaw::InputText { text, .. } => Ok(text),
                     other => Err(LLMYError::from(eyre!(
                         "a non-text part in a {} message has no chat-completion form: {:?}",
                         role,
@@ -1600,6 +1768,97 @@ mod tests {
         RawExtensibleChatCompletionRequest::new(raw)
     }
 
+    fn test_settings() -> LLMSettings {
+        LLMSettings {
+            llm_temperature: None,
+            llm_presence_penalty: None,
+            llm_prompt_timeout: 0,
+            llm_retry: 1,
+            llm_max_completion_tokens: None,
+            llm_tool_choice: None,
+            llm_stream: false,
+            top_p: None,
+            reasoning_effort: None,
+            auto_strip: false,
+            auto_cache_key: false,
+            cache_key_ttl: 0,
+            cache_key_rpm: 1,
+            billing_log_tokens: 0,
+            token_estimate_pct: 10.0,
+            allow_implicit_convert: false,
+            llm_concurrent: 0,
+        }
+    }
+
+    #[test]
+    fn explicit_cache_fields_map_onto_the_responses_wire() {
+        let req: RawExtensibleChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-test",
+            "prompt_cache_options": {"mode": "explicit"},
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "sys", "prompt_cache_breakpoint": {"mode": "explicit"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hi", "prompt_cache_breakpoint": {"mode": "explicit"}}
+                ]}
+            ]
+        }))
+        .unwrap();
+
+        let native = ResponsesRequestRaw::from_chat(&req).unwrap();
+        let value = serde_json::to_value(&native).unwrap();
+        assert_eq!(value["prompt_cache_options"]["mode"], "explicit");
+        // A breakpointed system message cannot live in `instructions` (the
+        // slot holds no markers), so it stays in `input`, in parts form.
+        assert!(value.get("instructions").is_none(), "{value:?}");
+        assert_eq!(value["input"][0]["role"], "system");
+        assert_eq!(
+            value["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(
+            value["input"][1]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+
+        // The user-part marker and the options survive the trip back to chat.
+        let chat = native.into_inner().into_chat_request().unwrap();
+        let chat_value = serde_json::to_value(&chat).unwrap();
+        assert_eq!(chat_value["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(
+            chat_value["messages"][1]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+    }
+
+    #[test]
+    fn a_message_breakpoint_lands_on_the_last_input_block() {
+        let mut user = Message::user("hello");
+        user.breakpoint();
+        let conversation = vec![Message::system("sys"), user];
+        let req = ResponsesRequestRaw::from_conversation(
+            "gpt-test",
+            &conversation,
+            None,
+            None,
+            &test_settings(),
+        )
+        .unwrap();
+        let value = serde_json::to_value(&req).unwrap();
+        // The breakpoint-free system prompt still takes `instructions`...
+        assert_eq!(value["instructions"], "sys");
+        // ...and the user message's breakpoint lands on its last text block.
+        assert_eq!(
+            value["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+
+        // The cache shape sees it, indexed past the instructions block.
+        let shape = req.cache_shape();
+        assert_eq!(shape.breakpoints, vec![1]);
+    }
+
     #[test]
     fn a_conversation_converts_to_responses_input_items() {
         let mut req = chat_request(vec![
@@ -1839,25 +2098,7 @@ mod tests {
             assistant,
             Message::tool_result("call_1", "found"),
         ];
-        let settings = LLMSettings {
-            llm_temperature: None,
-            llm_presence_penalty: None,
-            llm_prompt_timeout: 0,
-            llm_retry: 1,
-            llm_max_completion_tokens: None,
-            llm_tool_choice: None,
-            llm_stream: false,
-            top_p: None,
-            reasoning_effort: None,
-            auto_strip: false,
-            auto_cache_key: false,
-            cache_key_ttl: 0,
-            cache_key_rpm: 1,
-            billing_log_tokens: 0,
-            token_estimate_pct: 10.0,
-            allow_implicit_convert: false,
-            llm_concurrent: 0,
-        };
+        let settings = test_settings();
         let value = serde_json::to_value(
             ResponsesRequestRaw::from_conversation(
                 "gpt-test",
