@@ -1416,7 +1416,7 @@
     "maxInputTokens": 291808
   },
   "deepseek/deepseek-v4-flash": {
-    "encoding": "o200k_base",
+    "encoding": "deepseek",
     "tokens": {
       "contentMultiplier": 1,
       "baseOverhead": 3,
@@ -1441,7 +1441,7 @@
     "maxInputTokens": 655360
   },
   "deepseek/deepseek-v4-pro": {
-    "encoding": "o200k_base",
+    "encoding": "deepseek",
     "tokens": {
       "contentMultiplier": 1,
       "baseOverhead": 3,
@@ -1466,7 +1466,7 @@
     "maxInputTokens": 655360
   },
   "deepseek/deepseek-chat": {
-    "encoding": "o200k_base",
+    "encoding": "deepseek",
     "tokens": {
       "contentMultiplier": 1,
       "baseOverhead": 3,
@@ -1491,7 +1491,7 @@
     "maxInputTokens": 655360
   },
   "deepseek/deepseek-reasoner": {
-    "encoding": "o200k_base",
+    "encoding": "deepseek",
     "tokens": {
       "contentMultiplier": 1,
       "baseOverhead": 3,
@@ -1516,7 +1516,7 @@
     "maxInputTokens": 655360
   },
   "deepseek/deepseek-v3": {
-    "encoding": "o200k_base",
+    "encoding": "deepseek",
     "tokens": {
       "contentMultiplier": 1,
       "baseOverhead": 5,
@@ -1540,7 +1540,7 @@
     "maxInputTokens": 147456
   },
   "deepseek/deepseek-v3.1": {
-    "encoding": "o200k_base",
+    "encoding": "deepseek",
     "tokens": {
       "contentMultiplier": 1,
       "baseOverhead": 7,
@@ -1564,7 +1564,7 @@
     "maxInputTokens": 35840
   },
   "deepseek/deepseek-v3.1-terminus": {
-    "encoding": "o200k_base",
+    "encoding": "deepseek",
     "tokens": {
       "contentMultiplier": 1,
       "baseOverhead": 4,
@@ -1588,7 +1588,7 @@
     "maxInputTokens": 65536
   },
   "deepseek/deepseek-v3.2-exp": {
-    "encoding": "o200k_base",
+    "encoding": "deepseek",
     "tokens": {
       "contentMultiplier": 1,
       "baseOverhead": 3,
@@ -1612,7 +1612,7 @@
     "maxInputTokens": 0
   },
   "deepseek/deepseek-v3.2-exp-thinking": {
-    "encoding": "o200k_base",
+    "encoding": "deepseek",
     "tokens": {
       "contentMultiplier": 1,
       "baseOverhead": 3,
@@ -1975,7 +1975,7 @@
     "maxInputTokens": 95232
   },
   "zai/glm-4.5": {
-    "encoding": "cl100k_base",
+    "encoding": "glm",
     "tokens": {
       "contentMultiplier": 1,
       "baseOverhead": 9,
@@ -1999,7 +1999,7 @@
     "maxInputTokens": 0
   },
   "zai/glm-4.5-air": {
-    "encoding": "o200k_base",
+    "encoding": "glm",
     "tokens": {
       "contentMultiplier": 1,
       "baseOverhead": 4,
@@ -2023,7 +2023,7 @@
     "maxInputTokens": 32000
   },
   "zai/glm-4.5v": {
-    "encoding": "cl100k_base",
+    "encoding": "glm",
     "tokens": {
       "contentMultiplier": 1,
       "baseOverhead": 9,
@@ -2045,6 +2045,180 @@
       "output": 1.8e-06
     },
     "maxInputTokens": 0
+  },
+  "zai/glm-4.7": {
+    "encoding": "glm",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 9,
+      "perMessage": 3,
+      "toolsExist": 127,
+      "perTool": 28,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "GLM-4.7",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 6e-07,
+      "output": 2.2e-06,
+      "input_cache_read": 1.1e-07
+    },
+    "maxInputTokens": 202752
+  },
+  "zai/glm-4.7-flash": {
+    "encoding": "glm",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 9,
+      "perMessage": 3,
+      "toolsExist": 127,
+      "perTool": 28,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "GLM-4.7-Flash",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 0.0,
+      "output": 0.0
+    },
+    "maxInputTokens": 202752
+  },
+  "zai/glm-5": {
+    "encoding": "glm",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 9,
+      "perMessage": 3,
+      "toolsExist": 127,
+      "perTool": 28,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "GLM-5",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 1e-06,
+      "output": 3.2000000000000003e-06,
+      "input_cache_read": 2.0000000000000002e-07
+    },
+    "maxInputTokens": 204800
+  },
+  "zai/glm-5.1": {
+    "encoding": "glm",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 9,
+      "perMessage": 3,
+      "toolsExist": 127,
+      "perTool": 28,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "GLM-5.1",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 1.4e-06,
+      "output": 4.4e-06,
+      "input_cache_read": 2.6e-07
+    },
+    "maxInputTokens": 204800
+  },
+  "zai/glm-5.2": {
+    "encoding": "glm",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 9,
+      "perMessage": 3,
+      "toolsExist": 127,
+      "perTool": 28,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "GLM-5.2",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 1.4e-06,
+      "output": 4.4e-06,
+      "input_cache_read": 2.6e-07
+    },
+    "maxInputTokens": 1048576
+  },
+  "zai/glm-5.3": {
+    "encoding": "glm",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 9,
+      "perMessage": 3,
+      "toolsExist": 127,
+      "perTool": 28,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "GLM-5.3",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 1.4e-06,
+      "output": 4.4e-06,
+      "input_cache_read": 2.6e-07
+    },
+    "maxInputTokens": 1048576
+  },
+  "zai/glm-5.3-flash": {
+    "encoding": "glm",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 9,
+      "perMessage": 3,
+      "toolsExist": 127,
+      "perTool": 28,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "GLM-5.3-Flash",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 1.5e-07,
+      "output": 5e-07,
+      "input_cache_read": 3e-08
+    },
+    "maxInputTokens": 1048576
   },
   "meta/llama-3.3-70b": {
     "encoding": "claude",
@@ -2390,7 +2564,7 @@
     "maxInputTokens": 983040
   },
   "deepseek/deepseek-r1": {
-    "encoding": "o200k_base",
+    "encoding": "deepseek",
     "tokens": {
       "contentMultiplier": 1,
       "baseOverhead": 4,
@@ -2587,6 +2761,31 @@
       "output": 2.9e-06
     },
     "maxInputTokens": 0
+  },
+  "alibaba/qwen3.8-flash-next": {
+    "encoding": "qwen",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 7,
+      "perMessage": 4,
+      "toolsExist": 245,
+      "perTool": 56,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "Qwen3.8 Flash Next",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 1.5e-07,
+      "output": 4.6999999999999995e-07,
+      "input_cache_read": 3e-08
+    },
+    "maxInputTokens": 262144
   },
   "anthropic/claude-opus-4.5": {
     "encoding": "claude",

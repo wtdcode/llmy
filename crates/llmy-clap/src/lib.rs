@@ -1,6 +1,10 @@
 use clap::Args;
 use color_eyre::eyre::eyre;
-use llmy_client::{client::*, model::OpenAIModel, settings::*};
+use llmy_client::{
+    client::*,
+    model::{ModelPricing, OpenAIModel},
+    settings::*,
+};
 use llmy_types::error::LLMYError;
 
 /// Default OpenAI-compatible base URL, used when neither `--openai-url` nor
@@ -95,12 +99,45 @@ macro_rules! make_openai_args {
             pub biling_cap: Option<rust_decimal::Decimal>,
 
             /// Model id. The `OPENAI_API_MODEL` env is honoured as an alias
-            /// at resolve time; setting both envs is an error.
+            /// at resolve time; setting both envs is an error. Custom pricing
+            /// can come from the `name,input,output[,cache_read[,cache_write]]`
+            /// format or the friendlier `llm-*-price` flags, which win
+            /// field-by-field; `llm-max-context` sets the context window.
             #[arg(
                 long = concat!($long, "model"),
                 env = concat!($prefix, "LLM_MODEL"),
             )]
             pub model: Option<OpenAIModel>,
+
+            /// Input price per 1M tokens in USD (same unit as the
+            /// comma-separated model format).
+            #[arg(long = concat!($long, "llm-input-price"), env = concat!($prefix, "LLM_INPUT_PRICE"))]
+            pub llm_input_price: Option<rust_decimal::Decimal>,
+
+            /// Output price per 1M tokens in USD.
+            #[arg(long = concat!($long, "llm-output-price"), env = concat!($prefix, "LLM_OUTPUT_PRICE"))]
+            pub llm_output_price: Option<rust_decimal::Decimal>,
+
+            /// Cache-read input price per 1M tokens in USD; billing falls
+            /// back to the input price when unset.
+            #[arg(long = concat!($long, "llm-cache-read-price"), env = concat!($prefix, "LLM_CACHE_READ_PRICE"))]
+            pub llm_cache_read_price: Option<rust_decimal::Decimal>,
+
+            /// Cache-write input price per 1M tokens in USD.
+            #[arg(long = concat!($long, "llm-cache-write-price"), env = concat!($prefix, "LLM_CACHE_WRITE_PRICE"))]
+            pub llm_cache_write_price: Option<rust_decimal::Decimal>,
+
+            /// The model's context window in tokens (its max input); wins
+            /// over the registry value. Custom models default to 256k.
+            #[arg(long = concat!($long, "llm-max-context"), env = concat!($prefix, "LLM_MAX_CONTEXT"))]
+            pub llm_max_context: Option<u64>,
+
+            /// The model's max output tokens; wins over the registry value.
+            /// Custom models default to 256k. Backs the Anthropic protocol's
+            /// mandatory `max_tokens` when `llm-max-completion-tokens` is
+            /// unset.
+            #[arg(long = concat!($long, "llm-max-output"), env = concat!($prefix, "LLM_MAX_OUTPUT"))]
+            pub llm_max_output: Option<u64>,
 
             /// Send the canonical `owner/name` model id (e.g. `openai/gpt-5.4-mini`)
             /// in chat completion requests instead of the bare model name.
@@ -290,23 +327,83 @@ macro_rules! make_openai_args {
                     concat!($prefix, "LLM_MODEL"),
                     concat!($prefix, "OPENAI_API_MODEL"),
                 )?;
-                if let Some(model) = &self.model {
-                    return Ok(Some(model.clone()));
-                }
-                let Some(value) = alias else {
+                let model = if let Some(model) = &self.model {
+                    Some(model.clone())
+                } else if let Some(value) = alias {
+                    tracing::info!(concat!(
+                        "model read from ", $prefix, "OPENAI_API_MODEL; ",
+                        $prefix, "LLM_MODEL is the preferred name"
+                    ));
+                    Some(value.parse::<OpenAIModel>().map_err(|e| {
+                        LLMYError::Other(eyre!(
+                            concat!("invalid ", $prefix, "OPENAI_API_MODEL: {}"),
+                            e
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                let Some(mut model) = model else {
                     return Ok(None);
                 };
-                tracing::info!(concat!(
-                    "model read from ", $prefix, "OPENAI_API_MODEL; ",
-                    $prefix, "LLM_MODEL is the preferred name"
-                ));
-                let model = value.parse::<OpenAIModel>().map_err(|e| {
-                    LLMYError::Other(eyre!(
-                        concat!("invalid ", $prefix, "OPENAI_API_MODEL: {}"),
-                        e
-                    ))
-                })?;
+                self.apply_model_overrides(&mut model)?;
                 Ok(Some(model))
+            }
+
+            /// Fold the per-field model flags (prices, context window) into
+            /// the resolved model's config. They win over both the registry
+            /// and the comma-separated model format, field by field; prices
+            /// use the same per-1M-token USD unit as that format.
+            fn apply_model_overrides(&self, model: &mut OpenAIModel) -> Result<(), LLMYError> {
+                if let Some(max_context) = self.llm_max_context {
+                    model.config.max_input_tokens = max_context;
+                }
+                if let Some(max_output) = self.llm_max_output {
+                    model.config.max_tokens = max_output;
+                }
+                if self.llm_input_price.is_none()
+                    && self.llm_output_price.is_none()
+                    && self.llm_cache_read_price.is_none()
+                    && self.llm_cache_write_price.is_none()
+                {
+                    return Ok(());
+                }
+                // Stored pricing is per token; dividing by a power of ten
+                // just shifts the decimal scale, so the conversion is exact.
+                let per_million = rust_decimal::dec!(1_000_000);
+                let mut pricing = match model.config.pricing.clone() {
+                    Some(pricing) => pricing,
+                    None => {
+                        let (Some(input), Some(output)) =
+                            (self.llm_input_price, self.llm_output_price)
+                        else {
+                            return Err(LLMYError::Other(eyre!(concat!(
+                                "the model has no known pricing; give both --",
+                                $long, "llm-input-price and --", $long, "llm-output-price"
+                            ))));
+                        };
+                        ModelPricing {
+                            input: input / per_million,
+                            output: output / per_million,
+                            input_cache_read: None,
+                            input_cache_write: None,
+                        }
+                    }
+                };
+                if let Some(input) = self.llm_input_price {
+                    pricing.input = input / per_million;
+                }
+                if let Some(output) = self.llm_output_price {
+                    pricing.output = output / per_million;
+                }
+                if let Some(read) = self.llm_cache_read_price {
+                    pricing.input_cache_read = Some(read / per_million);
+                }
+                if let Some(write) = self.llm_cache_write_price {
+                    pricing.input_cache_write = Some(write / per_million);
+                }
+                model.config.pricing = Some(pricing);
+                Ok(())
             }
 
             /// The generic API key: the parsed `--openai-key`/`LLM_API_KEY`
@@ -649,6 +746,86 @@ mod tests {
                 .settings()
                 .allow_implicit_convert
         );
+    }
+
+    #[test]
+    fn model_flags_set_pricing_and_context_without_the_comma_format() {
+        let _env = env_lock();
+        let million = rust_decimal::dec!(1_000_000);
+
+        // The flags alone price a bare custom model and set its context.
+        let model = parse(&[
+            "--opt-opt-model",
+            "my-model",
+            "--opt-opt-llm-input-price",
+            "3",
+            "--opt-opt-llm-output-price",
+            "15",
+            "--opt-opt-llm-cache-read-price",
+            "0.3",
+            "--opt-opt-llm-max-context",
+            "200000",
+        ])
+        .resolved_model()
+        .unwrap()
+        .unwrap();
+        let pricing = model.config.pricing.as_ref().unwrap();
+        assert_eq!(pricing.input * million, rust_decimal::dec!(3));
+        assert_eq!(pricing.output * million, rust_decimal::dec!(15));
+        assert_eq!(
+            pricing.input_cache_read.unwrap() * million,
+            rust_decimal::dec!(0.3)
+        );
+        assert_eq!(model.config.max_input_tokens, 200_000);
+
+        // A flag overrides its field of the comma format, keeping the rest;
+        // `llm-max-context` rides along freely.
+        let model = parse(&[
+            "--opt-opt-model",
+            "my-model,1,2",
+            "--opt-opt-llm-output-price",
+            "20",
+            "--opt-opt-llm-max-context",
+            "1000",
+        ])
+        .resolved_model()
+        .unwrap()
+        .unwrap();
+        let pricing = model.config.pricing.as_ref().unwrap();
+        assert_eq!(pricing.input * million, rust_decimal::dec!(1));
+        assert_eq!(pricing.output * million, rust_decimal::dec!(20));
+        assert_eq!(model.config.max_input_tokens, 1000);
+
+        // Custom models default to 256k on both bounds; `llm-max-output`
+        // overrides its side.
+        let model = parse(&["--opt-opt-model", "my-model,1,2"])
+            .resolved_model()
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.config.max_input_tokens, 262_144);
+        assert_eq!(model.config.max_tokens, 262_144);
+        let model = parse(&[
+            "--opt-opt-model",
+            "my-model,1,2",
+            "--opt-opt-llm-max-output",
+            "32768",
+        ])
+        .resolved_model()
+        .unwrap()
+        .unwrap();
+        assert_eq!(model.config.max_tokens, 32_768);
+
+        // A lone price on an unpriced model is refused, not half-applied.
+        let err = parse(&[
+            "--opt-opt-model",
+            "my-model",
+            "--opt-opt-llm-input-price",
+            "3",
+        ])
+        .resolved_model()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("llm-output-price"), "{err}");
     }
 
     #[test]

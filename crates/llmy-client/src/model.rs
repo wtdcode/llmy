@@ -183,7 +183,7 @@ impl FromStr for OpenAIModel {
         }
 
         // Unknown model, zero pricing
-        tracing::info!("No valid model detected for {}, assume not billed", s);
+        tracing::info!("{} is not in the model registry", s);
         Ok(custom_model(s, None))
     }
 }
@@ -201,8 +201,11 @@ fn custom_model(s: &str, pricing: Option<ModelPricing>) -> OpenAIModel {
             encoding: "o200k_base".to_string(),
             tokens: ModelTokens::default(),
             name: model_name,
-            max_input_tokens: 0,
-            max_tokens: 0,
+            // An unknown model still deserves sane bounds; 256k for both
+            // context and output matches typical frontier ceilings, and the
+            // `llm-max-context` / `llm-max-output` flags override it.
+            max_input_tokens: 262_144,
+            max_tokens: 262_144,
             pricing,
             // Unknown model: assume the conservative, do-nothing-required policy.
             cache_policy: CachePolicy::default(),
@@ -250,6 +253,25 @@ mod tests {
     }
 
     #[test]
+    fn the_glm_and_qwen_flash_families_are_registered() {
+        let model = OpenAIModel::from_str("glm-5.3").unwrap();
+        assert_eq!(model.model_id_str(), "zai/glm-5.3");
+        assert_eq!(model.config.max_input_tokens, 1_048_576);
+        assert_eq!(model.config.max_tokens, 131_072);
+
+        let model = OpenAIModel::from_str("GLM-5.3-Flash").unwrap();
+        assert_eq!(model.model_id_str(), "zai/glm-5.3-flash");
+
+        let model = OpenAIModel::from_str("glm-4.7").unwrap();
+        assert_eq!(model.model_id_str(), "zai/glm-4.7");
+
+        let model = OpenAIModel::from_str("qwen3.8-flash-next").unwrap();
+        assert_eq!(model.model_id_str(), "alibaba/qwen3.8-flash-next");
+        assert_eq!(model.config.max_input_tokens, 262_144);
+        assert_eq!(model.config.max_tokens, 65_536);
+    }
+
+    #[test]
     fn custom_pricing_still_accepts_unknown_models() {
         let model = OpenAIModel::from_str("custom-model,2,4").unwrap();
         let pricing = model.pricing();
@@ -258,8 +280,8 @@ mod tests {
         assert!(matches!(model.model_id(), ModelId::Custom(_)));
         assert_eq!(model.owner(), None);
         assert_eq!(model.model_name(), "custom-model");
-        assert_eq!(model.config.max_input_tokens, 0);
-        assert_eq!(model.config.max_tokens, 0);
+        assert_eq!(model.config.max_input_tokens, 262_144);
+        assert_eq!(model.config.max_tokens, 262_144);
         assert_eq!(pricing.input, rust_decimal::dec!(0.000002));
         assert_eq!(pricing.output, rust_decimal::dec!(0.000004));
     }

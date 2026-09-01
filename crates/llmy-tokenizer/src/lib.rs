@@ -10,6 +10,15 @@ mod generated_models {
 mod generated_claude {
     include!(concat!(env!("OUT_DIR"), "/claude_generated.rs"));
 }
+mod generated_deepseek {
+    include!(concat!(env!("OUT_DIR"), "/deepseek_generated.rs"));
+}
+mod generated_qwen {
+    include!(concat!(env!("OUT_DIR"), "/qwen_generated.rs"));
+}
+mod generated_glm {
+    include!(concat!(env!("OUT_DIR"), "/glm_generated.rs"));
+}
 
 pub use generated_models::ModelId;
 
@@ -23,6 +32,9 @@ pub enum Encoding {
     O200kBase,
     P50kBase,
     Claude,
+    DeepSeek,
+    Qwen,
+    Glm,
 }
 
 impl Encoding {
@@ -32,6 +44,9 @@ impl Encoding {
             "o200k_base" => Some(Self::O200kBase),
             "p50k_base" => Some(Self::P50kBase),
             "claude" => Some(Self::Claude),
+            "deepseek" => Some(Self::DeepSeek),
+            "qwen" => Some(Self::Qwen),
+            "glm" => Some(Self::Glm),
             _ => None,
         }
     }
@@ -42,6 +57,9 @@ impl Encoding {
             Self::O200kBase => "o200k_base",
             Self::P50kBase => "p50k_base",
             Self::Claude => "claude",
+            Self::DeepSeek => "deepseek",
+            Self::Qwen => "qwen",
+            Self::Glm => "glm",
         }
     }
 }
@@ -204,15 +222,18 @@ pub fn encoding_for_model(model_id: &str) -> Option<Encoding> {
 }
 
 // ---------------------------------------------------------------------------
-// Claude BPE (built from pre-decoded binary data)
+// Embedded BPEs (built from pre-decoded binary data)
 // ---------------------------------------------------------------------------
 
-fn build_claude_bpe() -> CoreBPE {
-    let data = generated_claude::CLAUDE_BPE_DATA;
-
+fn build_embedded_bpe(
+    data: &[u8],
+    token_count: u32,
+    special_tokens: &[(&str, u32)],
+    pat_str: &str,
+) -> CoreBPE {
     let encoder = {
         let mut pos = 0;
-        let mut entries = Vec::with_capacity(generated_claude::CLAUDE_TOKEN_COUNT as usize);
+        let mut entries = Vec::with_capacity(token_count as usize);
         while pos < data.len() {
             let rank = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
             pos += 4;
@@ -224,12 +245,12 @@ fn build_claude_bpe() -> CoreBPE {
         entries.into_iter().collect()
     };
 
-    let special = generated_claude::CLAUDE_SPECIAL_TOKENS
+    let special = special_tokens
         .iter()
         .map(|&(k, v)| (k.to_string(), v))
         .collect();
 
-    CoreBPE::new(encoder, special, generated_claude::CLAUDE_PAT_STR).expect("build Claude BPE")
+    CoreBPE::new(encoder, special, pat_str).expect("build embedded BPE")
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +258,9 @@ fn build_claude_bpe() -> CoreBPE {
 // ---------------------------------------------------------------------------
 
 static CLAUDE_BPE: OnceLock<CoreBPE> = OnceLock::new();
+static DEEPSEEK_BPE: OnceLock<CoreBPE> = OnceLock::new();
+static QWEN_BPE: OnceLock<CoreBPE> = OnceLock::new();
+static GLM_BPE: OnceLock<CoreBPE> = OnceLock::new();
 static CL100K_BPE: OnceLock<CoreBPE> = OnceLock::new();
 static O200K_BPE: OnceLock<CoreBPE> = OnceLock::new();
 static P50K_BPE: OnceLock<CoreBPE> = OnceLock::new();
@@ -252,7 +276,38 @@ pub fn get_bpe(encoding: Encoding) -> &'static CoreBPE {
         Encoding::P50kBase => {
             P50K_BPE.get_or_init(|| tiktoken_rs::p50k_base().expect("init p50k_base"))
         }
-        Encoding::Claude => CLAUDE_BPE.get_or_init(build_claude_bpe),
+        Encoding::Claude => CLAUDE_BPE.get_or_init(|| {
+            build_embedded_bpe(
+                generated_claude::CLAUDE_BPE_DATA,
+                generated_claude::CLAUDE_TOKEN_COUNT,
+                generated_claude::CLAUDE_SPECIAL_TOKENS,
+                generated_claude::CLAUDE_PAT_STR,
+            )
+        }),
+        Encoding::DeepSeek => DEEPSEEK_BPE.get_or_init(|| {
+            build_embedded_bpe(
+                generated_deepseek::DEEPSEEK_BPE_DATA,
+                generated_deepseek::DEEPSEEK_TOKEN_COUNT,
+                generated_deepseek::DEEPSEEK_SPECIAL_TOKENS,
+                generated_deepseek::DEEPSEEK_PAT_STR,
+            )
+        }),
+        Encoding::Qwen => QWEN_BPE.get_or_init(|| {
+            build_embedded_bpe(
+                generated_qwen::QWEN_BPE_DATA,
+                generated_qwen::QWEN_TOKEN_COUNT,
+                generated_qwen::QWEN_SPECIAL_TOKENS,
+                generated_qwen::QWEN_PAT_STR,
+            )
+        }),
+        Encoding::Glm => GLM_BPE.get_or_init(|| {
+            build_embedded_bpe(
+                generated_glm::GLM_BPE_DATA,
+                generated_glm::GLM_TOKEN_COUNT,
+                generated_glm::GLM_SPECIAL_TOKENS,
+                generated_glm::GLM_PAT_STR,
+            )
+        }),
     }
 }
 
@@ -313,6 +368,34 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_and_qwen_match_the_reference_tokenizer() {
+        // Golden counts computed with the upstream HF `tokenizers` runtime on
+        // the published tokenizer.json files (DeepSeek-V4-Flash and
+        // Qwen3.8-Flash-Next).
+        let samples = [
+            "hello world",
+            "The quick brown fox jumps over the lazy dog.",
+            "你好，世界！今天天气怎么样？",
+            "fn main() { println!(\"{}\", 42); }",
+            "  indented\n\nmulti-line   text with   spaces\n",
+        ];
+        let deepseek = [2usize, 10, 8, 12, 12];
+        let qwen = [2usize, 10, 8, 11, 12];
+        let glm = [2usize, 10, 8, 10, 12];
+        for (s, want) in samples.iter().zip(deepseek) {
+            assert_eq!(encode(s, Encoding::DeepSeek).len(), want, "{s:?}");
+        }
+        for (s, want) in samples.iter().zip(qwen) {
+            assert_eq!(encode(s, Encoding::Qwen).len(), want, "{s:?}");
+        }
+        // The GLM vocab is GLM-5.3's; earlier zai generations share its base
+        // (151k of the 154k entries), so it stands in for them too.
+        for (s, want) in samples.iter().zip(glm) {
+            assert_eq!(encode(s, Encoding::Glm).len(), want, "{s:?}");
+        }
+    }
+
+    #[test]
     fn test_model_lookup() {
         assert_eq!(
             encoding_for_model("openai/gpt-4o"),
@@ -361,7 +444,7 @@ mod tests {
     fn test_deepseek_v4_model_config() {
         let model = get_model("deepseek/deepseek-v4-flash").expect("known model");
 
-        assert_eq!(model.encoding(), Some(Encoding::O200kBase));
+        assert_eq!(model.encoding(), Some(Encoding::DeepSeek));
         assert_eq!(model.max_input_tokens, 655360);
         assert_eq!(model.max_tokens, 393216);
         assert_eq!(

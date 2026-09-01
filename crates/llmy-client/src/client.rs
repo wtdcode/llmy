@@ -917,9 +917,8 @@ impl LLMInner {
 
     /// The output-token bound for protocols that demand one (the Anthropic
     /// protocol's mandatory `max_tokens`) when `llm_max_completion_tokens` is
-    /// unset: the model's configured max, or 8192 when the config doesn't say
-    /// (custom `name,input,output` models leave it at zero — the wire rejects
-    /// `max_tokens: 0`).
+    /// unset: the model's configured max, or 8192 when a hand-rolled config
+    /// still leaves it at zero — the wire rejects `max_tokens: 0`.
     fn default_max_output_tokens(&self) -> u32 {
         match self.model.config.max_tokens {
             0 => 8192,
