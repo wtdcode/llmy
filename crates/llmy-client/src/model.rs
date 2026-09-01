@@ -267,7 +267,7 @@ mod tests {
 
         let model = OpenAIModel::from_str("qwen3.8-flash-next").unwrap();
         assert_eq!(model.model_id_str(), "alibaba/qwen3.8-flash-next");
-        assert_eq!(model.config.max_input_tokens, 262_144);
+        assert_eq!(model.config.max_input_tokens, 1_000_000);
         assert_eq!(model.config.max_tokens, 65_536);
     }
 
