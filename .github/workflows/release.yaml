@@ -1,0 +1,103 @@
+name: Release 🚀 Binaries
+
+# Static binaries for every tag: Linux (musl, x86_64 native + aarch64
+# cross-compiled on x86 runners), Windows (static CRT, x86_64 native +
+# aarch64 cross-compiled on x86 runners), macOS (arm64 native + x86_64
+# cross-compiled on the arm runner).
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'test-release-*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            ext: .exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: '🛠️ Set up Rust'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: '🔗 Set up musl cross toolchain'
+        if: runner.os == 'Linux'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: '⚡ Rust cache'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: '🚧 Build (static CRT)'
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release -p llmy-cli --target ${{ matrix.target }}
+
+      - name: '🚧 Build'
+        if: runner.os != 'Windows'
+        run: cargo build --release -p llmy-cli --target ${{ matrix.target }}
+
+      - name: '📦 Stage artifact'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/llmy${{ matrix.ext }}" \
+             "dist/llmy-${{ matrix.target }}${{ matrix.ext }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llmy-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: '🔍 List artifacts'
+        run: ls -la dist
+
+      - name: '🚀 Create release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
