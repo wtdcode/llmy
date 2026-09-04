@@ -22,7 +22,9 @@ llmy-clap.workspace = true
 llmy-agent.workspace = true
 rmcp = {workspace = true, features = ["server"]}
 llmy-agent-tools.workspace = true
+llmy-codegraph.workspace = true
 llmy-harness.workspace = true
+llmy-harness-app.workspace = true
 llmy-client.workspace = true
 llmy-tokenizer.workspace = true
 rust_decimal = { workspace = true, features = ["macros"] }
@@ -54,6 +56,7 @@ rustls = [
     "llmy-agent/rustls",
     "llmy-agent-tools/rustls",
     "llmy-harness/rustls",
+    "llmy-harness-app/rustls",
 ]
 native-tls = [
     "async-openai/native-tls",
@@ -62,6 +65,7 @@ native-tls = [
     "llmy-agent/native-tls",
     "llmy-agent-tools/native-tls",
     "llmy-harness/native-tls",
+    "llmy-harness-app/native-tls",
 ]
 native-tls-vendored = [
     "async-openai/native-tls-vendored",
@@ -70,6 +74,7 @@ native-tls-vendored = [
     "llmy-agent/native-tls-vendored",
     "llmy-agent-tools/native-tls-vendored",
     "llmy-harness/native-tls-vendored",
+    "llmy-harness-app/native-tls-vendored",
 ]
 
 # Off by default. `embed` / `memory-embed-search` pull in `fastembed` +

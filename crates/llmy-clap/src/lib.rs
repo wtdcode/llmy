@@ -1,6 +1,7 @@
 use clap::Args;
 use color_eyre::eyre::eyre;
 use llmy_client::{
+    app::{AppIdentity, AppIdentityPreset},
     client::*,
     model::{ModelPricing, OpenAIModel},
     settings::*,
@@ -108,6 +109,23 @@ macro_rules! make_openai_args {
                 env = concat!($prefix, "LLM_MODEL"),
             )]
             pub model: Option<OpenAIModel>,
+
+            /// Announce a known application on every request (User-Agent
+            /// plus that app's marker headers). Values: llmy, claude, codex.
+            #[arg(
+                long = concat!($long, "llm-app"),
+                env = concat!($prefix, "LLM_APP"),
+                conflicts_with = "llm_app_override",
+            )]
+            pub llm_app: Option<AppIdentityPreset>,
+
+            /// Announce an arbitrary User-Agent instead of a preset (no
+            /// extra app headers). Mutually exclusive with `llm-app`.
+            #[arg(
+                long = concat!($long, "llm-app-override"),
+                env = concat!($prefix, "LLM_APP_OVERRIDE"),
+            )]
+            pub llm_app_override: Option<String>,
 
             /// Input price per 1M tokens in USD (same unit as the
             /// comma-separated model format).
@@ -298,6 +316,7 @@ macro_rules! make_openai_args {
                     billing_log_tokens: self.billing_log_tokens,
                     token_estimate_pct: self.token_estimate_pct,
                     allow_implicit_convert: self.allow_implicit_convert,
+                    llm_app: self.resolved_app_identity(),
                 }
             }
 
@@ -622,6 +641,16 @@ macro_rules! make_openai_args {
                 }
                 let url = openai_url.as_deref().unwrap_or(DEFAULT_OPENAI_URL);
                 Ok(SupportedConfig::new(url, key.as_str()))
+            }
+
+            /// The application identity to announce, if any. The raw
+            /// override wins over the preset (clap already rejects setting
+            /// both).
+            pub fn resolved_app_identity(&self) -> Option<AppIdentity> {
+                if let Some(user_agent) = &self.llm_app_override {
+                    return Some(AppIdentity::custom(user_agent));
+                }
+                self.llm_app.map(AppIdentity::preset)
             }
 
             async fn llm_new_inner(&self, model: OpenAIModel) -> Result<LLM, LLMYError> {
@@ -954,5 +983,33 @@ mod tests {
                 .as_deref(),
             Some("k1")
         );
+    }
+
+    #[test]
+    fn app_identity_flags_resolve_presets_and_overrides() {
+        let setup = parse(&["--opt-opt-llm-app", "claude"]);
+        let identity = setup.resolved_app_identity().expect("preset identity");
+        assert!(identity.user_agent.starts_with("claude-cli/"));
+        assert_eq!(setup.settings().llm_app, Some(identity));
+
+        let setup = parse(&["--opt-opt-llm-app-override", "my-agent/9.9"]);
+        let identity = setup.resolved_app_identity().expect("override identity");
+        assert_eq!(identity.user_agent, "my-agent/9.9");
+        assert!(identity.headers.is_empty());
+
+        assert!(parse(&[]).resolved_app_identity().is_none());
+        assert!(parse(&[]).settings().llm_app.is_none());
+    }
+
+    #[test]
+    fn app_preset_and_override_conflict() {
+        let result = TestCli::try_parse_from([
+            "prog",
+            "--opt-opt-llm-app",
+            "codex",
+            "--opt-opt-llm-app-override",
+            "x/1",
+        ]);
+        assert!(result.is_err());
     }
 }

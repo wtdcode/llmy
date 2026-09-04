@@ -13,6 +13,8 @@ llmy-clap.workspace = true
 llmy-client.workspace = true
 llmy-agent.workspace = true
 llmy-harness.workspace = true
+llmy-harness-app.workspace = true
+llmy-codegraph.workspace = true
 llmy-agent-tools.workspace = true
 llmy-agent-derive.workspace = true
 llmy-types.workspace = true
@@ -39,6 +41,7 @@ rustls = [
     "llmy-agent/rustls",
     "llmy-agent-tools/rustls",
     "llmy-harness/rustls",
+    "llmy-harness-app/rustls",
     "llmy-types/rustls",
 ]
 native-tls = [
@@ -48,6 +51,7 @@ native-tls = [
     "llmy-agent/native-tls",
     "llmy-agent-tools/native-tls",
     "llmy-harness/native-tls",
+    "llmy-harness-app/native-tls",
     "llmy-types/native-tls",
 ]
 native-tls-vendored = [
@@ -57,6 +61,7 @@ native-tls-vendored = [
     "llmy-agent/native-tls-vendored",
     "llmy-agent-tools/native-tls-vendored",
     "llmy-harness/native-tls-vendored",
+    "llmy-harness-app/native-tls-vendored",
     "llmy-types/native-tls-vendored",
 ]
 

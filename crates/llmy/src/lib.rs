@@ -116,6 +116,19 @@ pub mod harness {
     pub use llmy_harness::*;
 }
 
+/// Single-run harness application: SQLite-persisted tool calls with
+/// truncated-but-recoverable results, background bash and monitors, JSON
+/// scratchpad, structured output gating, and knowledge-graph memory.
+pub mod harness_app {
+    pub use llmy_harness_app::*;
+}
+
+/// Tree-sitter code graphs for smart contracts (Solidity / Rust / Move):
+/// call graphs, state graphs, and agent-facing query tools.
+pub mod codegraph {
+    pub use llmy_codegraph::*;
+}
+
 /// Tokenizer helpers and model metadata for approximate token counting and context sizing.
 pub mod tokenizer {
     pub use llmy_tokenizer::*;

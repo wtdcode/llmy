@@ -5,8 +5,9 @@ use clap::{Parser, Subcommand};
 mod commands;
 
 use commands::{
-    ChatArgs, DumpClientArgs, DumpReqArgs, ListReqArgs, McpServerArgs, TokenizerArgs, run_chat,
-    run_dump_client, run_dump_req, run_list_req, run_mcp_server, run_models, run_tokenizer,
+    ChatArgs, CodegraphArgs, DumpClientArgs, DumpReqArgs, HarnessArgs, ListReqArgs, McpServerArgs,
+    TokenizerArgs, run_chat, run_codegraph, run_dump_client, run_dump_req, run_harness,
+    run_list_req, run_mcp_server, run_models, run_tokenizer,
 };
 
 #[derive(Parser)]
@@ -32,6 +33,10 @@ enum Commands {
     DumpClient(DumpClientArgs),
     /// Run an MCP file server exposing read/list/find tools
     McpServer(McpServerArgs),
+    /// Run a single-shot agent harness to completion over a workspace
+    Harness(Box<HarnessArgs>),
+    /// Build and inspect smart-contract code graphs (Solidity/Rust/Move)
+    Codegraph(CodegraphArgs),
 }
 
 async fn main_entry() -> color_eyre::Result<()> {
@@ -44,6 +49,8 @@ async fn main_entry() -> color_eyre::Result<()> {
         Commands::DumpReq(args) => run_dump_req(args).await,
         Commands::DumpClient(args) => run_dump_client(args).await,
         Commands::McpServer(args) => run_mcp_server(args).await,
+        Commands::Harness(args) => run_harness(*args).await,
+        Commands::Codegraph(args) => run_codegraph(args).await,
     }
 }
 
@@ -69,6 +76,8 @@ fn main() {
         }
     }
 
+    // Logs go to stderr so stdout stays clean for pipeable command output
+    // (chat replies, structured harness results).
     let sub = tracing_subscriber::FmtSubscriber::builder()
         .with_env_filter(
             tracing_subscriber::EnvFilter::builder()
@@ -77,6 +86,7 @@ fn main() {
                 .expect("env contains non-utf8"),
         )
         .with_ansi(use_colors)
+        .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::set_global_default(sub).expect("can not set default tracing");
     tokio::runtime::Builder::new_multi_thread()

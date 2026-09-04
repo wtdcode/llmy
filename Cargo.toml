@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.24.1"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 readme = "Readme.md"
@@ -44,16 +44,21 @@ regex = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 axum = "0.8"
 rmcp = { version = "1", default-features = false }
+# TLS backends come from `async-openai`'s reqwest features via cargo feature
+# unification; this direct dependency only names the types.
+reqwest = { version = "0.13", default-features = false }
 rust_decimal = { version = "1" }
 
-llmy-clap = {version = "0.24.1", path = "./crates/llmy-clap", default-features = false}
-llmy-client = {version = "0.24.1", path = "./crates/llmy-client", default-features = false}
-llmy-types = {version = "0.24.1", path = "./crates/llmy-types", default-features = false}
-llmy-tokenizer = {version = "0.24.1", path = "./crates/llmy-tokenizer"}
-llmy-agent = {version = "0.24.1", path = "./crates/llmy-agent", default-features = false}
-llmy-agent-tools = {version = "0.24.1", path = "./crates/llmy-agent-tools", default-features = false}
-llmy-agent-derive = {version = "0.24.1", path = "./crates/llmy-agent-derive"}
-llmy-harness = {version = "0.24.1", path = "./crates/llmy-harness", default-features = false}
+llmy-clap = {version = "1.0.0", path = "./crates/llmy-clap", default-features = false}
+llmy-client = {version = "1.0.0", path = "./crates/llmy-client", default-features = false}
+llmy-types = {version = "1.0.0", path = "./crates/llmy-types", default-features = false}
+llmy-tokenizer = {version = "1.0.0", path = "./crates/llmy-tokenizer"}
+llmy-agent = {version = "1.0.0", path = "./crates/llmy-agent", default-features = false}
+llmy-agent-tools = {version = "1.0.0", path = "./crates/llmy-agent-tools", default-features = false}
+llmy-agent-derive = {version = "1.0.0", path = "./crates/llmy-agent-derive"}
+llmy-harness = {version = "1.0.0", path = "./crates/llmy-harness", default-features = false}
+llmy-harness-app = {version = "1.0.0", path = "./crates/llmy-harness-app", default-features = false}
+llmy-codegraph = {version = "1.0.0", path = "./crates/llmy-codegraph"}
 
-llmy = {version = "0.24.1", path = "./crates/llmy", default-features = false}
-llm-cli = {version = "0.24.1", path = "./crates/llmy-cli"}
+llmy = {version = "1.0.0", path = "./crates/llmy", default-features = false}
+llm-cli = {version = "1.0.0", path = "./crates/llmy-cli"}

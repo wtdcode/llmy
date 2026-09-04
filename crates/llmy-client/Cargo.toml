@@ -25,6 +25,7 @@ tokio-stream.workspace = true
 futures.workspace = true
 regex.workspace = true
 sqlx.workspace = true
+reqwest.workspace = true
 rust_decimal = { workspace = true, features = ["serde", "macros"] }
 
 llmy-tokenizer.workspace = true
@@ -52,4 +53,4 @@ native-tls-vendored = [
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = {workspace = true, features = ["macros", "rt-multi-thread"]}
+tokio = {workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"]}

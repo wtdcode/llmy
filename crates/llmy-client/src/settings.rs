@@ -119,6 +119,11 @@ pub struct LLMSettings {
     /// refused (`LLMY_ALLOW_IMPLICIT_CONVERT`). Only requests already in the
     /// backend's own format are sent without it.
     pub allow_implicit_convert: bool,
+    /// Application identity announced on every request (`User-Agent` plus
+    /// app marker headers): llmy itself, a mimicked known client, or a
+    /// custom value. Like `llm_concurrent`, applied when the client is
+    /// constructed — per-request settings overrides don't change it.
+    pub llm_app: Option<crate::app::AppIdentity>,
 }
 
 impl LLMSettings {

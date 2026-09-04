@@ -177,6 +177,43 @@ impl LLMClient {
         }
     }
 
+    /// [`Self::new`] with an application identity: every request goes out
+    /// through an HTTP client whose default headers carry the identity's
+    /// `User-Agent` and app markers. `None` behaves exactly like `new`; a
+    /// transport client that cannot be built (which reqwest only does when
+    /// the TLS backend is broken) falls back to the un-annotated client
+    /// with an error log rather than failing construction.
+    pub fn new_with_app(config: SupportedConfig, app: Option<&crate::app::AppIdentity>) -> Self {
+        let Some(identity) = app else {
+            return Self::new(config);
+        };
+        let http_client = match identity.http_client() {
+            Ok(http_client) => http_client,
+            Err(error) => {
+                tracing::error!(
+                    "failed to build the app-identity http client, requests go un-annotated: {}",
+                    error
+                );
+                return Self::new(config);
+            }
+        };
+        tracing::info!("annotating requests as app: {}", identity.user_agent);
+        match config {
+            SupportedConfig::Azure { config, .. } => {
+                Self::Azure(Client::with_config(config).with_http_client(http_client))
+            }
+            SupportedConfig::OpenAI(cfg) => {
+                Self::OpenAI(Client::with_config(cfg).with_http_client(http_client))
+            }
+            SupportedConfig::Anthropic(cfg) => {
+                Self::Anthropic(Client::with_config(cfg).with_http_client(http_client))
+            }
+            SupportedConfig::OpenAIResponses(cfg) => {
+                Self::Responses(Client::with_config(cfg).with_http_client(http_client))
+            }
+        }
+    }
+
     /// Which wire protocol this client speaks.
     pub fn protocol(&self) -> &'static str {
         match self {
@@ -720,6 +757,7 @@ impl LLM {
         settings: LLMSettings,
         debug_backend: Option<DebugBackend>,
     ) -> Self {
+        let client = LLMClient::new_with_app(config.clone(), settings.llm_app.as_ref());
         let billing = Arc::new(StdRwLock::new(BillingTree::new(cap)));
 
         let endpoint = config.endpoint_url().to_string();
@@ -754,7 +792,7 @@ impl LLM {
         LLM {
             llm: Arc::new(LLMInner {
                 node: ROOT,
-                client: LLMClient::new(config),
+                client,
                 model,
                 billing,
                 debug_backend: debug_backend.map(Arc::new),
@@ -1902,6 +1940,7 @@ mod tests {
             billing_log_tokens: 100_000,
             token_estimate_pct: 10.0,
             allow_implicit_convert: false,
+            llm_app: None,
             llm_concurrent: 0,
         }
     }

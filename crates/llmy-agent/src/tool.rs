@@ -303,6 +303,13 @@ impl ToolBox {
         self.tools.len()
     }
 
+    /// Iterates over the registered tools as `(name, tool)` pairs in sorted
+    /// name order. Useful for wrapping or inspecting every tool of a box
+    /// (e.g. building a recording adapter around each one).
+    pub fn entries(&self) -> impl Iterator<Item = (&String, &Arc<Box<dyn ToolDyn>>)> {
+        self.tools.iter()
+    }
+
     /// Phase-one batch gate: runs every call's [`ToolDyn::validate`] before
     /// anything executes, so a rejection costs zero side effects across the
     /// whole turn. The first rejection comes back as

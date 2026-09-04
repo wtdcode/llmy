@@ -1786,6 +1786,7 @@ mod tests {
             billing_log_tokens: 0,
             token_estimate_pct: 10.0,
             allow_implicit_convert: false,
+            llm_app: None,
             llm_concurrent: 0,
         }
     }
