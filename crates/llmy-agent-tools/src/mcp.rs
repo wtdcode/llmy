@@ -73,7 +73,7 @@ impl McpClient {
             toolbox.add_dyn_tool(Box::new(McpRemoteTool {
                 peer: self.peer.clone(),
                 tool,
-            }));
+            }))?;
         }
 
         let resources = self.peer.list_all_resources().await?;
@@ -81,7 +81,7 @@ impl McpClient {
             toolbox.add_dyn_tool(Box::new(McpResourceTool {
                 peer: self.peer.clone(),
                 resource,
-            }));
+            }))?;
         }
 
         Ok(toolbox)

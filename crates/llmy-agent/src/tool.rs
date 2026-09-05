@@ -64,16 +64,16 @@ pub trait ToolDyn: DynClone + Debug + Send + Sync + std::any::Any {
             function: WithOtherFields::new(FunctionObjectRaw {
                 name: self.name(),
                 description: self.description(),
-                parameters: Some(
-                    serde_json::to_value(self.schema()).expect("Fail to serialize schema"),
-                ),
+                // `schemars::Schema` is a transparent wrapper over
+                // `serde_json::Value`, so this is a move, not a serialize.
+                parameters: Some(self.schema().to_value()),
                 strict: Some(self.strict()),
             }),
         })
     }
     /// Renders the tool as an MCP [`rmcp::model::Tool`] descriptor.
     fn to_mcp_tool(&self) -> rmcp::model::Tool {
-        let input_schema = serde_json::to_value(self.schema()).expect("Fail to serialize schema");
+        let input_schema = self.schema().to_value();
         let input_schema = input_schema.as_object().cloned().unwrap_or_default();
         rmcp::model::Tool::new_with_raw(
             self.name(),
@@ -83,9 +83,10 @@ pub trait ToolDyn: DynClone + Debug + Send + Sync + std::any::Any {
     }
     /// Phase-one gate the agent loop runs on every call of a turn before any
     /// tool executes, on the same parsed arguments the execution path uses.
-    /// The arguments are assumed to conform to the tool's schema — schema
-    /// verdicts belong to the execution path (`IncorrectToolCall`), never to
-    /// validate. `Err(reason)` rejects the call: the
+    /// The arguments are guaranteed to conform to the tool's schema — the
+    /// batch gate ([`ToolBox::validate_calls`]) has already discarded the
+    /// turn as `IncorrectToolCall` for malformed calls before validate runs.
+    /// `Err(reason)` rejects the call: the
     /// loop wraps it into [`LLMYError::ToolCallRejected`] bound to the wire
     /// call, discards the whole model turn (no tool in the batch runs) and
     /// asks again — the reason is logged, never fed back to the model.
@@ -207,8 +208,8 @@ pub trait Tool: Send + Sync + DynClone + Debug {
     /// Phase-one gate on the same deserialized `arguments` [`Self::invoke`]
     /// receives, run by the agent loop before any tool of the turn executes.
     /// The arguments are already schema-checked — assume they conform; a
-    /// mismatch never reaches here (the execution path reports it as
-    /// [`LLMYError::IncorrectToolCall`]).
+    /// mismatch never reaches here (the batch gate discards the turn as
+    /// [`LLMYError::IncorrectToolCall`] first).
     /// `Err(reason)` rejects the call: the loop wraps it into
     /// [`LLMYError::ToolCallRejected`] bound to the wire call and discards
     /// the whole model turn — nothing has run yet, so the rejection costs
@@ -281,6 +282,87 @@ impl<T: Tool + DynClone + 'static> ToolDyn for T {
     }
 }
 
+struct ToolEntryInner {
+    tool: Box<dyn ToolDyn>,
+    /// Compiled once from the advertised schema at registration instead of
+    /// per call. Registration through [`ToolBox::add_dyn_tool`] refuses an
+    /// uncompilable schema outright, so `None` only happens on the typed
+    /// [`ToolBox::add_tool`] path in the freak case where `schema_for!`
+    /// output still fails to compile (e.g. an exotic
+    /// `#[schemars(regex(...))]` pattern) — schema validation then abstains
+    /// for that tool.
+    validator: Option<jsonschema::Validator>,
+}
+
+/// One registered tool plus its compiled schema validator, shared behind a
+/// single `Arc` so cloning a [`ToolBox`] or wrapping a tool costs one
+/// refcount bump.
+#[derive(Clone)]
+pub struct ToolEntry {
+    inner: Arc<ToolEntryInner>,
+}
+
+impl Debug for ToolEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolEntry")
+            .field("tool", &self.inner.tool.name())
+            .field("has_validator", &self.inner.validator.is_some())
+            .finish()
+    }
+}
+
+impl ToolEntry {
+    fn compile(tool: &dyn ToolDyn) -> Result<jsonschema::Validator, LLMYError> {
+        jsonschema::validator_for(tool.schema().as_value()).map_err(|error| {
+            color_eyre::eyre::eyre!(
+                "schema of tool {} is not a valid JSON Schema document: {}",
+                tool.name(),
+                error
+            )
+            .into()
+        })
+    }
+
+    /// Refuses a tool whose advertised schema does not compile.
+    fn strict(tool: Box<dyn ToolDyn>) -> Result<Self, LLMYError> {
+        let validator = Self::compile(tool.as_ref())?;
+        Ok(Self {
+            inner: Arc::new(ToolEntryInner {
+                tool,
+                validator: Some(validator),
+            }),
+        })
+    }
+
+    /// Registers the tool even when its schema does not compile; schema
+    /// validation abstains for it and the failure is logged loudly. Only for
+    /// typed tools, where this is not supposed to be reachable at all.
+    fn lenient(tool: Box<dyn ToolDyn>) -> Self {
+        let validator = match Self::compile(tool.as_ref()) {
+            Ok(validator) => Some(validator),
+            Err(error) => {
+                tracing::error!(
+                    "typed tool produced an uncompilable schema, validation abstains for it: {}",
+                    error
+                );
+                None
+            }
+        };
+        Self {
+            inner: Arc::new(ToolEntryInner { tool, validator }),
+        }
+    }
+
+    /// The registered tool.
+    pub fn tool(&self) -> &dyn ToolDyn {
+        self.inner.tool.as_ref()
+    }
+
+    fn validator(&self) -> Option<&jsonschema::Validator> {
+        self.inner.validator.as_ref()
+    }
+}
+
 /// A name-keyed registry of tools available to an agent.
 ///
 /// `ToolBox` owns its tools behind `Arc<Box<dyn ToolDyn>>`, so cloning the
@@ -289,7 +371,7 @@ impl<T: Tool + DynClone + 'static> ToolDyn for T {
 /// stable and sorted by name.
 #[derive(Default, Clone, Debug)]
 pub struct ToolBox {
-    tools: BTreeMap<String, Arc<Box<dyn ToolDyn>>>,
+    tools: BTreeMap<String, ToolEntry>,
 }
 
 impl ToolBox {
@@ -303,46 +385,71 @@ impl ToolBox {
         self.tools.len()
     }
 
-    /// Iterates over the registered tools as `(name, tool)` pairs in sorted
-    /// name order. Useful for wrapping or inspecting every tool of a box
-    /// (e.g. building a recording adapter around each one).
-    pub fn entries(&self) -> impl Iterator<Item = (&String, &Arc<Box<dyn ToolDyn>>)> {
+    /// Iterates over the registered tools as `(name, entry)` pairs in
+    /// sorted name order. Useful for wrapping or inspecting every tool of a
+    /// box (e.g. building a recording adapter around each one) — a cloned
+    /// [`ToolEntry`] is a cheap shared handle to the tool.
+    pub fn entries(&self) -> impl Iterator<Item = (&String, &ToolEntry)> {
         self.tools.iter()
     }
 
-    /// Phase-one batch gate: runs every call's [`ToolDyn::validate`] before
-    /// anything executes, so a rejection costs zero side effects across the
-    /// whole turn. The first rejection comes back as
-    /// [`LLMYError::ToolCallRejected`] bound to its wire call. Unknown tools,
-    /// unparseable arguments and arguments that fail the tool's own
-    /// [`ToolDyn::schema`] are skipped, not rejected — schema problems keep
-    /// their existing `IncorrectToolCall` soft path in the execution phase —
-    /// so `validate` only ever runs on conforming arguments.
-    pub async fn validate_calls(&self, calls: &[GeneralToolCall]) -> Result<(), LLMYError> {
+    /// Phase-one batch gate: runs before anything executes, so a failure
+    /// here costs zero side effects across the whole turn. Two verdicts
+    /// discard the model's turn:
+    ///
+    /// - a malformed call — arguments that don't parse as JSON or don't
+    ///   conform to the tool's advertised [`ToolDyn::schema`] — comes back
+    ///   as [`LLMYError::IncorrectToolCall`];
+    /// - content the tool's own [`ToolDyn::validate`] refuses comes back as
+    ///   [`LLMYError::ToolCallRejected`].
+    ///
+    /// Either way the agent loop drops the whole turn and re-asks the model
+    /// from a clean context — nothing about the failed attempt leaks into
+    /// what it sees next. Unknown tool names are skipped, not rejected: they
+    /// keep their soft "tool not defined" result in the execution phase, so
+    /// the model learns the actual roster instead of retrying blind.
+    ///
+    /// On success the arguments parsed here are returned (aligned with
+    /// `calls`; `None` for unknown tools) so the execution phase can reuse
+    /// them via [`Self::invoke_many_parsed`] instead of parsing the wire
+    /// strings a second time. Schema checks run against the validator
+    /// compiled once at registration ([`Self::add_dyn_tool`]).
+    pub async fn validate_calls(
+        &self,
+        calls: &[GeneralToolCall],
+    ) -> Result<Vec<Option<serde_json::Value>>, LLMYError> {
+        let mut parsed = Vec::with_capacity(calls.len());
         for call in calls {
-            let Some(tool) = self.tools.get(&call.tool_name) else {
+            let Some(entry) = self.tools.get(&call.tool_name) else {
+                parsed.push(None);
                 continue;
             };
             let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.tool_args) else {
-                continue;
+                return Err(LLMYError::IncorrectToolCall(
+                    call.tool_name.clone(),
+                    call.tool_args.clone(),
+                    entry.tool().schema(),
+                ));
             };
-            // Gate on the schema the tool advertises to the model
-            // ([`ToolDyn::schema`]), upholding validate's assumption that its
-            // arguments conform. An uncompilable schema cannot gate anything
-            // and falls through to validate's own abstention.
-            let schema =
-                serde_json::to_value(tool.schema()).unwrap_or(serde_json::Value::Bool(true));
-            let conforms = jsonschema::validator_for(&schema)
-                .map(|validator| validator.is_valid(&arguments))
-                .unwrap_or(true);
-            if !conforms {
-                continue;
+            // Gate on the schema the tool advertises to the model,
+            // upholding validate's assumption that its arguments conform.
+            // A tool whose schema did not compile has no validator and
+            // abstains.
+            if let Some(validator) = entry.validator()
+                && !validator.is_valid(&arguments)
+            {
+                return Err(LLMYError::IncorrectToolCall(
+                    call.tool_name.clone(),
+                    call.tool_args.clone(),
+                    entry.tool().schema(),
+                ));
             }
-            if let Err(reason) = tool.validate(arguments).await {
+            if let Err(reason) = entry.tool().validate(arguments.clone()).await {
                 return Err(LLMYError::ToolCallRejected(call.clone(), reason));
             }
+            parsed.push(Some(arguments));
         }
-        Ok(())
+        Ok(parsed)
     }
 
     /// Renders the registered tool names, optionally with their descriptions.
@@ -353,12 +460,14 @@ impl ToolBox {
     pub fn render_tools(&self, details: bool) -> Vec<String> {
         self.tools
             .iter()
-            .map(|(name, tool)| {
+            .map(|(name, entry)| {
                 if details {
                     format!(
                         "`{}`: {:?}", // description may contain new lines
                         name,
-                        tool.description()
+                        entry
+                            .tool()
+                            .description()
                             .unwrap_or_else(|| "no description is provided".to_string())
                     )
                 } else {
@@ -382,29 +491,48 @@ impl ToolBox {
     /// Renders every registered tool as an MCP [`rmcp::model::Tool`]
     /// descriptor.
     pub fn mcp_tools(&self) -> Vec<rmcp::model::Tool> {
-        self.tools.values().map(|t| t.to_mcp_tool()).collect()
+        self.tools
+            .values()
+            .map(|entry| entry.tool().to_mcp_tool())
+            .collect()
     }
 
     /// Renders every registered tool as an OpenAI `ChatCompletionTools`
     /// entry, ready to be attached to a chat completion request.
     pub fn openai_objects(&self) -> Vec<ChatCompletionTools> {
         self.tools
-            .iter()
-            .map(|t| WithOtherFields::new(ChatCompletionToolsRaw::Function(t.1.to_openai_obejct())))
+            .values()
+            .map(|entry| {
+                WithOtherFields::new(ChatCompletionToolsRaw::Function(
+                    entry.tool().to_openai_obejct(),
+                ))
+            })
             .collect()
     }
 
-    /// Registers a typed [`Tool`]. Equivalent to boxing it and calling
-    /// [`Self::add_dyn_tool`].
+    /// Registers a typed [`Tool`]. Its schema comes from `schema_for!` on
+    /// the `ARGUMENTS` type, which emits a valid JSON Schema document, so
+    /// registration is infallible — unlike [`Self::add_dyn_tool`], whose
+    /// schema can come from anywhere.
     pub fn add_tool<T: Tool + 'static>(&mut self, tool: T) {
-        self.add_dyn_tool(Box::new(tool) as _);
+        self.insert_entry(ToolEntry::lenient(Box::new(tool) as _));
     }
 
     /// Registers an already-erased [`ToolDyn`]. The tool's
     /// [`ToolDyn::name`] is used as the registry key, so adding a tool whose
     /// name collides with an existing one will replace the previous entry.
-    pub fn add_dyn_tool(&mut self, tool: Box<dyn ToolDyn>) {
-        self.tools.insert(tool.name(), Arc::new(tool));
+    /// The advertised schema is compiled into a validator here, once, so
+    /// [`Self::validate_calls`] never recompiles it per call — and because
+    /// an erased tool's schema can come from anywhere (an MCP server, a
+    /// hand-written impl), a schema that is not a valid JSON Schema document
+    /// refuses the tool.
+    pub fn add_dyn_tool(&mut self, tool: Box<dyn ToolDyn>) -> Result<(), LLMYError> {
+        self.insert_entry(ToolEntry::strict(tool)?);
+        Ok(())
+    }
+
+    fn insert_entry(&mut self, entry: ToolEntry) {
+        self.tools.insert(entry.tool().name(), entry);
     }
 
     /// Removes the tool registered under `name`, returning `true` if one was
@@ -423,9 +551,9 @@ impl ToolBox {
         tool_name: String,
         arguments: String,
     ) -> Option<Result<String, LLMYError>> {
-        if let Some(tool) = self.tools.get(&tool_name) {
+        if let Some(entry) = self.tools.get(&tool_name) {
             debug!("Invoking tool {} with arguments {}", &tool_name, &arguments);
-            Some(tool.call(arguments).await)
+            Some(entry.tool().call(arguments).await)
         } else {
             None
         }
@@ -436,9 +564,9 @@ impl ToolBox {
         tool_name: String,
         arguments: serde_json::Value,
     ) -> Option<Result<String, LLMYError>> {
-        if let Some(tool) = self.tools.get(&tool_name) {
+        if let Some(entry) = self.tools.get(&tool_name) {
             debug!("Invoking tool {} with arguments {}", &tool_name, &arguments);
-            Some(tool.run(arguments).await)
+            Some(entry.tool().run(arguments).await)
         } else {
             None
         }
@@ -455,13 +583,32 @@ impl ToolBox {
         &self,
         calls: Vec<GeneralToolCall>,
     ) -> Vec<(GeneralToolCall, Option<Result<String, LLMYError>>)> {
+        self.invoke_many_parsed(calls.into_iter().map(|call| (call, None)).collect())
+            .await
+    }
+
+    /// Concurrent invocation of `(call, parsed_args)` pairs. A `Some` value
+    /// — the arguments [`Self::validate_calls`] already parsed — executes
+    /// directly without re-parsing the wire string; a `None` falls back to
+    /// parsing the call's argument string (unknown tools land here and keep
+    /// their "not defined" result).
+    pub async fn invoke_many_parsed(
+        &self,
+        calls: Vec<(GeneralToolCall, Option<serde_json::Value>)>,
+    ) -> Vec<(GeneralToolCall, Option<Result<String, LLMYError>>)> {
         let mut js = JoinSet::new();
-        for call in calls {
+        for (call, parsed) in calls {
             let tb = self.clone();
             js.spawn(async move {
-                let tc: GeneralToolCall = call.clone();
-                tracing::info!("Calling {}", &tc);
-                (tc, tb.invoke(call.tool_name, call.tool_args).await)
+                tracing::info!("Calling {}", &call);
+                let result = match parsed {
+                    Some(value) => tb.invoke_value(call.tool_name.clone(), value).await,
+                    None => {
+                        tb.invoke(call.tool_name.clone(), call.tool_args.clone())
+                            .await
+                    }
+                };
+                (call, result)
             });
         }
 
@@ -476,12 +623,27 @@ impl ToolBox {
         &self,
         calls: Vec<GeneralToolCall>,
     ) -> Vec<(GeneralToolCall, Option<Result<String, LLMYError>>)> {
+        self.invoke_many_parsed_sequential(calls.into_iter().map(|call| (call, None)).collect())
+            .await
+    }
+
+    /// Sequential variant of [`Self::invoke_many_parsed`].
+    pub async fn invoke_many_parsed_sequential(
+        &self,
+        calls: Vec<(GeneralToolCall, Option<serde_json::Value>)>,
+    ) -> Vec<(GeneralToolCall, Option<Result<String, LLMYError>>)> {
         let mut out = Vec::with_capacity(calls.len());
 
-        for call in calls {
-            let tc: GeneralToolCall = call.clone();
-            tracing::debug!("Calling {}", &tc);
-            out.push((tc, self.invoke(call.tool_name, call.tool_args).await));
+        for (call, parsed) in calls {
+            tracing::debug!("Calling {}", &call);
+            let result = match parsed {
+                Some(value) => self.invoke_value(call.tool_name.clone(), value).await,
+                None => {
+                    self.invoke(call.tool_name.clone(), call.tool_args.clone())
+                        .await
+                }
+            };
+            out.push((call, result));
         }
 
         out
@@ -502,6 +664,19 @@ impl ToolBox {
         Self::agent_messages_from_invokes(invokes)
     }
 
+    /// [`Self::agent_invoke_many`] over `(call, parsed_args)` pairs, reusing
+    /// the arguments [`Self::validate_calls`] already parsed.
+    pub async fn agent_invoke_many_parsed(
+        &self,
+        calls: Vec<(GeneralToolCall, Option<serde_json::Value>)>,
+    ) -> Vec<(
+        GeneralToolCall,
+        Option<Result<ChatCompletionRequestMessageRaw, LLMYError>>,
+    )> {
+        let invokes = self.invoke_many_parsed(calls).await;
+        Self::agent_messages_from_invokes(invokes)
+    }
+
     /// Sequential variant of [`Self::agent_invoke_many`].
     pub async fn agent_invoke_many_sequential(
         &self,
@@ -511,6 +686,18 @@ impl ToolBox {
         Option<Result<ChatCompletionRequestMessageRaw, LLMYError>>,
     )> {
         let invokes = self.invoke_many_sequential(calls).await;
+        Self::agent_messages_from_invokes(invokes)
+    }
+
+    /// Sequential variant of [`Self::agent_invoke_many_parsed`].
+    pub async fn agent_invoke_many_parsed_sequential(
+        &self,
+        calls: Vec<(GeneralToolCall, Option<serde_json::Value>)>,
+    ) -> Vec<(
+        GeneralToolCall,
+        Option<Result<ChatCompletionRequestMessageRaw, LLMYError>>,
+    )> {
+        let invokes = self.invoke_many_parsed_sequential(calls).await;
         Self::agent_messages_from_invokes(invokes)
     }
 
@@ -537,5 +724,47 @@ impl ToolBox {
         }
 
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A hand-implemented dyn tool advertising a schema that is not a valid
+    /// JSON Schema document — the shape an ill-behaved MCP server produces.
+    #[derive(Debug, Clone)]
+    struct BadSchemaTool;
+
+    impl ToolDyn for BadSchemaTool {
+        fn name(&self) -> String {
+            "bad_schema_tool".to_string()
+        }
+
+        fn description(&self) -> Option<String> {
+            None
+        }
+
+        fn schema(&self) -> schemars::Schema {
+            serde_json::from_str(r#"{"type": "no-such-type"}"#)
+                .expect("the schema wrapper accepts any value")
+        }
+
+        fn run(
+            &self,
+            _arguments: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<String, LLMYError>> + Send + '_>> {
+            Box::pin(async { Ok("ok".to_string()) })
+        }
+    }
+
+    #[test]
+    fn a_dyn_tool_with_an_invalid_schema_is_refused() {
+        let mut tools = ToolBox::new();
+        let error = tools
+            .add_dyn_tool(Box::new(BadSchemaTool))
+            .expect_err("invalid schema must refuse registration");
+        assert!(error.to_string().contains("bad_schema_tool"), "{error}");
+        assert_eq!(tools.len(), 0);
     }
 }

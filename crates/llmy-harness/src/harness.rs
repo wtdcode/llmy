@@ -28,24 +28,10 @@ struct AgentMemoryRuntime {
     criteria: AgentMemorySystemPromptCriteria,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct AgentConfig {
     pub sequential_tool_call: bool,
     pub allow_empty_tool_calls: bool,
-    /// How many times a step re-asks the model after a turn is discarded by a
-    /// tool rejection ([`LLMYError::ToolCallRejected`]) before giving up and
-    /// surfacing the rejection to the caller.
-    pub tool_reject_retries: u64,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            sequential_tool_call: false,
-            allow_empty_tool_calls: false,
-            tool_reject_retries: 32,
-        }
-    }
 }
 
 impl AgentConfig {
@@ -349,10 +335,13 @@ impl Agent {
         let timeout = settings.timeout();
         let retry = settings.llm_retry;
 
-        // A turn discarded by a tool rejection is retried from an unchanged
-        // context: same conversation, same request — nothing about the
-        // rejected attempt (assistant turn, tool outputs, rejection reason)
-        // leaks into what the model sees next.
+        // A turn discarded in validation — a malformed tool call
+        // (`IncorrectToolCall`) or a tool's own rejection
+        // (`ToolCallRejected`) — is retried from an unchanged context: same
+        // conversation, same request — nothing about the failed attempt
+        // (assistant turn, tool outputs, failure reason) leaks into what the
+        // model sees next. The retry budget comes from
+        // `LLMSettings::tool_reject_retries`.
         let mut reject_attempts: u64 = 0;
         let (step_result, extra_messages, assistant_message) = loop {
             let tools = (self.tools.len() != 0).then(|| self.tools.openai_objects());
@@ -413,33 +402,53 @@ impl Agent {
                         }
                     } else {
                         // Phase one: gate the whole batch before anything
-                        // runs, so a rejection here costs zero side effects.
-                        if let Err(rejected) = self.tools.validate_calls(&calls).await {
-                            reject_attempts += 1;
-                            tracing::warn!(
-                                "tool call rejected in validation ({}/{}), discarding the turn: {}",
-                                reject_attempts,
-                                config.tool_reject_retries,
-                                rejected
-                            );
-                            if reject_attempts > config.tool_reject_retries {
-                                return Err(rejected);
+                        // runs, so a discard here costs zero side effects —
+                        // malformed calls and tool rejections both land here.
+                        // Success hands back the parsed arguments, which the
+                        // execution phase reuses instead of re-parsing the
+                        // wire strings.
+                        let parsed_args = match self.tools.validate_calls(&calls).await {
+                            Ok(parsed_args) => parsed_args,
+                            Err(rejected) => {
+                                reject_attempts += 1;
+                                tracing::warn!(
+                                    "tool call discarded in validation ({}/{}), re-asking from a clean context: {}",
+                                    reject_attempts,
+                                    settings.tool_reject_retries,
+                                    rejected
+                                );
+                                if reject_attempts > settings.tool_reject_retries {
+                                    return Err(rejected);
+                                }
+                                continue;
                             }
-                            continue;
-                        }
+                        };
 
                         // Phase two: execute. A rejection surfacing here
                         // means execution already started (side effects may
                         // exist), so re-asking would make the model repeat
                         // them — it degrades to a soft tool result instead;
                         // only the validate phase may discard the turn.
-                        let calls = self.invoke_tool_calls(calls, &config).await;
+                        let calls = self
+                            .invoke_tool_calls(
+                                calls.into_iter().zip(parsed_args).collect(),
+                                &config,
+                            )
+                            .await;
                         for (call, tool_out) in calls.into_iter() {
                             if let Some(tool_out) = tool_out {
                                 match tool_out {
                                     Ok(tool_out) => {
                                         out.push(Message::from_chat_request(&tool_out));
                                     }
+                                    // Malformed calls are normally discarded
+                                    // in validation; reaching here means the
+                                    // advertised schema accepted arguments
+                                    // the typed deserialize refused (schemars
+                                    // and serde disagreeing about an edge of
+                                    // the type). Execution already started,
+                                    // so it degrades to a soft tool result
+                                    // instead of a turn discard.
                                     Err(LLMYError::IncorrectToolCall(_, _, e)) => {
                                         tracing::warn!(
                                             "Incorrect tool call detected for {}, schema is {:?}, we will ask LLM to retry.",
@@ -520,18 +529,22 @@ impl Agent {
         Ok(step_result)
     }
 
+    /// Execute a batch of `(call, parsed_args)` pairs — the parsed side
+    /// comes from `validate_calls`, so accepted calls run without another
+    /// parse of the wire string (`None` marks unknown tools, which keep
+    /// their soft "not defined" path).
     async fn invoke_tool_calls(
         &self,
-        calls: Vec<GeneralToolCall>,
+        calls: Vec<(GeneralToolCall, Option<serde_json::Value>)>,
         config: &AgentConfig,
     ) -> Vec<(
         GeneralToolCall,
         Option<Result<ChatCompletionRequestMessageRaw, LLMYError>>,
     )> {
         if config.sequential_tool_call {
-            self.tools.agent_invoke_many_sequential(calls).await
+            self.tools.agent_invoke_many_parsed_sequential(calls).await
         } else {
-            self.tools.agent_invoke_many(calls).await
+            self.tools.agent_invoke_many_parsed(calls).await
         }
     }
 
@@ -876,23 +889,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_mismatch_and_unknown_tools_are_not_rejections() {
+    async fn malformed_calls_discard_the_turn_but_unknown_tools_stay_soft() {
         let mut tools = ToolBox::new();
         tools.add_tool(ZebraTool);
 
-        // Unparseable args keep their soft `IncorrectToolCall` path...
+        // Unparseable args discard the turn before anything runs...
         let mut garbled = tool_call("zebra_tool", "id-1");
         garbled.tool_args = "not json at all".to_string();
+        assert!(matches!(
+            tools.validate_calls(&[garbled]).await.unwrap_err(),
+            LLMYError::IncorrectToolCall(..)
+        ));
+
         // ...valid JSON of the wrong shape does too...
         let mut wrong_shape = tool_call("zebra_tool", "id-2");
         wrong_shape.tool_args = "123".to_string();
-        // ...and unknown tools keep their "not defined" tool_result path.
-        let unknown = tool_call("no_such_tool", "id-3");
+        assert!(matches!(
+            tools.validate_calls(&[wrong_shape]).await.unwrap_err(),
+            LLMYError::IncorrectToolCall(..)
+        ));
 
+        // ...but unknown tools keep their "not defined" tool_result path so
+        // the model learns the roster instead of retrying blind.
+        let unknown = tool_call("no_such_tool", "id-3");
         tools
-            .validate_calls(&[garbled, wrong_shape, unknown])
+            .validate_calls(&[unknown])
             .await
-            .expect("none of these is a rejection");
+            .expect("unknown tools are not rejections");
+    }
+
+    #[tokio::test]
+    async fn validated_arguments_flow_into_execution_without_reparsing() {
+        let mut tools = ToolBox::new();
+        tools.add_tool(ZebraTool);
+        let calls = vec![
+            tool_call("zebra_tool", "id-1"),
+            tool_call("no_such_tool", "id-2"),
+        ];
+
+        // Parsed values come back aligned with the batch: one per accepted
+        // call, `None` for the unknown tool.
+        let parsed = tools.validate_calls(&calls).await.expect("valid batch");
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].is_some());
+        assert!(parsed[1].is_none());
+
+        let results = tools
+            .invoke_many_parsed(calls.into_iter().zip(parsed).collect())
+            .await;
+        let known = results
+            .iter()
+            .find(|(call, _)| call.tool_id == "id-1")
+            .expect("known call result");
+        assert!(
+            matches!(&known.1, Some(Ok(out)) if out == "ok"),
+            "{known:?}"
+        );
+        let unknown = results
+            .iter()
+            .find(|(call, _)| call.tool_id == "id-2")
+            .expect("unknown call result");
+        assert!(unknown.1.is_none());
     }
 
     #[tokio::test]
@@ -906,7 +963,6 @@ mod tests {
         let config = AgentConfig {
             sequential_tool_call: true,
             allow_empty_tool_calls: false,
-            tool_reject_retries: 3,
         };
         let agent = Agent::new_with_config(
             "base system prompt".to_string(),
@@ -918,8 +974,8 @@ mod tests {
         let results = agent
             .invoke_tool_calls(
                 vec![
-                    tool_call("mid_run_reject_tool", "id-1"),
-                    tool_call("fast_recording_tool", "id-2"),
+                    (tool_call("mid_run_reject_tool", "id-1"), None),
+                    (tool_call("fast_recording_tool", "id-2"), None),
                 ],
                 &config,
             )
@@ -982,11 +1038,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_reject_retries_defaults_to_thirty_two() {
-        assert_eq!(AgentConfig::default().tool_reject_retries, 32);
-    }
-
-    #[test]
     fn agent_config_defaults_to_parallel_tool_calls() {
         assert!(!AgentConfig::default().sequential_tool_call);
 
@@ -1012,7 +1063,6 @@ mod tests {
         let config = AgentConfig {
             sequential_tool_call: true,
             allow_empty_tool_calls: false,
-            tool_reject_retries: 3,
         };
         let agent = Agent::new_with_config(
             "base system prompt".to_string(),
@@ -1024,8 +1074,8 @@ mod tests {
         let results = agent
             .invoke_tool_calls(
                 vec![
-                    tool_call("slow_recording_tool", "slow"),
-                    tool_call("fast_recording_tool", "fast"),
+                    (tool_call("slow_recording_tool", "slow"), None),
+                    (tool_call("fast_recording_tool", "fast"), None),
                 ],
                 &config,
             )
@@ -1306,6 +1356,7 @@ mod tests {
             llm_presence_penalty: None,
             llm_prompt_timeout: 1,
             llm_retry: 0,
+            tool_reject_retries: 32,
             llm_max_completion_tokens: None,
             llm_tool_choice: None,
             llm_stream: false,

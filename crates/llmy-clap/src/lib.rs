@@ -187,6 +187,12 @@ macro_rules! make_openai_args {
             #[arg(long = concat!($long, "llm-retry"), env = concat!($prefix, "LLM_RETRY"), default_value_t = 5)]
             pub llm_retry: u64,
 
+            /// Retries after a model turn is discarded by tool-call
+            /// validation (malformed call or tool rejection); the model is
+            /// re-asked from a clean context each time.
+            #[arg(long = concat!($long, "llm-tool-reject-retries"), env = concat!($prefix, "LLM_TOOL_REJECT_RETRIES"), default_value_t = 32)]
+            pub llm_tool_reject_retries: u64,
+
             /// Cap on concurrently in-flight LLM requests through this client
             /// (shared by every scope/clone of it); 0 = unlimited.
             #[arg(
@@ -303,6 +309,7 @@ macro_rules! make_openai_args {
                     llm_presence_penalty: self.llm_presence_penalty,
                     llm_prompt_timeout: self.llm_prompt_timeout,
                     llm_retry: self.llm_retry,
+                    tool_reject_retries: self.llm_tool_reject_retries,
                     llm_concurrent: self.llm_concurrent,
                     llm_max_completion_tokens: self.llm_max_completion_tokens,
                     llm_tool_choice: self.llm_tool_choice.clone(),
@@ -1011,5 +1018,16 @@ mod tests {
             "x/1",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn tool_reject_retries_defaults_to_thirty_two_in_settings() {
+        assert_eq!(parse(&[]).settings().tool_reject_retries, 32);
+        assert_eq!(
+            parse(&["--opt-opt-llm-tool-reject-retries", "7"])
+                .settings()
+                .tool_reject_retries,
+            7
+        );
     }
 }

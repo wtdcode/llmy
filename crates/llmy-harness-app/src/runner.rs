@@ -208,7 +208,7 @@ impl HarnessRunner {
         let structured = match &options.output_schema {
             Some(schema) => {
                 let state = StructuredOutputState::new(schema.clone())?;
-                tools.add_dyn_tool(Box::new(SubmitResultTool::new(state.clone())));
+                tools.add_dyn_tool(Box::new(SubmitResultTool::new(state.clone())))?;
                 Some(state)
             }
             None => None,
@@ -230,7 +230,7 @@ impl HarnessRunner {
         };
 
         tools.extend(extra_tools);
-        let recorded = db.record_toolbox(&tools, run_id, &policy);
+        let recorded = db.record_toolbox(&tools, run_id, &policy)?;
 
         let spec = SystemPromptSpec {
             template: options.system_prompt_template,

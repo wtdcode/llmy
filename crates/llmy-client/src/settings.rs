@@ -89,6 +89,11 @@ pub struct LLMSettings {
     pub llm_presence_penalty: Option<f32>,
     pub llm_prompt_timeout: u64,
     pub llm_retry: u64,
+    /// How many times an agent step re-asks the model after its turn is
+    /// discarded in validation — a malformed tool call (`IncorrectToolCall`)
+    /// or a tool's own rejection (`ToolCallRejected`) — before the error
+    /// surfaces to the caller. The re-ask starts from a clean context.
+    pub tool_reject_retries: u64,
     /// Cap on concurrently in-flight requests through one client (all its
     /// scopes/clones share the limiter); 0 = unlimited. Applied when the
     /// client is constructed — per-request settings overrides don't resize it.

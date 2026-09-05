@@ -9,6 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
+color-eyre.workspace = true
 tracing.workspace = true
 dyn-clone.workspace = true
 schemars.workspace = true

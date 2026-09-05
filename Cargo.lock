@@ -2511,6 +2511,7 @@ name = "llmy-agent"
 version = "1.0.0"
 dependencies = [
  "axum",
+ "color-eyre",
  "dyn-clone",
  "jsonschema",
  "llmy-agent-derive",

@@ -9,10 +9,9 @@ use std::fmt;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use color_eyre::eyre::eyre;
-use llmy_agent::tool::{ToolBox, ToolDyn};
+use llmy_agent::tool::{ToolBox, ToolDyn, ToolEntry};
 use llmy_types::error::LLMYError;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -325,17 +324,17 @@ impl HarnessStateDB {
         tools: &ToolBox,
         run_id: i64,
         policy: &ToolResultPolicy,
-    ) -> ToolBox {
+    ) -> Result<ToolBox, LLMYError> {
         let mut recorded = ToolBox::new();
-        for (_, tool) in tools.entries() {
+        for (_, entry) in tools.entries() {
             recorded.add_dyn_tool(Box::new(RecordedTool {
-                inner: tool.clone(),
+                inner: entry.clone(),
                 db: self.clone(),
                 run_id,
                 policy: policy.clone(),
-            }));
+            }))?;
         }
-        recorded
+        Ok(recorded)
     }
 }
 
@@ -344,7 +343,7 @@ impl HarnessStateDB {
 /// result exceeds the policy size.
 #[derive(Clone)]
 pub struct RecordedTool {
-    inner: Arc<Box<dyn ToolDyn>>,
+    inner: ToolEntry,
     db: HarnessStateDB,
     run_id: i64,
     policy: ToolResultPolicy,
@@ -353,7 +352,7 @@ pub struct RecordedTool {
 impl fmt::Debug for RecordedTool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecordedTool")
-            .field("inner", &self.inner.name())
+            .field("inner", &self.inner.tool().name())
             .field("run_id", &self.run_id)
             .finish()
     }
@@ -361,26 +360,26 @@ impl fmt::Debug for RecordedTool {
 
 impl ToolDyn for RecordedTool {
     fn name(&self) -> String {
-        self.inner.name()
+        self.inner.tool().name()
     }
 
     fn description(&self) -> Option<String> {
-        self.inner.description()
+        self.inner.tool().description()
     }
 
     fn schema(&self) -> schemars::Schema {
-        self.inner.schema()
+        self.inner.tool().schema()
     }
 
     fn strict(&self) -> bool {
-        self.inner.strict()
+        self.inner.tool().strict()
     }
 
     fn validate(
         &self,
         arguments: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
-        self.inner.validate(arguments)
+        self.inner.tool().validate(arguments)
     }
 
     fn run(
@@ -389,7 +388,7 @@ impl ToolDyn for RecordedTool {
     ) -> Pin<Box<dyn Future<Output = Result<String, LLMYError>> + Send + '_>> {
         Box::pin(async move {
             let rendered_args = arguments.to_string();
-            let result = self.inner.run(arguments).await;
+            let result = self.inner.tool().run(arguments).await;
 
             match result {
                 Ok(output) => {
@@ -539,7 +538,9 @@ mod tests {
         let mut tools = ToolBox::new();
         tools.add_tool(LongOutputTool { chars: 250 });
         tools.add_tool(ReadToolOutputTool::new(db.clone(), policy.clone()));
-        let recorded = db.record_toolbox(&tools, run_id, &policy);
+        let recorded = db
+            .record_toolbox(&tools, run_id, &policy)
+            .expect("record toolbox");
 
         let truncated = recorded
             .invoke("long_output_tool".to_string(), "null".to_string())
@@ -572,7 +573,9 @@ mod tests {
         let policy = ToolResultPolicy::default();
         let mut tools = ToolBox::new();
         tools.add_tool(LongOutputTool { chars: 10 });
-        let recorded = db.record_toolbox(&tools, run_id, &policy);
+        let recorded = db
+            .record_toolbox(&tools, run_id, &policy)
+            .expect("record toolbox");
 
         let result = recorded
             .invoke("long_output_tool".to_string(), "null".to_string())
