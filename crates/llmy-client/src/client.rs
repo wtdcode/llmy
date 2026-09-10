@@ -1929,6 +1929,7 @@ mod tests {
             llm_prompt_timeout: 0,
             llm_retry: 1,
             tool_reject_retries: 32,
+            unknown_tool_hard_reject: false,
             llm_max_completion_tokens: None,
             llm_tool_choice: None::<LLMToolChoice>,
             llm_stream: false,

@@ -94,6 +94,13 @@ pub struct LLMSettings {
     /// or a tool's own rejection (`ToolCallRejected`) — before the error
     /// surfaces to the caller. The re-ask starts from a clean context.
     pub tool_reject_retries: u64,
+    /// Whether a call to a tool that does not exist discards the model's
+    /// turn like a malformed call, sharing `tool_reject_retries` (the
+    /// default), instead of feeding a soft "tool not defined" result back.
+    /// The soft path lets the model learn the actual roster — e.g. after a
+    /// tool was removed at runtime — at the cost of the failed attempt
+    /// staying in context.
+    pub unknown_tool_hard_reject: bool,
     /// Cap on concurrently in-flight requests through one client (all its
     /// scopes/clones share the limiter); 0 = unlimited. Applied when the
     /// client is constructed — per-request settings overrides don't resize it.

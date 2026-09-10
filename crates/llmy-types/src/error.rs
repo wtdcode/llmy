@@ -108,6 +108,13 @@ pub enum LLMYError {
     /// fed back to the model.
     #[error("tool call rejected: {0}: {1}")]
     ToolCallRejected(GeneralToolCall, String),
+    /// A call to a tool that is not registered at all. Surfaced when the
+    /// agent loop hard-rejects unknown tools
+    /// (`LLMSettings::unknown_tool_hard_reject`, the default); with the
+    /// setting off, a soft "not defined" tool result goes back to the
+    /// model instead.
+    #[error("unknown tool call: {0}")]
+    UnknownToolCall(GeneralToolCall),
     #[error("response filtered: {0}")]
     Filtered(String),
     #[error("no choice is returned")]
@@ -178,6 +185,7 @@ impl LLMYError {
             Self::Billing(_) => "billing",
             Self::IncorrectToolCall(..) => "incorrect_tool_call",
             Self::ToolCallRejected(..) => "tool_call_rejected",
+            Self::UnknownToolCall(_) => "unknown_tool_call",
             Self::Filtered(_) => "filtered",
             Self::EmptyChoice => "empty_choice",
             Self::OutputLength => "output_length",

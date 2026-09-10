@@ -193,6 +193,22 @@ macro_rules! make_openai_args {
             #[arg(long = concat!($long, "llm-tool-reject-retries"), env = concat!($prefix, "LLM_TOOL_REJECT_RETRIES"), default_value_t = 32)]
             pub llm_tool_reject_retries: u64,
 
+            /// Discard the model's turn when it calls a tool that does not
+            /// exist (sharing the tool-reject retry budget). Pass `false`
+            /// to feed back a soft "tool not defined" result instead —
+            /// useful when tools get removed at runtime and the model must
+            /// learn the new roster.
+            #[arg(
+                long = concat!($long, "llm-unknown-tool-hard-reject"),
+                env = concat!($prefix, "LLM_UNKNOWN_TOOL_HARD_REJECT"),
+                default_value_t = true,
+                num_args = 0..=1,
+                default_missing_value = "true",
+                action = clap::ArgAction::Set,
+                value_parser = clap::builder::BoolishValueParser::new()
+            )]
+            pub llm_unknown_tool_hard_reject: bool,
+
             /// Cap on concurrently in-flight LLM requests through this client
             /// (shared by every scope/clone of it); 0 = unlimited.
             #[arg(
@@ -310,6 +326,7 @@ macro_rules! make_openai_args {
                     llm_prompt_timeout: self.llm_prompt_timeout,
                     llm_retry: self.llm_retry,
                     tool_reject_retries: self.llm_tool_reject_retries,
+                    unknown_tool_hard_reject: self.llm_unknown_tool_hard_reject,
                     llm_concurrent: self.llm_concurrent,
                     llm_max_completion_tokens: self.llm_max_completion_tokens,
                     llm_tool_choice: self.llm_tool_choice.clone(),
@@ -1028,6 +1045,16 @@ mod tests {
                 .settings()
                 .tool_reject_retries,
             7
+        );
+    }
+
+    #[test]
+    fn unknown_tool_hard_reject_defaults_to_hard_and_can_be_disabled() {
+        assert!(parse(&[]).settings().unknown_tool_hard_reject);
+        assert!(
+            !parse(&["--opt-opt-llm-unknown-tool-hard-reject=false"])
+                .settings()
+                .unknown_tool_hard_reject
         );
     }
 }

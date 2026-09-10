@@ -424,6 +424,33 @@ impl Agent {
                             }
                         };
 
+                        // Unknown tool names come back as `None` markers.
+                        // By default (`unknown_tool_hard_reject`) the turn
+                        // is discarded like any other validation failure, on
+                        // the same budget; turning the setting off keeps
+                        // their soft "not defined" tool result instead, so
+                        // the model learns the actual roster — which also
+                        // covers tools removed at runtime.
+                        if settings.unknown_tool_hard_reject
+                            && let Some((unknown, _)) = calls
+                                .iter()
+                                .zip(&parsed_args)
+                                .find(|(_, parsed)| parsed.is_none())
+                        {
+                            let rejected = LLMYError::UnknownToolCall(unknown.clone());
+                            reject_attempts += 1;
+                            tracing::warn!(
+                                "tool call discarded in validation ({}/{}), re-asking from a clean context: {}",
+                                reject_attempts,
+                                settings.tool_reject_retries,
+                                rejected
+                            );
+                            if reject_attempts > settings.tool_reject_retries {
+                                return Err(rejected);
+                            }
+                            continue;
+                        }
+
                         // Phase two: execute. A rejection surfacing here
                         // means execution already started (side effects may
                         // exist), so re-asking would make the model repeat
@@ -1357,6 +1384,7 @@ mod tests {
             llm_prompt_timeout: 1,
             llm_retry: 0,
             tool_reject_retries: 32,
+            unknown_tool_hard_reject: false,
             llm_max_completion_tokens: None,
             llm_tool_choice: None,
             llm_stream: false,

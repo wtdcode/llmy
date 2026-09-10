@@ -405,9 +405,11 @@ impl ToolBox {
     ///
     /// Either way the agent loop drops the whole turn and re-asks the model
     /// from a clean context — nothing about the failed attempt leaks into
-    /// what it sees next. Unknown tool names are skipped, not rejected: they
-    /// keep their soft "tool not defined" result in the execution phase, so
-    /// the model learns the actual roster instead of retrying blind.
+    /// what it sees next. Unknown tool names are skipped here, marked as
+    /// `None` in the returned vector: the agent loop decides their fate —
+    /// discard the turn (`LLMSettings::unknown_tool_hard_reject`, the
+    /// default) or a soft "tool not defined" result in the execution phase
+    /// so the model learns the actual roster.
     ///
     /// On success the arguments parsed here are returned (aligned with
     /// `calls`; `None` for unknown tools) so the execution phase can reuse
