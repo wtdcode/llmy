@@ -32,15 +32,20 @@ pub struct RawCallSite {
     /// The qualifier before the final segment, if any (`token`, `coin`).
     pub qualifier: Option<String>,
     pub line: usize,
+    /// The compiler's id of the declaration this site calls, when the
+    /// extraction came from a compiler AST; resolution then goes by id and
+    /// falls back to the name only when the id is unknown to the graph.
+    pub declaration: Option<i64>,
 }
 
-/// A by-name reference from a callable body to a state item, before
-/// resolution.
+/// A reference from a callable body to a state item, before resolution.
 #[derive(Debug, Clone)]
 pub struct RawStateRef {
     pub name: String,
     pub write: bool,
     pub line: usize,
+    /// The compiler's id of the referenced declaration, when known.
+    pub declaration: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +56,9 @@ pub struct RawCallable {
     pub span: LineSpan,
     pub calls: Vec<RawCallSite>,
     pub state_refs: Vec<RawStateRef>,
+    /// The compiler's id of this declaration, when the extraction came from
+    /// a compiler AST.
+    pub node_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +67,15 @@ pub struct RawState {
     pub kind: StateKind,
     pub type_text: String,
     pub span: LineSpan,
+    pub node_id: Option<i64>,
+}
+
+/// A direct parent of a module (Solidity inheritance), by name and, when a
+/// compiler AST provided it, by the parent's declaration id.
+#[derive(Debug, Clone)]
+pub struct RawParent {
+    pub name: String,
+    pub declaration: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,10 +83,10 @@ pub struct RawModule {
     pub name: String,
     pub kind: ModuleKind,
     pub span: LineSpan,
-    /// Direct parents by name (Solidity inheritance).
-    pub parents: Vec<String>,
+    pub parents: Vec<RawParent>,
     pub callables: Vec<RawCallable>,
     pub states: Vec<RawState>,
+    pub node_id: Option<i64>,
 }
 
 /// Everything extracted from one file.

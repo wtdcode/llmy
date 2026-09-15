@@ -18,6 +18,7 @@ use crate::model::{
 };
 use crate::move_lang::{MoveAptosExtractor, MoveSuiExtractor};
 use crate::rust_lang::RustExtractor;
+use crate::solc::{SolcBuildInfo, SolcExtractor};
 use crate::solidity::SolidityExtractor;
 
 const SOLIDITY_BUILTINS: [&str; 22] = [
@@ -65,11 +66,21 @@ impl BuildResult {
 
 pub struct CodeGraphBuilder {
     root: PathBuf,
+    /// Compiler ASTs for the Solidity files, when the caller compiled the
+    /// project: those files are extracted from the AST (exact declaration
+    /// ids, call options, low-level calls, inline assembly) and only the
+    /// files the compiler did not see fall back to tree-sitter.
+    solc: Option<SolcBuildInfo>,
 }
 
 impl CodeGraphBuilder {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self { root, solc: None }
+    }
+
+    pub fn with_solc(mut self, build_info: SolcBuildInfo) -> Self {
+        self.solc = Some(build_info);
+        self
     }
 
     pub async fn build(&self) -> Result<BuildResult, LLMYError> {
@@ -79,11 +90,16 @@ impl CodeGraphBuilder {
         let mut fingerprint_entries = vec![];
 
         for (source, language) in sources {
-            let extraction = match language {
-                Language::Solidity => SolidityExtractor::extract(&source)?,
-                Language::Rust => RustExtractor::extract(&source)?,
-                Language::MoveAptos => MoveAptosExtractor::extract(&source)?,
-                Language::MoveSui => MoveSuiExtractor::extract(&source)?,
+            let compiled = match (&self.solc, language) {
+                (Some(solc), Language::Solidity) => solc.units.get(&source.relative),
+                _ => None,
+            };
+            let extraction = match (language, compiled) {
+                (Language::Solidity, Some(unit)) => SolcExtractor::extract(&source.relative, unit)?,
+                (Language::Solidity, None) => SolidityExtractor::extract(&source)?,
+                (Language::Rust, _) => RustExtractor::extract(&source)?,
+                (Language::MoveAptos, _) => MoveAptosExtractor::extract(&source)?,
+                (Language::MoveSui, _) => MoveSuiExtractor::extract(&source)?,
             };
             if extraction.parse_errors > 0 {
                 tracing::warn!(
@@ -103,6 +119,9 @@ impl CodeGraphBuilder {
         }
 
         fingerprint_entries.sort();
+        if let Some(solc) = &self.solc {
+            fingerprint_entries.push(format!("solc:{}", solc.fingerprint));
+        }
         let graph = GraphAssembler::assemble(extractions);
         Ok(BuildResult {
             graph,
@@ -202,6 +221,14 @@ struct GraphAssembler {
     callables_by_name: BTreeMap<String, Vec<i64>>,
     /// module name -> ids.
     modules_by_name: BTreeMap<String, Vec<i64>>,
+    /// Compiler declaration id -> graph id, for the extractions that carry
+    /// declaration ids; resolution by id beats resolution by name.
+    callables_by_node: BTreeMap<i64, i64>,
+    modules_by_node: BTreeMap<i64, i64>,
+    states_by_node: BTreeMap<i64, i64>,
+    /// module id -> its constructor, so a call that references a contract
+    /// (`new C(...)`, a base constructor specifier) resolves to a callable.
+    constructors: BTreeMap<i64, i64>,
 }
 
 impl GraphAssembler {
@@ -210,12 +237,16 @@ impl GraphAssembler {
             graph: CodeGraph::default(),
             callables_by_name: BTreeMap::new(),
             modules_by_name: BTreeMap::new(),
+            callables_by_node: BTreeMap::new(),
+            modules_by_node: BTreeMap::new(),
+            states_by_node: BTreeMap::new(),
+            constructors: BTreeMap::new(),
         };
         // Pass one: nodes with globally assigned ids. Raw call sites and
         // state refs are kept alongside for pass two.
         let mut pending_calls: Vec<(i64, crate::extract::RawCallSite, Language)> = vec![];
         let mut pending_states: Vec<(i64, i64, crate::extract::RawStateRef, Language)> = vec![];
-        let mut pending_parents: Vec<(i64, String)> = vec![];
+        let mut pending_parents: Vec<(i64, crate::extract::RawParent)> = vec![];
 
         let mut next_module = 1i64;
         let mut next_callable = 1i64;
@@ -241,12 +272,18 @@ impl GraphAssembler {
                     .entry(raw_module.name.clone())
                     .or_default()
                     .push(module_id);
+                if let Some(node) = raw_module.node_id {
+                    assembler.modules_by_node.insert(node, module_id);
+                }
                 for parent in raw_module.parents {
                     pending_parents.push((module_id, parent));
                 }
                 for raw_state in raw_module.states {
                     let state_id = next_state;
                     next_state += 1;
+                    if let Some(node) = raw_state.node_id {
+                        assembler.states_by_node.insert(node, state_id);
+                    }
                     assembler.graph.states.insert(
                         state_id,
                         StateItem {
@@ -263,6 +300,15 @@ impl GraphAssembler {
                 for raw_callable in raw_module.callables {
                     let callable_id = next_callable;
                     next_callable += 1;
+                    if let Some(node) = raw_callable.node_id {
+                        assembler.callables_by_node.insert(node, callable_id);
+                    }
+                    if raw_callable.kind == crate::model::CallableKind::Constructor {
+                        assembler
+                            .constructors
+                            .entry(module_id)
+                            .or_insert(callable_id);
+                    }
                     assembler.graph.callables.insert(
                         callable_id,
                         Callable {
@@ -295,11 +341,14 @@ impl GraphAssembler {
             }
         }
 
-        for (module_id, parent_name) in pending_parents {
-            let parent = match assembler.modules_by_name.get(&parent_name) {
-                Some(ids) if ids.len() == 1 => ParentRef::Resolved(ids[0]),
-                Some(ids) if !ids.is_empty() => ParentRef::Resolved(ids[0]),
-                _ => ParentRef::External(parent_name),
+        for (module_id, raw_parent) in pending_parents {
+            let by_node = raw_parent
+                .declaration
+                .and_then(|node| assembler.modules_by_node.get(&node).copied());
+            let parent = match (by_node, assembler.modules_by_name.get(&raw_parent.name)) {
+                (Some(id), _) => ParentRef::Resolved(id),
+                (None, Some(ids)) if !ids.is_empty() => ParentRef::Resolved(ids[0]),
+                _ => ParentRef::External(raw_parent.name),
             };
             assembler
                 .graph
@@ -335,6 +384,40 @@ impl GraphAssembler {
                 .get(&caller_id)
                 .map(|c| c.module_id)
                 .unwrap_or(0);
+
+            // A site that carries the compiler's declaration id resolves by
+            // that id: a callable, a contract (its constructor), or a state
+            // variable's public getter, which is a read rather than a call.
+            // An id the graph does not hold is code outside the indexed
+            // sources, so the site stays external without a name search.
+            if let Some(node) = site.declaration {
+                if let Some(state_id) = self.states_by_node.get(&node).copied() {
+                    self.graph.state_edges.push(StateEdge {
+                        callable_id: caller_id,
+                        state_id,
+                        access: crate::model::AccessKind::Read,
+                        line: site.line,
+                    });
+                    continue;
+                }
+                let target = self.callables_by_node.get(&node).copied().or_else(|| {
+                    self.modules_by_node
+                        .get(&node)
+                        .and_then(|module| self.constructors.get(module))
+                        .copied()
+                });
+                let callee = match target {
+                    Some(id) => CalleeRef::Resolved(id),
+                    None => CalleeRef::External(site.text.clone()),
+                };
+                self.graph.call_edges.push(CallEdge {
+                    caller_id,
+                    callee,
+                    callee_text: site.text,
+                    line: site.line,
+                });
+                continue;
+            }
 
             let mut candidates: Vec<i64> = self
                 .callables_by_name
@@ -414,13 +497,23 @@ impl GraphAssembler {
     }
 
     fn resolve_states(&mut self, pending: Vec<(i64, i64, crate::extract::RawStateRef, Language)>) {
-        let mut seen: BTreeSet<(i64, i64, bool)> = BTreeSet::new();
+        // One edge per access site: the lines matter to callers that order
+        // accesses against calls in the same body.
+        let mut seen: BTreeSet<(i64, i64, bool, usize)> = BTreeSet::new();
         for (callable_id, module_id, state_ref, language) in pending {
-            // Move objects/resources may live in another module of the
-            // project; Solidity/Rust state is scoped to the module (plus
-            // inherited contracts for Solidity).
-            let project_wide = matches!(language, Language::MoveAptos | Language::MoveSui);
-            let matched: Vec<i64> = if project_wide {
+            // A reference with the compiler's declaration id is exact: it
+            // either names an indexed state item or nothing at all (a local,
+            // a parameter, a declaration outside the indexed sources).
+            let matched: Vec<i64> = if let Some(node) = state_ref.declaration {
+                self.states_by_node
+                    .get(&node)
+                    .copied()
+                    .into_iter()
+                    .collect()
+            } else if matches!(language, Language::MoveAptos | Language::MoveSui) {
+                // Move objects/resources may live in another module of the
+                // project; Solidity/Rust state is scoped to the module (plus
+                // inherited contracts for Solidity).
                 self.graph
                     .states
                     .values()
@@ -441,7 +534,7 @@ impl GraphAssembler {
                 } else {
                     crate::model::AccessKind::Read
                 };
-                if seen.insert((callable_id, state_id, state_ref.write)) {
+                if seen.insert((callable_id, state_id, state_ref.write, state_ref.line)) {
                     self.graph.state_edges.push(StateEdge {
                         callable_id,
                         state_id,

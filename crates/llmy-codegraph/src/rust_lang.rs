@@ -66,6 +66,7 @@ impl RustExtractor {
                             kind: StateKind::AnchorAccount,
                             type_text: "#[account] struct".to_string(),
                             span: item.line_span(),
+                            node_id: None,
                         });
                     } else if attributes.iter().any(|a| a.contains("Accounts")) {
                         containers.insert(name, Self::container_fields(item, source));
@@ -93,6 +94,7 @@ impl RustExtractor {
                         kind,
                         type_text: type_node.text_of(source),
                         span: item.line_span(),
+                        node_id: None,
                     });
                 }
             }
@@ -137,6 +139,7 @@ impl RustExtractor {
                 parents: vec![],
                 callables,
                 states,
+                node_id: None,
             }],
             parse_errors,
         })
@@ -233,6 +236,7 @@ impl RustExtractor {
                         name: field.type_name.clone(),
                         write: field.mutable,
                         line: function.line_span().start_line,
+                        declaration: None,
                     });
                 }
             }
@@ -252,6 +256,7 @@ impl RustExtractor {
                             name: call_name,
                             qualifier: None,
                             line,
+                            declaration: None,
                         });
                     }
                     "scoped_identifier" => {
@@ -270,6 +275,7 @@ impl RustExtractor {
                             name: call_name,
                             qualifier,
                             line,
+                            declaration: None,
                         });
                     }
                     "field_expression" => {
@@ -291,6 +297,7 @@ impl RustExtractor {
                                     name: receiver.clone(),
                                     write: true,
                                     line,
+                                    declaration: None,
                                 });
                                 continue;
                             }
@@ -299,6 +306,7 @@ impl RustExtractor {
                                     name: receiver.clone(),
                                     write: false,
                                     line,
+                                    declaration: None,
                                 });
                                 continue;
                             }
@@ -309,6 +317,7 @@ impl RustExtractor {
                             name: method,
                             qualifier: Some(receiver),
                             line,
+                            declaration: None,
                         });
                     }
                     _ => {}
@@ -323,6 +332,7 @@ impl RustExtractor {
             span: function.line_span(),
             calls,
             state_refs,
+            node_id: None,
         }
     }
 }

@@ -7,11 +7,13 @@ pub mod extract;
 pub mod model;
 pub mod move_lang;
 pub mod rust_lang;
+pub mod solc;
 pub mod solidity;
 pub mod store;
 pub mod tools;
 
 pub use builder::{BuildResult, CodeGraphBuilder};
 pub use model::CodeGraph;
+pub use solc::{ForgeAstOptions, SolcBuildInfo};
 pub use store::CodeGraphStore;
 pub use tools::CodegraphContext;

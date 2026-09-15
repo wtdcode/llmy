@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 chrono.workspace = true
 color-eyre.workspace = true
+foundry-compilers-artifacts = "0.19"
 globset.workspace = true
 ignore.workspace = true
 itertools.workspace = true
@@ -18,7 +19,7 @@ schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sqlx.workspace = true
-tokio = { workspace = true, features = ["fs", "rt"] }
+tokio = { workspace = true, features = ["fs", "rt", "process"] }
 tracing.workspace = true
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"

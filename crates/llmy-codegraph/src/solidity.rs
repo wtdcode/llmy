@@ -10,7 +10,7 @@ use llmy_types::error::LLMYError;
 use tree_sitter::Node;
 
 use crate::extract::{
-    FileExtraction, GrammarSet, NodeUtil, RawCallSite, RawCallable, RawModule, RawState,
+    FileExtraction, GrammarSet, NodeUtil, RawCallSite, RawCallable, RawModule, RawParent, RawState,
     RawStateRef, SourceFile,
 };
 use crate::model::{CallableKind, Language, ModuleKind, StateKind};
@@ -68,6 +68,10 @@ impl SolidityExtractor {
             .children_of_kind("inheritance_specifier")
             .into_iter()
             .filter_map(|spec| spec.first_identifier(source))
+            .map(|name| RawParent {
+                name,
+                declaration: None,
+            })
             .collect();
 
         let mut states = vec![];
@@ -89,6 +93,7 @@ impl SolidityExtractor {
                     kind: StateKind::StateVariable,
                     type_text,
                     span: declaration.line_span(),
+                    node_id: None,
                 });
             }
 
@@ -107,6 +112,7 @@ impl SolidityExtractor {
             parents,
             callables,
             states,
+            node_id: None,
         }
     }
 
@@ -147,6 +153,7 @@ impl SolidityExtractor {
                     name: modifier_name,
                     qualifier: None,
                     line: invocation.line_span().start_line,
+                    declaration: None,
                 });
             }
         }
@@ -170,6 +177,7 @@ impl SolidityExtractor {
             span: node.line_span(),
             calls,
             state_refs,
+            node_id: None,
         }
     }
 
@@ -187,6 +195,7 @@ impl SolidityExtractor {
                     name,
                     qualifier: None,
                     line,
+                    declaration: None,
                 })
             }
             "member_expression" => {
@@ -209,6 +218,7 @@ impl SolidityExtractor {
                     name,
                     qualifier,
                     line,
+                    declaration: None,
                 })
             }
             _ => None,
@@ -266,6 +276,7 @@ impl SolidityExtractor {
                     name,
                     write: true,
                     line: write.line_span().start_line,
+                    declaration: None,
                 });
             }
         }
@@ -289,6 +300,7 @@ impl SolidityExtractor {
                 name: text,
                 write: false,
                 line: identifier.line_span().start_line,
+                declaration: None,
             });
         }
 
@@ -360,7 +372,14 @@ interface IToken {
         let counter = &extraction.modules[0];
         assert_eq!(counter.name, "Counter");
         assert_eq!(counter.kind, ModuleKind::Contract);
-        assert_eq!(counter.parents, vec!["Ownable".to_string()]);
+        assert_eq!(
+            counter
+                .parents
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Ownable"]
+        );
         let state_names: Vec<_> = counter.states.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(state_names, vec!["count", "balances"]);
         assert_eq!(counter.states[1].type_text, "mapping(address => uint256)");

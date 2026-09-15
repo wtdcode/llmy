@@ -71,6 +71,7 @@ impl MoveAptosExtractor {
                     kind: StateKind::MoveResource,
                     type_text: format!("struct has {}", abilities.join(", ")),
                     span: declaration.line_span(),
+                    node_id: None,
                 });
             }
 
@@ -86,6 +87,7 @@ impl MoveAptosExtractor {
             parents: vec![],
             callables,
             states,
+            node_id: None,
         }
     }
 
@@ -134,6 +136,7 @@ impl MoveAptosExtractor {
                             name: resource,
                             write,
                             line,
+                            declaration: None,
                         });
                     } else if call_name == "move_to" {
                         // `move_to(account, Counter { .. })` — the resource is
@@ -147,6 +150,7 @@ impl MoveAptosExtractor {
                                 name: packed,
                                 write: true,
                                 line,
+                                declaration: None,
                             });
                         }
                     }
@@ -159,6 +163,7 @@ impl MoveAptosExtractor {
                     name: call_name,
                     qualifier,
                     line,
+                    declaration: None,
                 });
             }
         }
@@ -170,6 +175,7 @@ impl MoveAptosExtractor {
             span: function.line_span(),
             calls,
             state_refs,
+            node_id: None,
         }
     }
 }
@@ -231,6 +237,7 @@ impl MoveSuiExtractor {
                     kind: StateKind::SuiObject,
                     type_text: format!("struct has {}", abilities.join(", ")),
                     span: declaration.line_span(),
+                    node_id: None,
                 });
             }
 
@@ -253,6 +260,7 @@ impl MoveSuiExtractor {
             parents: vec![],
             callables,
             states,
+            node_id: None,
         }
     }
 
@@ -297,6 +305,7 @@ impl MoveSuiExtractor {
                                 name: type_name,
                                 write: mutable,
                                 line,
+                                declaration: None,
                             });
                         }
                     }
@@ -306,6 +315,7 @@ impl MoveSuiExtractor {
                                 name: type_name,
                                 write: true,
                                 line,
+                                declaration: None,
                             });
                         }
                     }
@@ -346,6 +356,7 @@ impl MoveSuiExtractor {
                     name: call_name,
                     qualifier,
                     line: call.line_span().start_line,
+                    declaration: None,
                 });
             }
         }
@@ -357,6 +368,7 @@ impl MoveSuiExtractor {
             span: function.line_span(),
             calls,
             state_refs,
+            node_id: None,
         }
     }
 
