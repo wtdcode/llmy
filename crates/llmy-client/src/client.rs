@@ -1237,6 +1237,10 @@ impl LLMInner {
         for idx in 0..retry {
             // Selection paid for the first send; a retry is extra traffic on the
             // same key and costs another slot of its budget.
+            let pause = self.default_settings.retry_backoff(idx);
+            if !pause.is_zero() {
+                tokio::time::sleep(pause).await;
+            }
             if let (true, Some(claim)) = (idx > 0, claim.as_ref()) {
                 claim.charge_resend();
             }
@@ -1299,6 +1303,10 @@ impl LLMInner {
 
         let mut last = None;
         for idx in 0..retry {
+            let pause = self.default_settings.retry_backoff(idx);
+            if !pause.is_zero() {
+                tokio::time::sleep(pause).await;
+            }
             if let (true, Some(claim)) = (idx > 0, claim.as_ref()) {
                 claim.charge_resend();
             }
@@ -1928,6 +1936,9 @@ mod tests {
             llm_presence_penalty: None,
             llm_prompt_timeout: 0,
             llm_retry: 1,
+            llm_retry_backoff_secs: 0.0,
+            llm_retry_backoff_factor: 2.0,
+            llm_retry_backoff_max_secs: 16.0,
             tool_reject_retries: 32,
             unknown_tool_hard_reject: false,
             llm_max_completion_tokens: None,

@@ -187,6 +187,21 @@ macro_rules! make_openai_args {
             #[arg(long = concat!($long, "llm-retry"), env = concat!($prefix, "LLM_RETRY"), default_value_t = 5)]
             pub llm_retry: u64,
 
+            /// Pause before the first retry of a failed request, in seconds
+            /// (0 retries at once); each further retry waits
+            /// `llm-retry-backoff-factor` times longer, capped at
+            /// `llm-retry-backoff-max-secs`.
+            #[arg(long = concat!($long, "llm-retry-backoff-secs"), env = concat!($prefix, "LLM_RETRY_BACKOFF_SECS"), default_value_t = 1.0)]
+            pub llm_retry_backoff_secs: f64,
+
+            /// Multiplier applied to the retry pause after each retry.
+            #[arg(long = concat!($long, "llm-retry-backoff-factor"), env = concat!($prefix, "LLM_RETRY_BACKOFF_FACTOR"), default_value_t = 2.0)]
+            pub llm_retry_backoff_factor: f64,
+
+            /// Upper bound on the retry pause, in seconds (0 = no cap).
+            #[arg(long = concat!($long, "llm-retry-backoff-max-secs"), env = concat!($prefix, "LLM_RETRY_BACKOFF_MAX_SECS"), default_value_t = 16.0)]
+            pub llm_retry_backoff_max_secs: f64,
+
             /// Retries after a model turn is discarded by tool-call
             /// validation (malformed call or tool rejection); the model is
             /// re-asked from a clean context each time.
@@ -325,6 +340,9 @@ macro_rules! make_openai_args {
                     llm_presence_penalty: self.llm_presence_penalty,
                     llm_prompt_timeout: self.llm_prompt_timeout,
                     llm_retry: self.llm_retry,
+                    llm_retry_backoff_secs: self.llm_retry_backoff_secs,
+                    llm_retry_backoff_factor: self.llm_retry_backoff_factor,
+                    llm_retry_backoff_max_secs: self.llm_retry_backoff_max_secs,
                     tool_reject_retries: self.llm_tool_reject_retries,
                     unknown_tool_hard_reject: self.llm_unknown_tool_hard_reject,
                     llm_concurrent: self.llm_concurrent,

@@ -370,6 +370,17 @@ pub fn extract_raw_text(req: &CreateChatCompletionRequestRaw) -> String {
                 }
             },
             ChatCompletionRequestMessageRaw::Assistant(ass) => {
+                // Replayed reasoning rides the wire as the
+                // `reasoning_content` extra (see `Message::to_chat_messages`)
+                // and backends that accept it bill it as prompt tokens, so
+                // the estimate must count it too. `reasoning` covers
+                // passthrough requests written for providers using that
+                // spelling.
+                for key in ["reasoning_content", "reasoning"] {
+                    if let Some(serde_json::Value::String(reasoning)) = ass.other.get(key) {
+                        parts.push(reasoning.clone());
+                    }
+                }
                 if let Some(content) = &ass.content {
                     match content {
                         ChatCompletionRequestAssistantMessageContent::Text(t) => {
@@ -1467,5 +1478,37 @@ INSERT INTO prefix_billing VALUES (1, 'planner', 10, 2, 5, 1, 1.5);
         .unwrap();
         let row = db.get_row(id).await.unwrap().expect("row missing");
         assert_eq!(row.cache_write_tokens, Some(4));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimate_text_counts_replayed_reasoning() {
+        // The fixture mirrors what `Message::to_chat_messages` puts on the
+        // wire: reasoning as a message-level extra next to the content.
+        let request: CreateChatCompletionRequestRaw = serde_json::from_str(
+            r#"{
+                "model": "deepseek-v4-flash",
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer",
+                     "reasoning_content": "REASONING_MARKER thinking it through"},
+                    {"role": "assistant", "content": "later", "reasoning": "ALT_SPELLING_MARKER"}
+                ]
+            }"#,
+        )
+        .expect("request json");
+
+        let text = extract_raw_text(&request);
+        assert!(text.contains("question"), "{text}");
+        assert!(text.contains("answer"), "{text}");
+        assert!(
+            text.contains("REASONING_MARKER thinking it through"),
+            "{text}"
+        );
+        assert!(text.contains("ALT_SPELLING_MARKER"), "{text}");
     }
 }

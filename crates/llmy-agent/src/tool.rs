@@ -426,7 +426,7 @@ impl ToolBox {
                 parsed.push(None);
                 continue;
             };
-            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.tool_args) else {
+            let Some(arguments) = Self::parse_arguments(&call.tool_args) else {
                 return Err(LLMYError::IncorrectToolCall(
                     call.tool_name.clone(),
                     call.tool_args.clone(),
@@ -452,6 +452,118 @@ impl ToolBox {
             parsed.push(Some(arguments));
         }
         Ok(parsed)
+    }
+
+    /// Parses the wire arguments of a tool call. Models sometimes write a string value
+    /// without quotes (`"include": *.sol`); when strict parsing fails, the bare tokens are
+    /// quoted and the text parsed again, so a call the model meant well is not discarded.
+    fn parse_arguments(text: &str) -> Option<serde_json::Value> {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+            return Some(value);
+        }
+        let repaired = Self::quote_bare_tokens(text);
+        if repaired == text {
+            return None;
+        }
+        match serde_json::from_str::<serde_json::Value>(&repaired) {
+            Ok(value) => {
+                tracing::debug!("tool arguments repaired by quoting bare tokens: {text}");
+                Some(value)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Quotes every value that starts outside a string with a character JSON does not allow
+    /// there (`*.sol`, `src/**`), up to the next `,`, `}` or `]` outside a string. Numbers,
+    /// `true`, `false` and `null` stay as they are.
+    fn quote_bare_tokens(text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len() + 16);
+        let mut i = 0;
+        let mut in_string = false;
+        let mut escaped = false;
+        // Whether the next non-space character starts a value (after `:` or inside an array
+        // after `[` or `,`); tracked with a stack of container kinds.
+        let mut containers: Vec<char> = Vec::new();
+        let mut expect_value = false;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_string {
+                out.push(c);
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                '"' => {
+                    in_string = true;
+                    expect_value = false;
+                    out.push(c);
+                }
+                '{' => {
+                    containers.push('{');
+                    expect_value = false;
+                    out.push(c);
+                }
+                '[' => {
+                    containers.push('[');
+                    expect_value = true;
+                    out.push(c);
+                }
+                '}' | ']' => {
+                    containers.pop();
+                    expect_value = false;
+                    out.push(c);
+                }
+                ':' => {
+                    expect_value = true;
+                    out.push(c);
+                }
+                ',' => {
+                    expect_value = containers.last() == Some(&'[');
+                    out.push(c);
+                }
+                c if c.is_whitespace() => out.push(c),
+                _ => {
+                    if !expect_value {
+                        out.push(c);
+                        i += 1;
+                        continue;
+                    }
+                    // A bare token runs to the next separator outside a string.
+                    let start = i;
+                    let mut end = i;
+                    while end < chars.len() && !matches!(chars[end], ',' | '}' | ']') {
+                        end += 1;
+                    }
+                    let token: String = chars[start..end].iter().collect();
+                    let trimmed = token.trim_end();
+                    let trailing = &token[trimmed.len()..];
+                    let literal = matches!(trimmed, "true" | "false" | "null")
+                        || trimmed.parse::<f64>().is_ok();
+                    if literal {
+                        out.push_str(&token);
+                    } else {
+                        out.push('"');
+                        out.push_str(&trimmed.replace('"', "\\\""));
+                        out.push('"');
+                        out.push_str(trailing);
+                    }
+                    expect_value = false;
+                    i = end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
     }
 
     /// Renders the registered tool names, optionally with their descriptions.
@@ -768,5 +880,39 @@ mod tests {
             .expect_err("invalid schema must refuse registration");
         assert!(error.to_string().contains("bad_schema_tool"), "{error}");
         assert_eq!(tools.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod bare_token_tests {
+    use super::ToolBox;
+
+    #[test]
+    fn bare_globs_are_quoted_and_literals_kept() {
+        let raw = r#"{"directory": ".", "max_matches": 20, "pattern": "a|b", "include": *.sol, "exclude": src/**, "flag": true}"#;
+        let value = ToolBox::parse_arguments(raw).expect("repaired");
+        assert_eq!(value["include"], "*.sol");
+        assert_eq!(value["exclude"], "src/**");
+        assert_eq!(value["max_matches"], 20);
+        assert_eq!(value["flag"], true);
+        assert_eq!(value["pattern"], "a|b");
+    }
+
+    #[test]
+    fn bare_tokens_inside_arrays_are_quoted() {
+        let raw = r#"{"include": [*.sol, test/**/*.t.sol], "pattern": "x"}"#;
+        let value = ToolBox::parse_arguments(raw).expect("repaired");
+        assert_eq!(value["include"][0], "*.sol");
+        assert_eq!(value["include"][1], "test/**/*.t.sol");
+    }
+
+    #[test]
+    fn valid_json_and_hopeless_text_are_untouched() {
+        let raw = r#"{"pattern": "a: b, c"}"#;
+        assert_eq!(
+            ToolBox::parse_arguments(raw).expect("valid")["pattern"],
+            "a: b, c"
+        );
+        assert!(ToolBox::parse_arguments("not json at all").is_none());
     }
 }
