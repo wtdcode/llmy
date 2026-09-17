@@ -4,8 +4,8 @@ use llmy_agent::LLMYError;
 use llmy_agent_derive::tool;
 
 use super::common::{
-    DeleteFileArgs, EditFileArgs, FindFileArgs, GrepDirectoryArgs, ListDirectoryToolArgs,
-    ReadFileToolArgs, WriteFileArgs, delete_file_at_path, edit_file_at_path,
+    DeleteFileArgs, EditFileArgs, FileToolConfig, FindFileArgs, GrepDirectoryArgs,
+    ListDirectoryToolArgs, ReadFileToolArgs, WriteFileArgs, delete_file_at_path, edit_file_at_path,
     find_file_blocking_at_path, grep_directory_blocking_at_path, list_directory_at_path,
     list_files_relative, read_file_at_path, sanitize_join_relative_path, write_file_at_path,
 };
@@ -27,12 +27,19 @@ use super::prompt::{
 pub struct ReadFileTool {
     /// Root directory that all file operations are constrained to.
     pub cwd: PathBuf,
+    /// Size limits for this tool instance.
+    pub config: FileToolConfig,
 }
 
 impl ReadFileTool {
-    /// Creates a file-reading tool rooted at `cwd`.
+    /// Creates a file-reading tool rooted at `cwd`, with default limits.
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self::with_config(cwd, FileToolConfig::default())
+    }
+
+    /// Creates a file-reading tool rooted at `cwd` with the given limits.
+    pub fn with_config(cwd: PathBuf, config: FileToolConfig) -> Self {
+        Self { cwd, config }
     }
 
     /// Reads a whole file or a requested line range from `file_path`.
@@ -42,7 +49,7 @@ impl ReadFileTool {
             Err(error) => return Ok(error),
         };
 
-        read_file_at_path(&target_path, &args.file_path, &args).await
+        read_file_at_path(&target_path, &args.file_path, &args, &self.config).await
     }
 }
 
@@ -135,29 +142,47 @@ impl FindFileTool {
 pub struct GrepDirectoryTool {
     /// Root directory that all file operations are constrained to.
     pub cwd: PathBuf,
+    /// Size limits for this tool instance.
+    pub config: FileToolConfig,
 }
 
 impl GrepDirectoryTool {
-    /// Creates a recursive content-search tool rooted at `cwd`.
+    /// Creates a recursive content-search tool rooted at `cwd`, with default
+    /// limits.
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self::with_config(cwd, FileToolConfig::default())
     }
 
-    fn grep_directory_blocking(cwd: PathBuf, args: GrepDirectoryArgs) -> Result<String, LLMYError> {
+    /// Creates a recursive content-search tool rooted at `cwd` with the
+    /// given limits.
+    pub fn with_config(cwd: PathBuf, config: FileToolConfig) -> Self {
+        Self { cwd, config }
+    }
+
+    fn grep_directory_blocking(
+        cwd: PathBuf,
+        config: FileToolConfig,
+        args: GrepDirectoryArgs,
+    ) -> Result<String, LLMYError> {
         let target_path = match sanitize_join_relative_path(&cwd, &args.directory) {
             Ok(path) => path,
             Err(error) => return Ok(error),
         };
 
-        grep_directory_blocking_at_path(&target_path, &args.directory, &args, move |path| {
-            path.strip_prefix(&cwd).unwrap_or(path).to_path_buf()
-        })
+        grep_directory_blocking_at_path(
+            &target_path,
+            &args.directory,
+            &args,
+            &config,
+            move |path| path.strip_prefix(&cwd).unwrap_or(path).to_path_buf(),
+        )
     }
 
     /// Recursively searches `directory` for lines matching `pattern`.
     pub async fn grep_directory(&self, args: GrepDirectoryArgs) -> Result<String, LLMYError> {
         let cwd = self.cwd.clone();
-        tokio::task::spawn_blocking(move || Self::grep_directory_blocking(cwd, args))
+        let config = self.config.clone();
+        tokio::task::spawn_blocking(move || Self::grep_directory_blocking(cwd, config, args))
             .await
             .expect("fail to join")
     }

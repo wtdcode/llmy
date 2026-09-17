@@ -24,6 +24,32 @@ pub const DEFAULT_GREP_MAX_MATCHES: usize = 50;
 /// truncated. Keeps a single minified line from flooding the output.
 const MAX_GREP_LINE_BYTES: usize = 512;
 
+/// Size limits for the file tools, configurable per tool instance. The
+/// defaults keep the historical hard-coded values, so tools built through
+/// the plain constructors behave exactly as before.
+#[derive(Debug, Clone)]
+pub struct FileToolConfig {
+    /// Cap on the bytes a single file read returns — applies to both the
+    /// sliced text and the binary hexdump preview.
+    pub max_read_bytes: usize,
+    /// Cap on matching lines a directory grep returns when the call itself
+    /// does not set `max_matches`.
+    pub default_grep_max_matches: usize,
+    /// Cap on the rendered bytes of a single matching grep line, keeping one
+    /// minified line from flooding the output.
+    pub max_grep_line_bytes: usize,
+}
+
+impl Default for FileToolConfig {
+    fn default() -> Self {
+        Self {
+            max_read_bytes: MAX_READ_BYTES,
+            default_grep_max_matches: DEFAULT_GREP_MAX_MATCHES,
+            max_grep_line_bytes: MAX_GREP_LINE_BYTES,
+        }
+    }
+}
+
 /// Joins a relative path to `cwd` while rejecting absolute and parent-traversal paths.
 pub fn sanitize_join_relative_path(cwd: &Path, rpath: &Path) -> Result<PathBuf, String> {
     if rpath.is_absolute() {
@@ -208,12 +234,12 @@ fn validate_read_range(args: &ReadFileToolArgs) -> Result<(usize, Option<usize>)
     Ok((start_line, args.line_count))
 }
 
-fn truncate_text(mut text: String) -> String {
-    if text.len() <= MAX_READ_BYTES {
+fn truncate_text(mut text: String, max_read_bytes: usize) -> String {
+    if text.len() <= max_read_bytes {
         return text;
     }
 
-    let mut cutoff = MAX_READ_BYTES;
+    let mut cutoff = max_read_bytes;
     while cutoff > 0 && !text.is_char_boundary(cutoff) {
         cutoff -= 1;
     }
@@ -234,6 +260,7 @@ fn slice_text_lines(
     display_path: &Path,
     start_line: usize,
     line_count: Option<usize>,
+    max_read_bytes: usize,
 ) -> String {
     let total_lines = total_line_count(text);
     if start_line > 1 && start_line > total_lines {
@@ -254,13 +281,14 @@ fn slice_text_lines(
         .unwrap_or(lines.len())
         .min(lines.len());
 
-    truncate_text(lines[start_index..end_index].concat())
+    truncate_text(lines[start_index..end_index].concat(), max_read_bytes)
 }
 
 pub async fn read_file_at_path(
     target_path: &Path,
     display_path: &Path,
     args: &ReadFileToolArgs,
+    config: &FileToolConfig,
 ) -> Result<String, LLMYError> {
     let (start_line, line_count) = match validate_read_range(args) {
         Ok(range) => range,
@@ -297,11 +325,12 @@ pub async fn read_file_at_path(
             display_path,
             start_line,
             line_count,
+            config.max_read_bytes,
         )),
         Err(error) => {
             let bytes = error.into_bytes();
             Ok(render_binary_preview(
-                &bytes[..bytes.len().min(MAX_READ_BYTES)],
+                &bytes[..bytes.len().min(config.max_read_bytes)],
             ))
         }
     }
@@ -376,13 +405,13 @@ struct GrepMatch {
     content: String,
 }
 
-/// Truncates a single line to [`MAX_GREP_LINE_BYTES`] on a char boundary.
-fn truncate_line(line: &str) -> String {
-    if line.len() <= MAX_GREP_LINE_BYTES {
+/// Truncates a single line to `max_grep_line_bytes` on a char boundary.
+fn truncate_line(line: &str, max_grep_line_bytes: usize) -> String {
+    if line.len() <= max_grep_line_bytes {
         return line.to_string();
     }
 
-    let mut cutoff = MAX_GREP_LINE_BYTES;
+    let mut cutoff = max_grep_line_bytes;
     while cutoff > 0 && !line.is_char_boundary(cutoff) {
         cutoff -= 1;
     }
@@ -423,6 +452,7 @@ struct GrepSink<'a> {
     display: &'a str,
     invert: Option<&'a RegexMatcher>,
     limit: usize,
+    max_line_bytes: usize,
 }
 
 impl Sink for GrepSink<'_> {
@@ -441,7 +471,7 @@ impl Sink for GrepSink<'_> {
         self.matches.push(GrepMatch {
             display: self.display.to_string(),
             line_number: mat.line_number().unwrap_or(0),
-            content: truncate_line(trimmed),
+            content: truncate_line(trimmed, self.max_line_bytes),
         });
 
         // Stop searching this file once the global limit is reached.
@@ -458,6 +488,7 @@ pub fn grep_directory_blocking_at_path<F>(
     target_path: &Path,
     display_path: &Path,
     args: &GrepDirectoryArgs,
+    config: &FileToolConfig,
     display_match_path: F,
 ) -> Result<String, LLMYError>
 where
@@ -467,7 +498,7 @@ where
         return Ok(format!("{:?} is not a directory", display_path));
     }
 
-    let limit = args.max_matches.unwrap_or(DEFAULT_GREP_MAX_MATCHES);
+    let limit = args.max_matches.unwrap_or(config.default_grep_max_matches);
     if limit == 0 {
         return Ok("max_matches must be greater than or equal to 1".to_string());
     }
@@ -532,6 +563,7 @@ where
             display: &display,
             invert: invert_matcher.as_ref(),
             limit,
+            max_line_bytes: config.max_grep_line_bytes,
         };
 
         if let Err(error) = searcher.search_path(&matcher, path, sink) {

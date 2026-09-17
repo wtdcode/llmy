@@ -11,8 +11,8 @@ pub use absolute::{
     AbsoluteWriteFileTool,
 };
 pub use common::{
-    DeleteFileArgs, EditFileArgs, FindFileArgs, GrepDirectoryArgs, ListDirectoryToolArgs,
-    ReadFileToolArgs, WriteFileArgs, sanitize_join_relative_path,
+    DeleteFileArgs, EditFileArgs, FileToolConfig, FindFileArgs, GrepDirectoryArgs,
+    ListDirectoryToolArgs, ReadFileToolArgs, WriteFileArgs, sanitize_join_relative_path,
 };
 pub use relative::{
     DeleteFileTool, EditFileTool, FindFileTool, GrepDirectoryTool, ListDirectoryTool, ReadFileTool,
@@ -208,5 +208,77 @@ mod tests {
             result.contains("repeat.txt:1:value FOOfoo here"),
             "{result}"
         );
+    }
+
+    #[tokio::test]
+    async fn config_caps_read_bytes() {
+        let dir = tempdir().unwrap();
+        tokio::fs::write(dir.path().join("big.txt"), "x".repeat(100))
+            .await
+            .unwrap();
+
+        let tool = ReadFileTool::with_config(
+            dir.path().to_path_buf(),
+            FileToolConfig {
+                max_read_bytes: 10,
+                ..FileToolConfig::default()
+            },
+        );
+        let result = tool
+            .read_file(ReadFileToolArgs {
+                file_path: PathBuf::from("big.txt"),
+                start_line: None,
+                line_count: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 10);
+
+        // The plain constructor keeps the historical default.
+        let result = ReadFileTool::new(dir.path().to_path_buf())
+            .read_file(ReadFileToolArgs {
+                file_path: PathBuf::from("big.txt"),
+                start_line: None,
+                line_count: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn config_caps_grep_default_matches_and_line_bytes() {
+        let dir = tempdir().unwrap();
+        seed_grep_workspace(dir.path()).await;
+        tokio::fs::write(
+            dir.path().join("long.txt"),
+            format!("TODO {}\n", "y".repeat(300)),
+        )
+        .await
+        .unwrap();
+
+        let tool = GrepDirectoryTool::with_config(
+            dir.path().to_path_buf(),
+            FileToolConfig {
+                default_grep_max_matches: 1,
+                max_grep_line_bytes: 16,
+                ..FileToolConfig::default()
+            },
+        );
+
+        // No max_matches in the call: the configured default applies.
+        let result = tool.grep_directory(grep_args(".", "TODO")).await.unwrap();
+        assert!(result.contains("Found 1 matching line(s)"), "{result}");
+        assert!(
+            result.contains("reached the max_matches limit of 1"),
+            "{result}"
+        );
+
+        // Matching lines are truncated at the configured byte cap.
+        let mut args = grep_args(".", "TODO");
+        args.include = vec!["long.txt".to_string()];
+        let result = tool.grep_directory(args).await.unwrap();
+        assert!(result.contains("[line truncated]"), "{result}");
+        assert!(!result.contains(&"y".repeat(30)), "{result}");
     }
 }

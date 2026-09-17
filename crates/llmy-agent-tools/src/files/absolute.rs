@@ -11,10 +11,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use super::common::{
-    DeleteFileArgs, EditFileArgs, FindFileArgs, GrepDirectoryArgs, ReadFileToolArgs, WriteFileArgs,
-    delete_file_at_path, edit_file_at_path, find_file_blocking_at_path,
-    grep_directory_blocking_at_path, list_directory_at_path, list_files_absolute,
-    read_file_at_path, write_file_at_path,
+    DeleteFileArgs, EditFileArgs, FileToolConfig, FindFileArgs, GrepDirectoryArgs,
+    ReadFileToolArgs, WriteFileArgs, delete_file_at_path, edit_file_at_path,
+    find_file_blocking_at_path, grep_directory_blocking_at_path, list_directory_at_path,
+    list_files_absolute, read_file_at_path, write_file_at_path,
 };
 use super::prompt::{
     ABSOLUTE_DELETE_FILE_TOOL_DESCRIPTION, ABSOLUTE_EDIT_FILE_TOOL_DESCRIPTION,
@@ -42,16 +42,24 @@ pub struct AbsoluteListDirectoryToolArgs {
     name = "read_file",
     description = ABSOLUTE_READ_FILE_TOOL_DESCRIPTION,
 )]
-pub struct AbsoluteReadFileTool {}
+pub struct AbsoluteReadFileTool {
+    /// Size limits for this tool instance.
+    pub config: FileToolConfig,
+}
 
 impl AbsoluteReadFileTool {
     pub fn new() -> Self {
-        Self {}
+        Self::default()
+    }
+
+    /// Creates a direct-path file-reading tool with the given limits.
+    pub fn with_config(config: FileToolConfig) -> Self {
+        Self { config }
     }
 
     pub async fn read_file(&self, args: ReadFileToolArgs) -> Result<String, LLMYError> {
         let target_path = args.file_path.clone();
-        read_file_at_path(&target_path, &args.file_path, &args).await
+        read_file_at_path(&target_path, &args.file_path, &args, &self.config).await
     }
 }
 
@@ -128,22 +136,34 @@ impl AbsoluteFindFileTool {
     name = "grep",
     description = ABSOLUTE_GREP_TOOL_DESCRIPTION,
 )]
-pub struct AbsoluteGrepDirectoryTool {}
+pub struct AbsoluteGrepDirectoryTool {
+    /// Size limits for this tool instance.
+    pub config: FileToolConfig,
+}
 
 impl AbsoluteGrepDirectoryTool {
     pub fn new() -> Self {
-        Self {}
+        Self::default()
     }
 
-    fn grep_directory_blocking(args: GrepDirectoryArgs) -> Result<String, LLMYError> {
+    /// Creates a direct-path content-search tool with the given limits.
+    pub fn with_config(config: FileToolConfig) -> Self {
+        Self { config }
+    }
+
+    fn grep_directory_blocking(
+        config: FileToolConfig,
+        args: GrepDirectoryArgs,
+    ) -> Result<String, LLMYError> {
         let target_path = args.directory.clone();
-        grep_directory_blocking_at_path(&target_path, &args.directory, &args, |path| {
+        grep_directory_blocking_at_path(&target_path, &args.directory, &args, &config, |path| {
             path.to_path_buf()
         })
     }
 
     pub async fn grep_directory(&self, args: GrepDirectoryArgs) -> Result<String, LLMYError> {
-        tokio::task::spawn_blocking(move || Self::grep_directory_blocking(args))
+        let config = self.config.clone();
+        tokio::task::spawn_blocking(move || Self::grep_directory_blocking(config, args))
             .await
             .expect("fail to join")
     }
