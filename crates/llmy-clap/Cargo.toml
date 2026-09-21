@@ -12,9 +12,14 @@ repository.workspace = true
 clap = {workspace = true, features = ["derive", "env"]}
 rust_decimal = { workspace = true, features = ["macros"] }
 color-eyre.workspace = true
+serde = { workspace = true, features = ["derive"] }
+toml.workspace = true
 tracing.workspace = true
 llmy-client.workspace = true
 llmy-types.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = ["rustls"]

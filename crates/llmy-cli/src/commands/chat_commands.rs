@@ -75,9 +75,13 @@ pub(crate) async fn run_chat_command(
         }
         ChatCommand::Tokens => {
             let billing = llm.billing_snapshot();
-            let approx_context_tokens = agent.approx_context_tokens(&llm.model.config);
+            let approx_context_tokens = agent.approx_context_tokens(&llm.targets[0].model.config);
             print_command_output(
-                &format_token_usage(&billing, approx_context_tokens, &llm.model.config),
+                &format_token_usage(
+                    &billing,
+                    approx_context_tokens,
+                    &llm.targets[0].model.config,
+                ),
                 is_tty,
             );
         }

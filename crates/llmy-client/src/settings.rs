@@ -34,6 +34,17 @@ impl FromStr for LLMToolChoice {
     }
 }
 
+// Hand-written instead of derived: the CLI string format has sugar the wire
+// JSON shape does not — any string that is not a mode names a custom tool —
+// and TOML profiles must accept exactly the CLI strings, not the wire form.
+impl<'de> serde::Deserialize<'de> for LLMToolChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse()
+            .map_err(|infallible: std::convert::Infallible| match infallible {})
+    }
+}
+
 impl Deref for LLMToolChoice {
     type Target = ChatCompletionToolChoiceOption;
     fn deref(&self) -> &Self::Target {
@@ -59,7 +70,8 @@ impl From<LLMToolChoice> for ChatCompletionToolChoiceOption {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(transparent)]
 pub struct Reasoning(pub ReasoningEffort);
 
 impl Reasoning {

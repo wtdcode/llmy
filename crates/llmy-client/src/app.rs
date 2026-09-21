@@ -21,11 +21,13 @@ const CLAUDE_CODE_SDK_VERSION: &str = "0.70.1";
 const CODEX_VERSION: &str = "0.50.0";
 
 /// A known application whose request annotation can be mimicked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AppIdentityPreset {
     /// llmy announcing itself honestly.
     Llmy,
     /// Claude Code's CLI headers.
+    #[serde(alias = "claude-code", alias = "claude_code")]
     Claude,
     /// Codex CLI's headers.
     Codex,

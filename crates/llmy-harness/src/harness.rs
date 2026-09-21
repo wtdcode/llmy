@@ -5,10 +5,10 @@ use llmy_agent_tools::memory::{
 };
 use llmy_client::debug::completion_to_string;
 use llmy_client::model::OpenAIModel;
-use llmy_client::req::{ChatCompletionRequestMessageRaw, PromptCacheMode, PromptCacheOptionsRaw};
+use llmy_client::req::{ChatCompletionRequestMessageRaw, PromptCacheMode};
 use llmy_client::resp::{ChatChoice, FinishReason};
 use llmy_client::{
-    client::{LLM, LLMRequest, Message, MessagePart, RawExtensibleChatCompletionRequest},
+    client::{LLM, Message, MessagePart},
     model::ModelConfig,
     settings::LLMSettings,
 };
@@ -227,46 +227,6 @@ impl Agent {
     /// Skipped for models that don't address their cache by breakpoint: the
     /// field is unknown to them, and strict providers reject unknown request
     /// fields outright.
-    fn apply_cache_options(&self, llm: &LLM, req: &mut RawExtensibleChatCompletionRequest) {
-        let Some(mode) = self.cache_mode else {
-            return;
-        };
-        let policy = llm.model.cache_policy();
-        if !policy.needs_breakpoints() {
-            tracing::warn!(
-                "dropping prompt cache mode {:?}: {} caches by {}, not by breakpoint",
-                mode,
-                llm.model,
-                policy
-            );
-            return;
-        }
-        req.prompt_cache_options = Some(PromptCacheOptionsRaw::with_mode(mode));
-    }
-
-    /// [`Agent::apply_cache_options`] for a native responses request — the
-    /// protocol took the same GPT-5.6 explicit-caching fields as chat.
-    fn apply_responses_cache_options(
-        &self,
-        llm: &LLM,
-        req: &mut llmy_client::responses::ResponsesRequest,
-    ) {
-        let Some(mode) = self.cache_mode else {
-            return;
-        };
-        let policy = llm.model.cache_policy();
-        if !policy.needs_breakpoints() {
-            tracing::warn!(
-                "dropping prompt cache mode {:?}: {} caches by {}, not by breakpoint",
-                mode,
-                llm.model,
-                policy
-            );
-            return;
-        }
-        req.prompt_cache_options = Some(PromptCacheOptionsRaw::with_mode(mode));
-    }
-
     pub fn render_context(&self) -> String {
         Message::many_to_chat(&self.conversation_context())
             .iter()
@@ -326,14 +286,18 @@ impl Agent {
         debug_prefix: Option<&str>,
         settings: Option<LLMSettings>,
     ) -> Result<StepResult, LLMYError> {
-        let config = self.config.from_model(&llm.model);
+        let config = self.config.from_model(&llm.targets[0].model);
 
         let current_context = self.context.clone();
         let conversation = self.conversation_context();
         let cache_key = self.cache_key.as_deref();
-        let settings = settings.unwrap_or_else(|| llm.default_settings.clone());
-        let timeout = settings.timeout();
-        let retry = settings.llm_retry;
+        // An explicit override applies to every fallback target (and supplies
+        // the harness-level knobs below); without one each target runs on its
+        // own profile's settings, and the harness knobs come from the primary.
+        let settings_override = settings;
+        let settings = settings_override
+            .clone()
+            .unwrap_or_else(|| llm.targets[0].settings.clone());
 
         // A turn discarded in validation — a malformed tool call
         // (`IncorrectToolCall`) or a tool's own rejection
@@ -345,21 +309,17 @@ impl Agent {
         let mut reject_attempts: u64 = 0;
         let (step_result, extra_messages, assistant_message) = loop {
             let tools = (self.tools.len() != 0).then(|| self.tools.openai_objects());
-            // The context is protocol-neutral; the client builds the backend's
-            // native request from it directly.
-            let mut req =
-                llm.build_conversation_request(&conversation, cache_key, &settings, tools)?;
-            match &mut req {
-                LLMRequest::Chat(chat) => self.apply_cache_options(llm, chat),
-                LLMRequest::Responses(resp) => self.apply_responses_cache_options(llm, resp),
-                LLMRequest::Anthropic(_) => {}
-            }
+            // The context is protocol-neutral; whichever fallback target the
+            // client tries builds its own native request from it, with the
+            // cache options fitting that target's model.
             let (mut resp, assistant_native) = llm
-                .complete_request_message_once_with_retry(
-                    req,
+                .complete_conversation_message_once_with_retry(
+                    &conversation,
+                    cache_key,
+                    tools,
+                    self.cache_mode,
+                    settings_override.as_ref(),
                     debug_prefix,
-                    Some(timeout),
-                    Some(retry),
                 )
                 .await?;
 
@@ -770,6 +730,7 @@ fn render_memory_entry(memory: &AgentMemoryContent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use llmy_client::client::LLMRequest;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1481,20 +1442,10 @@ mod tests {
 
     #[test]
     fn cache_options_are_absent_until_toggled() {
+        // `step` attaches cache options only when a mode was toggled on; a
+        // fresh agent carries none.
         let agent = cache_test_agent();
-        let llm = cache_test_llm("openai/gpt-5.6-sol");
         assert_eq!(agent.breakpoint_mode(), None);
-
-        let mut req = llm
-            .build_chat_request(
-                Message::many_to_chat(&agent.conversation_context()),
-                None,
-                &cache_test_settings(),
-                None,
-            )
-            .unwrap();
-        agent.apply_cache_options(&llm, &mut req);
-        assert!(req.prompt_cache_options.is_none());
     }
 
     #[test]
@@ -1510,7 +1461,7 @@ mod tests {
             agent.toggle_breakpoint_implicit(explicit);
             assert_eq!(agent.breakpoint_mode(), Some(expected));
 
-            let mut req = llm
+            let chat = llm
                 .build_chat_request(
                     Message::many_to_chat(&agent.conversation_context()),
                     None,
@@ -1518,9 +1469,13 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            agent.apply_cache_options(&llm, &mut req);
+            let mut req = LLMRequest::Chat(chat);
+            llm.targets[0].apply_cache_mode(&mut req, expected);
+            let LLMRequest::Chat(chat) = req else {
+                panic!("a chat request stays chat");
+            };
             assert_eq!(
-                req.prompt_cache_options.as_ref().map(|o| o.inner.mode),
+                chat.prompt_cache_options.as_ref().map(|o| o.inner.mode),
                 Some(Some(expected))
             );
         }
@@ -1534,7 +1489,7 @@ mod tests {
         let mut agent = cache_test_agent();
         agent.toggle_breakpoint_implicit(true);
 
-        let mut req = llm
+        let chat = llm
             .build_chat_request(
                 Message::many_to_chat(&agent.conversation_context()),
                 None,
@@ -1542,8 +1497,12 @@ mod tests {
                 None,
             )
             .unwrap();
-        agent.apply_cache_options(&llm, &mut req);
-        assert!(req.prompt_cache_options.is_none());
+        let mut req = LLMRequest::Chat(chat);
+        llm.targets[0].apply_cache_mode(&mut req, PromptCacheMode::Explicit);
+        let LLMRequest::Chat(chat) = req else {
+            panic!("a chat request stays chat");
+        };
+        assert!(chat.prompt_cache_options.is_none());
         // The agent still remembers what was asked for.
         assert_eq!(agent.breakpoint_mode(), Some(PromptCacheMode::Explicit));
     }

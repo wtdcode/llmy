@@ -12,7 +12,7 @@ use async_openai::{
     error::OpenAIError,
 };
 use color_eyre::eyre::eyre;
-use llmy_types::error::LLMYError;
+use llmy_types::error::{BillingExhausted, LLMYError};
 use llmy_types::other::WithOtherFields;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -24,7 +24,7 @@ use crate::req::{
     ChatCompletionMessageToolCallsRaw, ChatCompletionRequestMessageRaw,
     ChatCompletionRequestSystemMessageRaw, ChatCompletionRequestUserMessageRaw,
     ChatCompletionStreamOptionsRaw, ChatCompletionTools, CreateChatCompletionRequestRaw,
-    FunctionCallRaw, Role,
+    FunctionCallRaw, PromptCacheMode, PromptCacheOptionsRaw, Role,
 };
 use crate::resp::{
     ChatChoice, ChatChoiceRaw, ChatCompletionResponseMessageRaw, CompletionUsage,
@@ -593,6 +593,17 @@ impl LLMRequest {
         }
     }
 
+    /// Overwrite the model id this request goes out with — how a fallback
+    /// target takes over a request originally built for another profile's
+    /// model.
+    fn set_model(&mut self, model: &str) {
+        match self {
+            Self::Chat(req) => req.model = model.to_string(),
+            Self::Anthropic(req) => req.model = model.to_string(),
+            Self::Responses(req) => req.model = model.to_string(),
+        }
+    }
+
     /// Set the routing key on the protocols that have one; the Anthropic
     /// protocol routes by content, so there is nothing to set.
     fn set_prompt_cache_key(&mut self, key: &str) {
@@ -746,6 +757,27 @@ pub struct LLM {
     llm: Arc<LLMInner>,
 }
 
+/// The default pause before a profile that exhausted its retries is tried
+/// first again — see [`LLM::new_with_fallback`].
+pub const DEFAULT_FALLBACK_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// One upstream profile of an [`LLM`]: an endpoint config plus the model,
+/// settings, and optional spend cap to use through it. The first profile of
+/// a fallback chain is the primary; the rest take over, in order, when the
+/// one before them exhausts its retries.
+#[derive(Debug, Clone)]
+pub struct LLMProfile {
+    /// Name used in logs and cap diagnostics (e.g. the TOML profile key).
+    pub name: String,
+    pub config: SupportedConfig,
+    pub model: OpenAIModel,
+    pub settings: LLMSettings,
+    /// Spend cap for this profile alone, in USD; `None` leaves only the
+    /// global cap. A profile over its own cap is skipped — traffic spills to
+    /// the profiles after it instead of failing the whole client.
+    pub cap: Option<Decimal>,
+}
+
 impl LLM {
     /// Build an LLM with a pre-constructed debug backend (or `None` to disable).
     /// Use this directly when you already own a [`DebugBackend`]; otherwise see
@@ -757,17 +789,33 @@ impl LLM {
         settings: LLMSettings,
         debug_backend: Option<DebugBackend>,
     ) -> Self {
-        let client = LLMClient::new_with_app(config.clone(), settings.llm_app.as_ref());
-        let billing = Arc::new(StdRwLock::new(BillingTree::new(cap)));
-
-        let endpoint = config.endpoint_url().to_string();
-        let azure_deployment = config.azure_deployment().map(|s| s.to_string());
-
-        let content_filter: Box<dyn OpenAIContentFilter> = if model.is_google() {
-            Box::new(GoogleContentFilter)
-        } else {
-            Box::new(NoFilter)
+        let profile = LLMProfile {
+            name: "default".to_string(),
+            config,
+            model,
+            settings,
+            cap: None,
         };
+        Self::new_with_fallback(vec![profile], cap, DEFAULT_FALLBACK_COOLDOWN, debug_backend)
+            .expect("one profile is always a valid fallback chain")
+    }
+
+    /// Build an LLM over a fallback chain of profiles, primary first. All of
+    /// them share one billing tree (capped at `cap`), one scope tree, and one
+    /// debug backend; everything endpoint-specific (protocol client, model,
+    /// settings, cache keys, filters, concurrency limiter, per-profile cap)
+    /// lives with its profile. A profile that exhausts its retries is cooled
+    /// down for `fallback_cooldown`, demoting it to a last resort until the
+    /// pause lapses. Refuses an empty chain.
+    pub fn new_with_fallback(
+        profiles: Vec<LLMProfile>,
+        cap: Decimal,
+        fallback_cooldown: Duration,
+        debug_backend: Option<DebugBackend>,
+    ) -> Result<Self, LLMYError> {
+        if profiles.is_empty() {
+            return Err(eyre!("an LLM needs at least one profile").into());
+        }
 
         match debug_backend.as_ref() {
             Some(DebugBackend::Folder(folder)) => {
@@ -786,24 +834,27 @@ impl LLM {
             None => {}
         }
 
-        let cache_keys = CacheKeys::new(settings.cache_key_config());
-        let concurrency = LLMInner::concurrency_limiter(settings.llm_concurrent);
+        let targets: Vec<LLMTarget> = profiles.into_iter().map(LLMTarget::new).collect();
+        if targets.len() > 1 {
+            tracing::info!(
+                "LLM fallback chain: {}",
+                targets
+                    .iter()
+                    .map(|t| format!("{} ({} at {})", t.name, t.model, t.endpoint))
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            );
+        }
 
-        LLM {
+        Ok(LLM {
             llm: Arc::new(LLMInner {
                 node: ROOT,
-                client,
-                model,
-                billing,
+                targets,
+                billing: Arc::new(StdRwLock::new(BillingTree::new(cap))),
                 debug_backend: debug_backend.map(Arc::new),
-                endpoint,
-                azure_deployment,
-                default_settings: settings,
-                content_filter: Arc::new(StdRwLock::new(content_filter)),
-                cache_keys,
-                concurrency,
+                fallback_cooldown,
             }),
-        }
+        })
     }
 
     /// Convenience constructor that dispatches `LLM_DEBUG`-style strings to a
@@ -817,13 +868,33 @@ impl LLM {
         debug_prefix: Option<String>,
         debug_target: Option<String>,
     ) -> Result<Self, LLMYError> {
-        let backend = match debug_target {
-            Some(s) if !s.is_empty() => {
-                Some(DebugBackend::from_env_string(&s, debug_prefix.as_deref()).await?)
-            }
-            _ => None,
-        };
+        let backend = Self::debug_backend_from(debug_prefix, debug_target).await?;
         Ok(Self::new(config, model, cap, settings, backend))
+    }
+
+    /// [`Self::new_with_fallback`] with the `LLM_DEBUG`-style string dispatch
+    /// of [`Self::new_async`].
+    pub async fn new_with_fallback_async(
+        profiles: Vec<LLMProfile>,
+        cap: Decimal,
+        fallback_cooldown: Duration,
+        debug_prefix: Option<String>,
+        debug_target: Option<String>,
+    ) -> Result<Self, LLMYError> {
+        let backend = Self::debug_backend_from(debug_prefix, debug_target).await?;
+        Self::new_with_fallback(profiles, cap, fallback_cooldown, backend)
+    }
+
+    async fn debug_backend_from(
+        debug_prefix: Option<String>,
+        debug_target: Option<String>,
+    ) -> Result<Option<DebugBackend>, LLMYError> {
+        match debug_target {
+            Some(s) if !s.is_empty() => Ok(Some(
+                DebugBackend::from_env_string(&s, debug_prefix.as_deref()).await?,
+            )),
+            _ => Ok(None),
+        }
     }
 
     /// A handle pointing back at the root scope (the whole-LLM budget), sharing
@@ -891,26 +962,207 @@ impl Deref for LLM {
     }
 }
 
+/// One upstream an [`LLM`] can send through — the endpoint-specific half of
+/// the client, built from one [`LLMProfile`]: protocol client, model,
+/// settings, cache-key registry, content filter, concurrency limiter, and
+/// the profile's own spend ledger. The cross-cutting half (billing tree,
+/// scopes, debug backend) stays on the [`LLM`] and is shared by the whole
+/// fallback chain. Cloning is cheap and shares the mutable state (ledger,
+/// cooldown, filter, cache keys, limiter) — a clone is a handle to the same
+/// target, following the [`LLM`]/[`LLMInner`] pattern.
+#[derive(Debug, Clone)]
+pub struct LLMTarget {
+    /// The profile name this target was built from.
+    pub name: String,
+    pub client: LLMClient,
+    pub model: OpenAIModel,
+    pub endpoint: String,
+    pub azure_deployment: Option<String>,
+    pub settings: LLMSettings,
+    content_filter: Arc<StdRwLock<Arc<dyn OpenAIContentFilter>>>,
+    /// Auto `prompt_cache_key` selection for this endpoint, shared with every
+    /// scope cut from the client so a sub-agent continuing a conversation
+    /// keeps its routing.
+    cache_keys: CacheKeys,
+    /// In-flight request limiter (`llm_concurrent`) for this endpoint, shared
+    /// with every scope/clone of the client; `None` when unlimited.
+    concurrency: Option<Arc<tokio::sync::Semaphore>>,
+    /// This profile's own spend cap in USD; `None` = only the global cap.
+    pub cap: Option<Decimal>,
+    /// USD spent through this target, accumulated post-hoc like the billing
+    /// tree; checked against `cap` when a request picks its target order.
+    pub spent: Arc<StdRwLock<Decimal>>,
+    /// Epoch milliseconds (chrono UTC) until which this target is demoted to
+    /// a last resort after exhausting its retries; 0 = not cooling.
+    pub cooldown_until: Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl LLMTarget {
+    fn new(profile: LLMProfile) -> Self {
+        let LLMProfile {
+            name,
+            config,
+            model,
+            settings,
+            cap,
+        } = profile;
+        let client = LLMClient::new_with_app(config.clone(), settings.llm_app.as_ref());
+        let content_filter: Arc<dyn OpenAIContentFilter> = if model.is_google() {
+            Arc::new(GoogleContentFilter)
+        } else {
+            Arc::new(NoFilter)
+        };
+        Self {
+            name,
+            client,
+            endpoint: config.endpoint_url().to_string(),
+            azure_deployment: config.azure_deployment().map(|s| s.to_string()),
+            content_filter: Arc::new(StdRwLock::new(content_filter)),
+            cache_keys: CacheKeys::new(settings.cache_key_config()),
+            concurrency: LLMInner::concurrency_limiter(settings.llm_concurrent),
+            model,
+            settings,
+            cap,
+            spent: Arc::new(StdRwLock::new(Decimal::ZERO)),
+            cooldown_until: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        }
+    }
+
+    /// Resolve a caller-built request against this target. On the primary
+    /// the request is exactly what the caller meant, so only protocol
+    /// resolution applies (cross-protocol conversion stays gated by this
+    /// profile's `allow_implicit_convert`); on a fallback target the request
+    /// was built for another profile, so the model id is rewritten to this
+    /// target's own.
+    fn adapt_request(&self, req: LLMRequest, is_primary: bool) -> Result<LLMRequest, LLMYError> {
+        let mut req = self.client.resolve_request(
+            req,
+            self.default_max_output_tokens(),
+            self.settings.allow_implicit_convert,
+        )?;
+        if !is_primary {
+            req.set_model(self.model.api_model_name());
+        }
+        Ok(req)
+    }
+
+    /// Attach breakpoint prompt-cache options to a request when this
+    /// target's model addresses its cache by breakpoint; prefix-cached
+    /// models reject the unknown field, so the mode is dropped with a
+    /// warning there. The Anthropic protocol carries its breakpoints inside
+    /// the messages, not as a request option.
+    pub fn apply_cache_mode(&self, req: &mut LLMRequest, mode: PromptCacheMode) {
+        let policy = self.model.cache_policy();
+        if !policy.needs_breakpoints() {
+            tracing::warn!(
+                "dropping prompt cache mode {:?}: {} caches by {}, not by breakpoint",
+                mode,
+                self.model,
+                policy
+            );
+            return;
+        }
+        match req {
+            LLMRequest::Chat(chat) => {
+                chat.prompt_cache_options = Some(PromptCacheOptionsRaw::with_mode(mode));
+            }
+            LLMRequest::Responses(resp) => {
+                resp.prompt_cache_options = Some(PromptCacheOptionsRaw::with_mode(mode));
+            }
+            LLMRequest::Anthropic(_) => {}
+        }
+    }
+
+    /// Take the auto cache key for one logical request through this target,
+    /// whatever protocol it resolved to. The Anthropic protocol routes by
+    /// content, so it never takes one; a caller-supplied key is never
+    /// second-guessed.
+    fn auto_cache_key_request(
+        &self,
+        req: &LLMRequest,
+        debug_prefix: Option<&str>,
+    ) -> Option<CacheKeyClaim> {
+        if req.prompt_cache_key().is_some() {
+            return None;
+        }
+        let shape = req.cache_shape()?;
+        self.cache_keys
+            .select_shape(&shape, &self.model, debug_prefix)
+    }
+
+    /// Take a slot on this target's concurrency limiter; trivially `None`
+    /// when the target is unlimited. Holding the permit spans the wire round
+    /// trip, so excess requests queue here instead of piling onto the
+    /// endpoint.
+    async fn acquire_concurrency_slot(
+        &self,
+    ) -> Result<Option<tokio::sync::SemaphorePermit<'_>>, LLMYError> {
+        match &self.concurrency {
+            Some(semaphore) => {
+                Ok(Some(semaphore.acquire().await.map_err(|_| {
+                    LLMYError::Other(eyre!("the concurrency limiter was closed"))
+                })?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The output-token bound for protocols that demand one (the Anthropic
+    /// protocol's mandatory `max_tokens`) when `llm_max_completion_tokens` is
+    /// unset: the model's configured max, or 8192 when a hand-rolled config
+    /// still leaves it at zero — the wire rejects `max_tokens: 0`.
+    fn default_max_output_tokens(&self) -> u32 {
+        match self.model.config.max_tokens {
+            0 => 8192,
+            max => max.try_into().unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Deserialize the first-choice content into `T`. On a JSON parse error —
+    /// and only when this target's `auto_strip` is enabled — retry the parse
+    /// after stripping a markdown code fence (the common ` ```json {…} ``` `
+    /// wrapper) from the content. Absent content is an error.
+    fn parse_first_choice<T: DeserializeOwned>(
+        &self,
+        resp: &RawExtensibleChatCompletionResponse,
+    ) -> Result<T, LLMYError> {
+        let content = resp
+            .choices
+            .first()
+            .and_then(|c| c.inner.message.content.as_deref())
+            .ok_or_else(|| {
+                eyre!("completion has no content to deserialize into the requested type")
+            })?;
+        match serde_json::from_str::<T>(content) {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                if self.settings.auto_strip
+                    && let Some(stripped) = crate::filters::strip_markdown_fence(content)
+                {
+                    return Ok(serde_json::from_str::<T>(&stripped)?);
+                }
+                Err(err.into())
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct LLMInner {
     /// This handle's current billing scope; defaults to [`ROOT`]. [`LLM::scope`]
     /// clones the handle with a different node while sharing everything else via
     /// `Arc`, so billing reads `self.node` with zero parameter threading.
     node: NodeId,
-    pub client: LLMClient,
-    pub model: OpenAIModel,
+    /// The fallback chain, primary first (`targets[0]`); never empty. Each
+    /// target's mutable state (cache keys, filter, spend ledger, cooldown)
+    /// sits behind its own `Arc`, so the clones held by every scope cut from
+    /// this client all point at the same accounts.
+    pub targets: Vec<LLMTarget>,
     pub billing: Arc<StdRwLock<BillingTree>>,
     pub debug_backend: Option<Arc<DebugBackend>>,
-    pub endpoint: String,
-    pub azure_deployment: Option<String>,
-    pub default_settings: LLMSettings,
-    content_filter: Arc<StdRwLock<Box<dyn OpenAIContentFilter>>>,
-    /// Auto `prompt_cache_key` selection, shared with every scope cut from this
-    /// client so a sub-agent continuing a conversation keeps its routing.
-    cache_keys: CacheKeys,
-    /// Global in-flight request limiter (`llm_concurrent`), shared with every
-    /// scope/clone of this client; `None` when unlimited.
-    concurrency: Option<Arc<tokio::sync::Semaphore>>,
+    /// How long a target that exhausted its retries is demoted to a last
+    /// resort before the chain tries it first again.
+    fallback_cooldown: Duration,
 }
 
 impl Drop for LLMInner {
@@ -935,59 +1187,41 @@ impl LLMInner {
     }
 
     /// Clone this handle pointing at a different scope `node`. The mutable shared
-    /// state (`billing` tree, `content_filter`) is shared via `Arc`; the rest is
-    /// cheap config.
+    /// state (`billing` tree, the targets with their filters and ledgers) is
+    /// shared via `Arc`; the rest is cheap config.
     fn rescope(&self, node: NodeId) -> LLMInner {
         LLMInner {
             node,
-            client: self.client.clone(),
-            model: self.model.clone(),
+            targets: self.targets.clone(),
             billing: self.billing.clone(),
             debug_backend: self.debug_backend.clone(),
-            endpoint: self.endpoint.clone(),
-            azure_deployment: self.azure_deployment.clone(),
-            default_settings: self.default_settings.clone(),
-            content_filter: self.content_filter.clone(),
-            cache_keys: self.cache_keys.clone(),
-            concurrency: self.concurrency.clone(),
+            fallback_cooldown: self.fallback_cooldown,
         }
     }
 
-    /// The output-token bound for protocols that demand one (the Anthropic
-    /// protocol's mandatory `max_tokens`) when `llm_max_completion_tokens` is
-    /// unset: the model's configured max, or 8192 when a hand-rolled config
-    /// still leaves it at zero — the wire rejects `max_tokens: 0`.
-    fn default_max_output_tokens(&self) -> u32 {
-        match self.model.config.max_tokens {
-            0 => 8192,
-            max => max.try_into().unwrap_or(u32::MAX),
-        }
-    }
-
-    /// Lower a chat-typed request into the backend's wire format — see
-    /// [`LLMClient::lower_chat_request`]. This is how conversation-state
+    /// Lower a chat-typed request into the primary backend's wire format —
+    /// see [`LLMClient::lower_chat_request`]. This is how conversation-state
     /// callers (agents, the message-level prompt APIs) go native on any
     /// backend without the implicit-conversion opt-in.
     pub fn lower_request(
         &self,
         chat: RawExtensibleChatCompletionRequest,
     ) -> Result<LLMRequest, LLMYError> {
-        self.client
-            .lower_chat_request(chat, self.default_max_output_tokens())
+        self.targets[0].lower_request(chat)
     }
 
-    /// Replace the content filter applied to every request and response. Defaults to
-    /// `GoogleContentFilter` for google models, `NoFilter` otherwise.
+    /// Replace the content filter applied to every request and response, on
+    /// every target of the fallback chain (they share the one filter given
+    /// here). Each target defaults to `GoogleContentFilter` for google
+    /// models, `NoFilter` otherwise.
     pub fn set_content_filter(&self, filter: Box<dyn OpenAIContentFilter>) {
-        *self
-            .content_filter
-            .write()
-            .expect("content_filter poisoned") = filter;
-    }
-
-    fn apply_filter_input(&self, req: &mut RawExtensibleChatCompletionRequest) {
-        let guard = self.content_filter.read().expect("content_filter poisoned");
-        guard.filter_input(req);
+        let filter: Arc<dyn OpenAIContentFilter> = Arc::from(filter);
+        for target in self.targets.iter() {
+            *target
+                .content_filter
+                .write()
+                .expect("content_filter poisoned") = filter.clone();
+        }
     }
 
     /// Take the auto cache key for one logical request: the key whose prompt
@@ -1000,8 +1234,9 @@ impl LLMInner {
     /// A newly minted key carries `debug_prefix` in its name, so the keys in the
     /// logs and the debug DB say which workload opened them. A caller-supplied
     /// key is never second-guessed.
-    // Production traffic goes through [`Self::auto_cache_key_request`]; this
-    // chat-typed shorthand remains for the tests exercising claim semantics.
+    // Production traffic goes through [`LLMTarget::auto_cache_key_request`];
+    // this chat-typed shorthand remains for the tests exercising claim
+    // semantics.
     #[cfg(test)]
     fn auto_cache_key(
         &self,
@@ -1011,23 +1246,8 @@ impl LLMInner {
         if req.prompt_cache_key.is_some() {
             return None;
         }
-        self.cache_keys.select(req, &self.model, debug_prefix)
-    }
-
-    /// Take the auto cache key for one logical request, whatever protocol it
-    /// resolved to. The Anthropic protocol routes by content, so it never
-    /// takes one; a caller-supplied key is never second-guessed.
-    fn auto_cache_key_request(
-        &self,
-        req: &LLMRequest,
-        debug_prefix: Option<&str>,
-    ) -> Option<CacheKeyClaim> {
-        if req.prompt_cache_key().is_some() {
-            return None;
-        }
-        let shape = req.cache_shape()?;
-        self.cache_keys
-            .select_shape(&shape, &self.model, debug_prefix)
+        let primary = &self.targets[0];
+        primary.cache_keys.select(req, &primary.model, debug_prefix)
     }
 
     /// Cached prompt tokens the provider reported, or zero if it reported none.
@@ -1049,7 +1269,7 @@ impl LLMInner {
     /// intervals of all requests tile the total exactly once, whatever order
     /// concurrent scopes finish in, so every boundary is reported exactly once.
     fn billing_line_due(&self, running: TokenUsage, just_billed: TokenUsage) -> bool {
-        let every = self.default_settings.billing_log_tokens;
+        let every = self.targets[0].settings.billing_log_tokens;
         if every == 0 {
             return true;
         }
@@ -1057,9 +1277,9 @@ impl LLMInner {
         total / every != total.saturating_sub(just_billed.total()) / every
     }
 
-    /// Snapshot of the auto cache key policy in force for this client.
+    /// Snapshot of the auto cache key policy in force on the primary target.
     pub fn cache_key_config(&self) -> crate::cache_key::CacheKeyConfig {
-        self.cache_keys.config()
+        self.targets[0].cache_keys.config()
     }
 
     /// The limiter an `llm_concurrent` value describes: `None` when 0
@@ -1068,28 +1288,7 @@ impl LLMInner {
         (limit > 0).then(|| Arc::new(tokio::sync::Semaphore::new(limit)))
     }
 
-    /// Take a slot on the global concurrency limiter; trivially `None` when
-    /// the client is unlimited. Holding the permit spans the wire round trip,
-    /// so excess requests queue here instead of piling onto the endpoint.
-    async fn acquire_concurrency_slot(
-        &self,
-    ) -> Result<Option<tokio::sync::SemaphorePermit<'_>>, LLMYError> {
-        match &self.concurrency {
-            Some(semaphore) => {
-                Ok(Some(semaphore.acquire().await.map_err(|_| {
-                    LLMYError::Other(eyre!("the concurrency limiter was closed"))
-                })?))
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn apply_filter_output(&self, resp: &mut RawExtensibleChatCompletionResponse) {
-        let guard = self.content_filter.read().expect("content_filter poisoned");
-        guard.filter_output(resp);
-    }
-
-    fn debug_row_context(&self, cache_key: Option<&str>) -> DebugRowContext {
+    fn debug_row_context(&self, target: &LLMTarget, cache_key: Option<&str>) -> DebugRowContext {
         // The debug DB stores USD as a SQLite REAL column; SQLite has no native
         // decimal type, so collapse to f64 only at this boundary. The cap logged
         // is the global budget (matching the root-level `current_usage_usd`).
@@ -1101,12 +1300,300 @@ impl LLMInner {
             .to_f64()
             .unwrap_or_default();
         DebugRowContext {
-            model_name: self.model.model_id_str().to_string(),
-            endpoint: self.endpoint.clone(),
-            azure_deployment: self.azure_deployment.clone(),
+            model_name: target.model.model_id_str().to_string(),
+            endpoint: target.endpoint.clone(),
+            azure_deployment: target.azure_deployment.clone(),
             cache_key: cache_key.map(|s| s.to_string()),
             cap_usd,
         }
+    }
+
+    /// The order this logical request walks the fallback chain: profiles over
+    /// their own spend cap are dropped outright, and profiles cooling down
+    /// after a recent retry-exhaustion are demoted behind the rest (never
+    /// skipped entirely — when everything ahead of them fails too, they still
+    /// get their try). Errs when every profile is over its own cap.
+    fn target_order(&self) -> Result<Vec<LLMTarget>, LLMYError> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut ready = Vec::new();
+        let mut cooling = Vec::new();
+        for target in self.targets.iter() {
+            // The cap check is post-hoc like the billing tree's, so a
+            // request already in flight is never cut short mid-chain.
+            let spent = *target.spent.read().expect("target spend poisoned");
+            if target.cap.is_some_and(|cap| spent > cap) {
+                continue;
+            }
+            if target
+                .cooldown_until
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > now
+            {
+                cooling.push(target.clone());
+            } else {
+                ready.push(target.clone());
+            }
+        }
+        ready.extend(cooling);
+        if ready.is_empty() {
+            let primary = &self.targets[0];
+            return Err(LLMYError::Billing(BillingExhausted {
+                cap: primary.cap.unwrap_or_default(),
+                current: *primary.spent.read().expect("target spend poisoned"),
+                node: ROOT,
+                scope: Some(format!("profile '{}'", primary.name)),
+            }));
+        }
+        Ok(ready)
+    }
+
+    /// Mark a target as exhausted: it is demoted to a last resort until the
+    /// cooldown lapses (see [`Self::target_order`]).
+    fn cool_down_target(&self, target: &LLMTarget, budget: u64) {
+        let until = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_add(i64::try_from(self.fallback_cooldown.as_millis()).unwrap_or(i64::MAX));
+        target
+            .cooldown_until
+            .store(until, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            "profile '{}' exhausted its {} attempts; cooling it down for {:?} and falling back",
+            target.name,
+            budget,
+            self.fallback_cooldown,
+        );
+    }
+
+    /// The fallback-aware retry engine every untyped `*_with_retry` entry
+    /// point runs on: one pre-built request per usable target, in
+    /// [`Self::target_order`]. Each target gets up to its retry budget of
+    /// attempts (`timeout`/`retry` overrides win over the target's own
+    /// settings); a target that exhausts its budget is cooled down and the
+    /// next one takes over. Billing/cap errors abort the whole chain at
+    /// once, since neither retry nor fallback can recover a blown budget.
+    async fn complete_planned_once_with_retry(
+        &self,
+        planned: Vec<(LLMTarget, LLMRequest)>,
+        debug_prefix: Option<&str>,
+        timeout: Option<Duration>,
+        retry: Option<u64>,
+    ) -> Result<(RawExtensibleChatCompletionResponse, Message), LLMYError> {
+        let chained = self.targets.len() > 1;
+        let mut last: Option<LLMYError> = None;
+        for (target, req) in planned {
+            // One claim per target for the whole logical request; every
+            // attempt gets a clone, and moving on drops the last one, which
+            // abandons it.
+            let claim = target.auto_cache_key_request(&req, debug_prefix);
+            let budget = retry.unwrap_or(target.settings.llm_retry);
+            for idx in 0..budget {
+                // Selection paid for the first send; a retry is extra traffic
+                // on the same key and costs another slot of its budget.
+                let pause = target.settings.retry_backoff(idx);
+                if !pause.is_zero() {
+                    tokio::time::sleep(pause).await;
+                }
+                if let (true, Some(claim)) = (idx > 0, claim.as_ref()) {
+                    claim.charge_resend();
+                }
+                match self
+                    .complete_request_attempt(
+                        &target,
+                        req.clone(),
+                        claim.clone(),
+                        debug_prefix,
+                        timeout,
+                    )
+                    .await
+                {
+                    Ok(landed) => {
+                        if chained {
+                            target
+                                .cooldown_until
+                                .store(0, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        return Ok(landed);
+                    }
+                    Err(e @ LLMYError::Billing(_)) => return Err(e),
+                    Err(e) => {
+                        tracing::warn!("Having an error {} during {} retry", e, idx);
+                        last = Some(e);
+                    }
+                }
+            }
+            if chained {
+                self.cool_down_target(&target, budget);
+            }
+        }
+        Err(last
+            .unwrap_or_else(|| LLMYError::Other(eyre!("no response after zero retry attempts?!"))))
+    }
+
+    /// [`Self::complete_planned_once_with_retry`] for the typed entry
+    /// points: each landed response additionally has its first choice
+    /// deserialized into `T` (honoring the serving target's `auto_strip`),
+    /// and a malformed response is retried like a wire error.
+    async fn complete_planned_once_with_retry_typed<T: DeserializeOwned>(
+        &self,
+        planned: Vec<(LLMTarget, LLMRequest)>,
+        debug_prefix: Option<&str>,
+        timeout: Option<Duration>,
+        retry: Option<u64>,
+    ) -> Result<T, LLMYError> {
+        let chained = self.targets.len() > 1;
+        let mut last: Option<LLMYError> = None;
+        for (target, req) in planned {
+            // One claim per target for the whole logical request — see the
+            // untyped engine.
+            let claim = target.auto_cache_key_request(&req, debug_prefix);
+            let budget = retry.unwrap_or(target.settings.llm_retry);
+            for idx in 0..budget {
+                let pause = target.settings.retry_backoff(idx);
+                if !pause.is_zero() {
+                    tokio::time::sleep(pause).await;
+                }
+                if let (true, Some(claim)) = (idx > 0, claim.as_ref()) {
+                    claim.charge_resend();
+                }
+                let attempt = match self
+                    .complete_request_attempt(
+                        &target,
+                        req.clone(),
+                        claim.clone(),
+                        debug_prefix,
+                        timeout,
+                    )
+                    .await
+                {
+                    Ok((resp, _)) => target.parse_first_choice::<T>(&resp),
+                    Err(error) => Err(error),
+                };
+                match attempt {
+                    Ok(value) => {
+                        if chained {
+                            target
+                                .cooldown_until
+                                .store(0, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        return Ok(value);
+                    }
+                    Err(e @ LLMYError::Billing(_)) => return Err(e),
+                    Err(e) => {
+                        tracing::warn!("Having an error {} during {} retry", e, idx);
+                        last = Some(e);
+                    }
+                }
+            }
+            if chained {
+                self.cool_down_target(&target, budget);
+            }
+        }
+        Err(last
+            .unwrap_or_else(|| LLMYError::Other(eyre!("no response after zero retry attempts?!"))))
+    }
+
+    /// One pre-built wire request per usable target: the primary sends the
+    /// caller's request verbatim, fallback targets adapt it (protocol
+    /// resolution and model-id rewrite). A target that cannot take the
+    /// request (e.g. cross-protocol without the convert opt-in) is skipped
+    /// as failed; every target failing to plan is an error.
+    fn plan_wire(&self, req: &LLMRequest) -> Result<Vec<(LLMTarget, LLMRequest)>, LLMYError> {
+        let primary_name = self.targets[0].name.clone();
+        let mut planned = Vec::new();
+        let mut last: Option<LLMYError> = None;
+        for target in self.target_order()? {
+            let is_primary = target.name == primary_name;
+            match target.adapt_request(req.clone(), is_primary) {
+                Ok(req) => planned.push((target, req)),
+                Err(e @ LLMYError::Billing(_)) => return Err(e),
+                Err(e) => {
+                    tracing::warn!("profile '{}' cannot take this request: {}", target.name, e);
+                    last = Some(e);
+                }
+            }
+        }
+        if planned.is_empty() {
+            return Err(
+                last.unwrap_or_else(|| LLMYError::Other(eyre!("no usable fallback target")))
+            );
+        }
+        Ok(planned)
+    }
+
+    /// One natively built system+user prompt request per usable target. An
+    /// explicit `settings` override applies to every target; without one
+    /// each target builds on its own settings.
+    fn plan_prompt(
+        &self,
+        sys_msg: &str,
+        user_msg: &str,
+        cache_key: Option<&str>,
+        settings: Option<&LLMSettings>,
+    ) -> Result<Vec<(LLMTarget, LLMRequest)>, LLMYError> {
+        let mut planned = Vec::new();
+        let mut last: Option<LLMYError> = None;
+        for target in self.target_order()? {
+            let build = target.build_prompt_request(
+                sys_msg,
+                user_msg,
+                cache_key,
+                settings.unwrap_or(&target.settings),
+            );
+            match build {
+                Ok(req) => planned.push((target, req)),
+                Err(e @ LLMYError::Billing(_)) => return Err(e),
+                Err(e) => {
+                    tracing::warn!("profile '{}' cannot take this request: {}", target.name, e);
+                    last = Some(e);
+                }
+            }
+        }
+        if planned.is_empty() {
+            return Err(
+                last.unwrap_or_else(|| LLMYError::Other(eyre!("no usable fallback target")))
+            );
+        }
+        Ok(planned)
+    }
+
+    /// One chat request built and lowered per usable target, from
+    /// already-wrapped messages. Settings override semantics as in
+    /// [`Self::plan_prompt`].
+    fn plan_messages(
+        &self,
+        messages: &[RawExtensibleChatRequestMessage],
+        cache_key: Option<&str>,
+        settings: Option<&LLMSettings>,
+        tools: Option<&Vec<ChatCompletionTools>>,
+    ) -> Result<Vec<(LLMTarget, LLMRequest)>, LLMYError> {
+        let mut planned = Vec::new();
+        let mut last: Option<LLMYError> = None;
+        for target in self.target_order()? {
+            let build = target
+                .build_chat_request(
+                    messages.to_vec(),
+                    cache_key,
+                    settings.unwrap_or(&target.settings),
+                    tools.cloned(),
+                )
+                // Explicit lowering: message-level callers go native on any
+                // backend without the implicit-conversion opt-in.
+                .and_then(|req| target.lower_request(req));
+            match build {
+                Ok(req) => planned.push((target, req)),
+                Err(e @ LLMYError::Billing(_)) => return Err(e),
+                Err(e) => {
+                    tracing::warn!("profile '{}' cannot take this request: {}", target.name, e);
+                    last = Some(e);
+                }
+            }
+        }
+        if planned.is_empty() {
+            return Err(
+                last.unwrap_or_else(|| LLMYError::Other(eyre!("no usable fallback target")))
+            );
+        }
+        Ok(planned)
     }
 
     // we use t/s to estimate a timeout to avoid infinite repeating
@@ -1118,15 +1605,15 @@ impl LLMInner {
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
-        let settings = settings.unwrap_or_else(|| self.default_settings.clone());
-        let req = self.build_prompt_request(sys_msg, user_msg, cache_key, &settings)?;
-        self.complete_request_once_with_retry(
-            req,
+        let planned = self.plan_prompt(sys_msg, user_msg, cache_key, settings.as_ref())?;
+        self.complete_planned_once_with_retry(
+            planned,
             debug_prefix,
-            Some(settings.timeout()),
-            Some(settings.llm_retry),
+            settings.as_ref().map(|s| s.timeout()),
+            settings.as_ref().map(|s| s.llm_retry),
         )
         .await
+        .map(|(resp, _)| resp)
     }
 
     /// Like [`Self::prompt_once_with_retry`], but deserializes the first-choice
@@ -1140,13 +1627,12 @@ impl LLMInner {
         cache_key: Option<&str>,
         settings: Option<LLMSettings>,
     ) -> Result<T, LLMYError> {
-        let settings = settings.unwrap_or_else(|| self.default_settings.clone());
-        let req = self.build_prompt_request(sys_msg, user_msg, cache_key, &settings)?;
-        self.complete_request_once_with_retry_typed::<T>(
-            req,
+        let planned = self.plan_prompt(sys_msg, user_msg, cache_key, settings.as_ref())?;
+        self.complete_planned_once_with_retry_typed::<T>(
+            planned,
             debug_prefix,
-            Some(settings.timeout()),
-            Some(settings.llm_retry),
+            settings.as_ref().map(|s| s.timeout()),
+            settings.as_ref().map(|s| s.llm_retry),
         )
         .await
     }
@@ -1223,43 +1709,63 @@ impl LLMInner {
         timeout: Option<Duration>,
         retry: Option<u64>,
     ) -> Result<(RawExtensibleChatCompletionResponse, Message), LLMYError> {
-        let req = self.client.resolve_request(
-            req,
-            self.default_max_output_tokens(),
-            self.default_settings.allow_implicit_convert,
-        )?;
-        let retry = retry.unwrap_or(u64::MAX);
-        // One claim for the whole logical request; every attempt gets a clone,
-        // and giving up drops the last one, which abandons it.
-        let claim = self.auto_cache_key_request(&req, debug_prefix);
+        let planned = self.plan_wire(&req)?;
+        self.complete_planned_once_with_retry(planned, debug_prefix, timeout, retry)
+            .await
+    }
 
-        let mut last = None;
-        for idx in 0..retry {
-            // Selection paid for the first send; a retry is extra traffic on the
-            // same key and costs another slot of its budget.
-            let pause = self.default_settings.retry_backoff(idx);
-            if !pause.is_zero() {
-                tokio::time::sleep(pause).await;
-            }
-            if let (true, Some(claim)) = (idx > 0, claim.as_ref()) {
-                claim.charge_resend();
-            }
-            match self
-                .complete_request_attempt(req.clone(), claim.clone(), debug_prefix, timeout)
-                .await
-            {
-                Ok(r) => return Ok(r),
-                // A billing/cap error is deterministic — retrying can't recover it
-                // (and would keep tripping the pre-flight check), so fail fast.
+    /// Fallback-aware step for conversation-state callers (the agent
+    /// harness): every usable target builds its own native request from the
+    /// protocol-neutral conversation, with `cache_mode` breakpoint options
+    /// attached where that target's model wants them, and the landed
+    /// response comes back with its protocol-faithful assistant
+    /// [`Message`]. An explicit `settings` override applies to every target
+    /// and supplies the retry/timeout bounds; `None` lets each profile run
+    /// on its own settings.
+    pub async fn complete_conversation_message_once_with_retry(
+        &self,
+        conversation: &[Message],
+        cache_key: Option<&str>,
+        tools: Option<Vec<ChatCompletionTools>>,
+        cache_mode: Option<PromptCacheMode>,
+        settings: Option<&LLMSettings>,
+        debug_prefix: Option<&str>,
+    ) -> Result<(RawExtensibleChatCompletionResponse, Message), LLMYError> {
+        let mut planned = Vec::new();
+        let mut last: Option<LLMYError> = None;
+        for target in self.target_order()? {
+            let build = target.build_conversation_request(
+                conversation,
+                cache_key,
+                settings.unwrap_or(&target.settings),
+                tools.clone(),
+            );
+            match build {
+                Ok(mut req) => {
+                    if let Some(mode) = cache_mode {
+                        target.apply_cache_mode(&mut req, mode);
+                    }
+                    planned.push((target, req));
+                }
                 Err(e @ LLMYError::Billing(_)) => return Err(e),
                 Err(e) => {
-                    tracing::warn!("Having an error {} during {} retry", e, idx);
-                    last = Some(Err(e));
+                    tracing::warn!("profile '{}' cannot take this request: {}", target.name, e);
+                    last = Some(e);
                 }
             }
         }
-
-        last.ok_or_else(|| eyre!("no response after {} retries?!", retry))?
+        if planned.is_empty() {
+            return Err(
+                last.unwrap_or_else(|| LLMYError::Other(eyre!("no usable fallback target")))
+            );
+        }
+        self.complete_planned_once_with_retry(
+            planned,
+            debug_prefix,
+            settings.map(|s| s.timeout()),
+            settings.map(|s| s.llm_retry),
+        )
+        .await
     }
 
     /// Like [`Self::complete_extensible_once_with_retry`], but each attempt also
@@ -1292,41 +1798,9 @@ impl LLMInner {
         timeout: Option<Duration>,
         retry: Option<u64>,
     ) -> Result<T, LLMYError> {
-        let req = self.client.resolve_request(
-            req,
-            self.default_max_output_tokens(),
-            self.default_settings.allow_implicit_convert,
-        )?;
-        let retry = retry.unwrap_or(u64::MAX);
-        // One claim for the whole logical request — see the untyped variant.
-        let claim = self.auto_cache_key_request(&req, debug_prefix);
-
-        let mut last = None;
-        for idx in 0..retry {
-            let pause = self.default_settings.retry_backoff(idx);
-            if !pause.is_zero() {
-                tokio::time::sleep(pause).await;
-            }
-            if let (true, Some(claim)) = (idx > 0, claim.as_ref()) {
-                claim.charge_resend();
-            }
-            let attempt = self
-                .complete_request_attempt(req.clone(), claim.clone(), debug_prefix, timeout)
-                .await
-                .and_then(|(resp, _)| self.parse_first_choice::<T>(&resp));
-            match attempt {
-                Ok(value) => return Ok(value),
-                // A billing/cap error is deterministic — retrying can't recover it
-                // (and would keep tripping the pre-flight check), so fail fast.
-                Err(e @ LLMYError::Billing(_)) => return Err(e),
-                Err(e) => {
-                    tracing::warn!("Having an error {} during {} retry", e, idx);
-                    last = Some(Err(e));
-                }
-            }
-        }
-
-        last.ok_or_else(|| eyre!("no response after {} retries?!", retry))?
+        let planned = self.plan_wire(&req)?;
+        self.complete_planned_once_with_retry_typed::<T>(planned, debug_prefix, timeout, retry)
+            .await
     }
 
     pub async fn complete(
@@ -1338,34 +1812,6 @@ impl LLMInner {
         let req = RawExtensibleChatCompletionRequest::new(req);
         self.complete_extensible(req, debug_prefix, timeout_overwrite)
             .await
-    }
-
-    /// Deserialize the first-choice content into `T`. On a JSON parse error — and
-    /// only when `auto_strip` is enabled — retry the parse after stripping a
-    /// markdown code fence (the common ` ```json {…} ``` ` wrapper) from the
-    /// content. Absent content is an error.
-    fn parse_first_choice<T: DeserializeOwned>(
-        &self,
-        resp: &RawExtensibleChatCompletionResponse,
-    ) -> Result<T, LLMYError> {
-        let content = resp
-            .choices
-            .first()
-            .and_then(|c| c.inner.message.content.as_deref())
-            .ok_or_else(|| {
-                eyre!("completion has no content to deserialize into the requested type")
-            })?;
-        match serde_json::from_str::<T>(content) {
-            Ok(value) => Ok(value),
-            Err(err) => {
-                if self.default_settings.auto_strip
-                    && let Some(stripped) = crate::filters::strip_markdown_fence(content)
-                {
-                    return Ok(serde_json::from_str::<T>(&stripped)?);
-                }
-                Err(err.into())
-            }
-        }
     }
 
     /// A single completion attempt that deserializes the first-choice content into
@@ -1381,7 +1827,7 @@ impl LLMInner {
         let resp = self
             .complete_request(LLMRequest::Chat(req), debug_prefix, timeout_overwrite)
             .await?;
-        self.parse_first_choice::<T>(&resp)
+        self.targets[0].parse_first_choice::<T>(&resp)
     }
 
     pub async fn complete_extensible(
@@ -1394,46 +1840,45 @@ impl LLMInner {
             .await
     }
 
-    /// One-shot send of a request in any wire format: passthrough when the
-    /// backend speaks it; a cross-protocol send needs `allow_implicit_convert`
-    /// to convert through the chat hub. A one-shot
-    /// call is a logical request of exactly one attempt, so the cache-key
-    /// claim is taken and dropped here — abandoned if the call does not land.
+    /// One-shot send of a request in any wire format, always through the
+    /// primary target: passthrough when the backend speaks it; a
+    /// cross-protocol send needs `allow_implicit_convert` to convert through
+    /// the chat hub. A one-shot call is a logical request of exactly one
+    /// attempt, so the cache-key claim is taken and dropped here — abandoned
+    /// if the call does not land.
     pub async fn complete_request(
         &self,
         req: LLMRequest,
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
-        let req = self.client.resolve_request(
-            req,
-            self.default_max_output_tokens(),
-            self.default_settings.allow_implicit_convert,
-        )?;
-        let claim = self.auto_cache_key_request(&req, debug_prefix);
-        self.complete_request_attempt(req, claim, debug_prefix, timeout_overwrite)
+        let target = &self.targets[0];
+        let req = target.adapt_request(req, true)?;
+        let claim = target.auto_cache_key_request(&req, debug_prefix);
+        self.complete_request_attempt(target, req, claim, debug_prefix, timeout_overwrite)
             .await
             .map(|(resp, _)| resp)
     }
 
-    /// One attempt of a resolved logical request, carrying that request's
-    /// cache key claim — see [`Self::auto_cache_key_request`]. The attempt only
-    /// ever uses the claim it is given; it never takes one of its own, so
-    /// retrying cannot cost a second claim or a second slot of the key's
-    /// request budget.
+    /// One attempt of a resolved logical request through one target of the
+    /// chain, carrying that request's cache key claim — see
+    /// [`LLMTarget::auto_cache_key_request`]. The attempt only ever uses the
+    /// claim it is given; it never takes one of its own, so retrying cannot
+    /// cost a second claim or a second slot of the key's request budget.
     async fn complete_request_attempt(
         &self,
+        target: &LLMTarget,
         mut req: LLMRequest,
         given_claim: Option<CacheKeyClaim>,
         debug_prefix: Option<&str>,
         timeout_overwrite: Option<Duration>,
     ) -> Result<(RawExtensibleChatCompletionResponse, Message), LLMYError> {
-        // A limited client queues right at the attempt's entry. Nothing about
+        // A limited target queues right at the attempt's entry. Nothing about
         // the attempt (budget check, debug row, token estimate, wire clock)
         // happens until it owns a slot; the permit then spans the whole round
         // trip (streaming included — the stream is consumed inside `llm_fut`),
         // keeping queue wait out of the tok/s math and the request timeout.
-        let _concurrency_permit = self.acquire_concurrency_slot().await?;
+        let _concurrency_permit = target.acquire_concurrency_slot().await?;
 
         // Check the budget only once the slot is owned: usage recorded by
         // requests that finished while this one queued counts against it, so
@@ -1448,14 +1893,18 @@ impl LLMInner {
         // The content-filter quirks are all chat-endpoint quirks; a native
         // request goes out exactly as built.
         if let LLMRequest::Chat(chat) = &mut req {
-            self.apply_filter_input(chat);
+            target
+                .content_filter
+                .read()
+                .expect("content_filter poisoned")
+                .filter_input(chat);
         }
 
         // Keep the raw prefix (None => "") for the per-prefix billing dimension,
         // before it gets defaulted to "llm" for the debug backend below.
         let billing_prefix = debug_prefix;
 
-        let use_stream = self.default_settings.llm_stream;
+        let use_stream = target.settings.llm_stream;
         let debug_prefix = if let Some(debug_prefix) = debug_prefix {
             debug_prefix.to_string()
         } else {
@@ -1466,7 +1915,7 @@ impl LLMInner {
         let dbg_handle = if let (Some(backend), Some(dbg_req)) =
             (self.debug_backend.as_ref(), dbg_req.as_ref())
         {
-            let ctx = self.debug_row_context(req.prompt_cache_key());
+            let ctx = self.debug_row_context(target, req.prompt_cache_key());
             backend.start(&debug_prefix, ctx, dbg_req).await
         } else {
             None
@@ -1475,7 +1924,7 @@ impl LLMInner {
         let estimated_tokens = {
             let text = req.estimate_text();
             tracing::trace!("Text is {:?}", text);
-            self.model.config.count_tokens(&text)
+            target.model.config.count_tokens(&text)
         };
 
         tracing::trace!(
@@ -1486,15 +1935,16 @@ impl LLMInner {
         let now = std::time::SystemTime::now();
         let llm_fut = async {
             if use_stream {
-                self.client
-                    .send_streaming(&mut req, self.model.api_model_name())
+                target
+                    .client
+                    .send_streaming(&mut req, target.model.api_model_name())
                     .await
             } else {
-                self.client.send(&req).await
+                target.client.send(&req).await
             }
         };
 
-        let timeout = timeout_overwrite.unwrap_or_else(|| self.default_settings.timeout());
+        let timeout = timeout_overwrite.unwrap_or_else(|| target.settings.timeout());
         let resp = if timeout == Duration::MAX {
             llm_fut.await
         } else {
@@ -1547,7 +1997,11 @@ impl LLMInner {
         if let Some(claim) = given_claim.as_ref() {
             claim.confirm(Self::reported_cached_tokens(&resp));
         }
-        self.apply_filter_output(&mut resp);
+        target
+            .content_filter
+            .read()
+            .expect("content_filter poisoned")
+            .filter_output(&mut resp);
         if let (Some(backend), Some(handle), Some(dbg_req), Some(resp_json)) = (
             self.debug_backend.as_ref(),
             dbg_handle.as_ref(),
@@ -1587,12 +2041,17 @@ impl LLMInner {
                 reasoning_tokens: reasoning,
             };
 
+            // The target's own ledger first — even when the tree record below
+            // trips a cap, the spend happened and must count against this
+            // profile.
+            *target.spent.write().expect("target spend poisoned") += delta.cost(&target.model);
+
             // Tight critical section (no `.await` while the std guard is held):
             // bill the scope tree + prefix bucket, then snapshot root and the
             // per-prefix breakdown for the debug backend.
             let debug_snapshot = {
                 let mut tree = self.billing.write().unwrap();
-                tree.record(self.node, billing_prefix, &self.model, delta)?;
+                tree.record(self.node, billing_prefix, &target.model, delta)?;
                 // Snapshot under the same lock as the record, so this request's
                 // slice of the running total is exactly `total - billed` even
                 // when other scopes are recording concurrently.
@@ -1619,14 +2078,15 @@ impl LLMInner {
                     .record_billing(handle, snapshot, &usage_for_debug)
                     .await;
 
-                // Persist the cumulative per-debug_prefix breakdown (cost computed
-                // at this LLM's single model). Not tied to the per-request handle.
+                // Persist the cumulative per-debug_prefix breakdown (cost
+                // computed at this attempt's model). Not tied to the
+                // per-request handle.
                 let prefix_rows: Vec<PrefixBilling> = prefix_usage
                     .iter()
                     .map(|(prefix, tokens)| PrefixBilling {
                         prefix: prefix.clone(),
                         tokens: *tokens,
-                        cost_usd: tokens.cost(&self.model).to_f64().unwrap_or_default(),
+                        cost_usd: tokens.cost(&target.model).to_f64().unwrap_or_default(),
                     })
                     .collect();
                 backend.record_prefix_billing(&prefix_rows).await;
@@ -1641,7 +2101,7 @@ impl LLMInner {
                 };
                 // A small drift is just tokenizer noise; a large one means this
                 // model's tokenizer config is wrong and is worth surfacing.
-                if pct > self.default_settings.token_estimate_pct {
+                if pct > target.settings.token_estimate_pct {
                     tracing::info!(
                         "Token estimate: {} estimated vs {} actual (diff {:.1}%)",
                         est,
@@ -1701,9 +2161,56 @@ impl LLMInner {
         Ok((resp, assistant))
     }
 
-    /// Build an extensible chat request with this model's settings, tools, and provider quirks
-    /// applied. Per-message extras (e.g. mimo `reasoning_content`) are preserved from the
-    /// supplied wrapped messages.
+    /// [`LLMTarget::build_chat_request`] on the primary target.
+    pub fn build_chat_request(
+        &self,
+        messages: Vec<RawExtensibleChatRequestMessage>,
+        cache_key: Option<&str>,
+        settings: &LLMSettings,
+        tools: Option<Vec<ChatCompletionTools>>,
+    ) -> Result<RawExtensibleChatCompletionRequest, LLMYError> {
+        self.targets[0].build_chat_request(messages, cache_key, settings, tools)
+    }
+
+    /// [`LLMTarget::build_prompt_request`] on the primary target.
+    pub fn build_prompt_request(
+        &self,
+        sys_msg: &str,
+        user_msg: &str,
+        cache_key: Option<&str>,
+        settings: &LLMSettings,
+    ) -> Result<LLMRequest, LLMYError> {
+        self.targets[0].build_prompt_request(sys_msg, user_msg, cache_key, settings)
+    }
+
+    /// [`LLMTarget::build_conversation_request`] on the primary target.
+    pub fn build_conversation_request(
+        &self,
+        conversation: &[Message],
+        cache_key: Option<&str>,
+        settings: &LLMSettings,
+        tools: Option<Vec<ChatCompletionTools>>,
+    ) -> Result<LLMRequest, LLMYError> {
+        self.targets[0].build_conversation_request(conversation, cache_key, settings, tools)
+    }
+}
+
+impl LLMTarget {
+    /// Lower a chat-typed request into this target's wire format — see
+    /// [`LLMClient::lower_chat_request`]. This is how conversation-state
+    /// callers (agents, the message-level prompt APIs) go native on any
+    /// backend without the implicit-conversion opt-in.
+    pub fn lower_request(
+        &self,
+        chat: RawExtensibleChatCompletionRequest,
+    ) -> Result<LLMRequest, LLMYError> {
+        self.client
+            .lower_chat_request(chat, self.default_max_output_tokens())
+    }
+
+    /// Build an extensible chat request with this target's model, settings,
+    /// tools, and provider quirks applied. Per-message extras (e.g. mimo
+    /// `reasoning_content`) are preserved from the supplied wrapped messages.
     pub fn build_chat_request(
         &self,
         messages: Vec<RawExtensibleChatRequestMessage>,
@@ -1836,7 +2343,9 @@ impl LLMInner {
             )),
         }
     }
+}
 
+impl LLMInner {
     pub async fn prompt_messages_once(
         &self,
         messages: Vec<ChatCompletionRequestMessageRaw>,
@@ -1845,18 +2354,19 @@ impl LLMInner {
         settings: Option<LLMSettings>,
         tools: Option<Vec<ChatCompletionTools>>,
     ) -> Result<RawExtensibleChatCompletionResponse, LLMYError> {
-        let settings = settings.unwrap_or_else(|| self.default_settings.clone());
-        let timeout = settings.timeout();
-        let retry = settings.llm_retry;
-        let wrapped = messages
+        let wrapped: Vec<RawExtensibleChatRequestMessage> = messages
             .into_iter()
             .map(RawExtensibleChatRequestMessage::new)
             .collect();
-        let req = self.build_chat_request(wrapped, cache_key, &settings, tools)?;
-        // Explicit lowering: message-level callers go native on any backend.
-        let req = self.lower_request(req)?;
-        self.complete_request_once_with_retry(req, debug_prefix, Some(timeout), Some(retry))
-            .await
+        let planned = self.plan_messages(&wrapped, cache_key, settings.as_ref(), tools.as_ref())?;
+        self.complete_planned_once_with_retry(
+            planned,
+            debug_prefix,
+            settings.as_ref().map(|s| s.timeout()),
+            settings.as_ref().map(|s| s.llm_retry),
+        )
+        .await
+        .map(|(resp, _)| resp)
     }
 
     /// Like [`Self::prompt_messages_once`], but deserializes the first-choice
@@ -1870,22 +2380,16 @@ impl LLMInner {
         settings: Option<LLMSettings>,
         tools: Option<Vec<ChatCompletionTools>>,
     ) -> Result<T, LLMYError> {
-        let settings = settings.unwrap_or_else(|| self.default_settings.clone());
-        let timeout = settings.timeout();
-        let retry = settings.llm_retry;
-        let wrapped = messages
+        let wrapped: Vec<RawExtensibleChatRequestMessage> = messages
             .into_iter()
             .map(RawExtensibleChatRequestMessage::new)
             .collect();
-        let req: RawExtensibleChatCompletionRequest =
-            self.build_chat_request(wrapped, cache_key, &settings, tools)?;
-        // Explicit lowering: message-level callers go native on any backend.
-        let req = self.lower_request(req)?;
-        self.complete_request_once_with_retry_typed::<T>(
-            req,
+        let planned = self.plan_messages(&wrapped, cache_key, settings.as_ref(), tools.as_ref())?;
+        self.complete_planned_once_with_retry_typed::<T>(
+            planned,
             debug_prefix,
-            Some(timeout),
-            Some(retry),
+            settings.as_ref().map(|s| s.timeout()),
+            settings.as_ref().map(|s| s.llm_retry),
         )
         .await
     }
@@ -1995,7 +2499,7 @@ mod tests {
     fn parse_first_choice_parses_plain_json() {
         let llm = test_llm();
         let resp = crate::filters::build_resp(Some(r#"{"a": 2}"#), FinishReason::Stop);
-        let v: serde_json::Value = llm.parse_first_choice(&resp).unwrap();
+        let v: serde_json::Value = llm.targets[0].parse_first_choice(&resp).unwrap();
         assert_eq!(v["a"], 2);
     }
 
@@ -2003,7 +2507,7 @@ mod tests {
     fn parse_first_choice_auto_strips_markdown_fence() {
         let llm = test_llm(); // auto_strip = true
         let resp = crate::filters::build_resp(Some("```json\n{\"a\": 1}\n```"), FinishReason::Stop);
-        let v: serde_json::Value = llm.parse_first_choice(&resp).unwrap();
+        let v: serde_json::Value = llm.targets[0].parse_first_choice(&resp).unwrap();
         assert_eq!(v["a"], 1);
     }
 
@@ -2013,7 +2517,7 @@ mod tests {
         settings.auto_strip = false;
         let llm = test_llm_with(settings);
         let resp = crate::filters::build_resp(Some("```json\n{\"a\": 1}\n```"), FinishReason::Stop);
-        let parsed: Result<serde_json::Value, _> = llm.parse_first_choice(&resp);
+        let parsed: Result<serde_json::Value, _> = llm.targets[0].parse_first_choice(&resp);
         assert!(matches!(parsed, Err(LLMYError::STDJSON(_))));
     }
 
@@ -2021,7 +2525,7 @@ mod tests {
     fn parse_first_choice_errors_when_no_content() {
         let llm = test_llm();
         let resp = crate::filters::build_resp(None, FinishReason::Stop);
-        let parsed: Result<serde_json::Value, _> = llm.parse_first_choice(&resp);
+        let parsed: Result<serde_json::Value, _> = llm.targets[0].parse_first_choice(&resp);
         assert!(parsed.is_err());
     }
 
@@ -2608,7 +3112,7 @@ mod tests {
             .build_prompt_request("s", "u", None, &settings)
             .unwrap();
         let before = serde_json::to_value(&native).unwrap();
-        let resolved = anthropic
+        let resolved = anthropic.targets[0]
             .client
             .resolve_request(native, 4096, false)
             .unwrap();
@@ -2617,7 +3121,7 @@ mod tests {
         // Every cross-protocol send is an implicit conversion and is refused
         // by default — a chat struct included...
         let chat: LLMRequest = user_request("hello").into();
-        let err = anthropic
+        let err = anthropic.targets[0]
             .client
             .resolve_request(chat.clone(), 4096, false)
             .unwrap_err();
@@ -2628,7 +3132,7 @@ mod tests {
         let foreign = responses_llm()
             .build_prompt_request("sys", "hello", None, &settings)
             .unwrap();
-        let err = anthropic
+        let err = anthropic.targets[0]
             .client
             .resolve_request(foreign.clone(), 4096, false)
             .unwrap_err();
@@ -2638,9 +3142,12 @@ mod tests {
         );
 
         // ...and converts through the chat hub once the caller opts in.
-        let resolved = anthropic.client.resolve_request(chat, 4096, true).unwrap();
+        let resolved = anthropic.targets[0]
+            .client
+            .resolve_request(chat, 4096, true)
+            .unwrap();
         assert_eq!(resolved.protocol(), "anthropic");
-        let resolved = anthropic
+        let resolved = anthropic.targets[0]
             .client
             .resolve_request(foreign, 4096, true)
             .unwrap();
@@ -2653,7 +3160,7 @@ mod tests {
         let native = anthropic
             .build_prompt_request("sys", "hello", None, &settings)
             .unwrap();
-        let resolved = test_llm()
+        let resolved = test_llm().targets[0]
             .client
             .resolve_request(native, 4096, true)
             .unwrap();
@@ -2684,7 +3191,7 @@ mod tests {
         // state; lowering it is an explicit build, not an implicit conversion,
         // so it needs no allow_implicit_convert even on native backends.
         let anthropic = anthropic_llm();
-        assert!(!anthropic.default_settings.allow_implicit_convert);
+        assert!(!anthropic.targets[0].settings.allow_implicit_convert);
         let lowered = anthropic.lower_request(user_request("hello")).unwrap();
         assert_eq!(lowered.protocol(), "anthropic");
 
@@ -2696,6 +3203,101 @@ mod tests {
         assert_eq!(chat.protocol(), "chat-completion");
     }
 
+    // --- fallback chain ------------------------------------------------------
+
+    fn fallback_profile(name: &str, model: &str, cap: Option<Decimal>) -> LLMProfile {
+        LLMProfile {
+            name: name.to_string(),
+            config: SupportedConfig::new("http://localhost:0", "k"),
+            model: OpenAIModel::from_str(model).unwrap(),
+            settings: test_settings(None),
+            cap,
+        }
+    }
+
+    fn order_names(llm: &LLM) -> Vec<String> {
+        llm.llm
+            .target_order()
+            .expect("order")
+            .iter()
+            .map(|t| t.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn target_order_demotes_cooling_profiles_and_drops_over_cap_ones() {
+        let llm = LLM::new_with_fallback(
+            vec![
+                fallback_profile("a", "captest,1000000,1000000", None),
+                fallback_profile("b", "captest,1000000,1000000", Some(rust_decimal::dec!(1))),
+                fallback_profile("c", "captest,1000000,1000000", None),
+            ],
+            rust_decimal::dec!(100),
+            Duration::from_secs(60),
+            None,
+        )
+        .expect("llm");
+        assert_eq!(order_names(&llm), ["a", "b", "c"]);
+
+        // A cooling profile is demoted behind the rest, not skipped.
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        llm.targets[0].cooldown_until.store(i64::MAX, relaxed);
+        assert_eq!(order_names(&llm), ["b", "c", "a"]);
+        llm.targets[0].cooldown_until.store(0, relaxed);
+        assert_eq!(order_names(&llm), ["a", "b", "c"]);
+
+        // A profile over its own cap is dropped outright.
+        *llm.targets[1].spent.write().unwrap() += rust_decimal::dec!(2);
+        assert_eq!(order_names(&llm), ["a", "c"]);
+
+        // An expired cooldown restores the original order.
+        llm.targets[0]
+            .cooldown_until
+            .store(chrono::Utc::now().timestamp_millis(), relaxed);
+        assert_eq!(order_names(&llm), ["a", "c"]);
+    }
+
+    #[test]
+    fn every_profile_over_its_cap_is_a_billing_error() {
+        let llm = LLM::new_with_fallback(
+            vec![fallback_profile(
+                "only",
+                "captest,1000000,1000000",
+                Some(rust_decimal::dec!(1)),
+            )],
+            rust_decimal::dec!(100),
+            Duration::from_secs(60),
+            None,
+        )
+        .expect("llm");
+        *llm.targets[0].spent.write().unwrap() += rust_decimal::dec!(2);
+        let err = llm.llm.target_order().unwrap_err();
+        assert!(matches!(err, LLMYError::Billing(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_fallback_target_rewrites_the_model_id_and_the_primary_does_not() {
+        let llm = LLM::new_with_fallback(
+            vec![
+                fallback_profile("a", "first-model,1,1", None),
+                fallback_profile("b", "second-model,1,1", None),
+            ],
+            rust_decimal::dec!(100),
+            Duration::from_secs(60),
+            None,
+        )
+        .expect("llm");
+
+        let req = LLMRequest::Chat(user_request("hello"));
+        let kept = llm.targets[0].adapt_request(req.clone(), true).unwrap();
+        let value = serde_json::to_value(&kept).unwrap();
+        assert_eq!(value["model"], "mimo-v2.5-pro");
+
+        let rewritten = llm.targets[1].adapt_request(req, false).unwrap();
+        let value = serde_json::to_value(&rewritten).unwrap();
+        assert_eq!(value["model"], "second-model");
+    }
+
     #[test]
     fn native_requests_take_auto_cache_keys_only_where_the_protocol_has_them() {
         // The responses protocol routes by prompt_cache_key, so a native
@@ -2704,7 +3306,7 @@ mod tests {
         let req = responses
             .build_prompt_request("sys", "hello", None, &test_settings(None))
             .unwrap();
-        let claim = responses
+        let claim = responses.targets[0]
             .auto_cache_key_request(&req, None)
             .expect("auto key");
         claim.confirm(0);
@@ -2714,6 +3316,10 @@ mod tests {
         let req = anthropic
             .build_prompt_request("sys", "hello", None, &test_settings(None))
             .unwrap();
-        assert!(anthropic.auto_cache_key_request(&req, None).is_none());
+        assert!(
+            anthropic.targets[0]
+                .auto_cache_key_request(&req, None)
+                .is_none()
+        );
     }
 }

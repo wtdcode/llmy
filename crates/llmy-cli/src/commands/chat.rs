@@ -16,7 +16,7 @@ use llmy_agent_tools::memory::{
     AgentMemory, AgentMemoryContext,
     embed::{SimilarityModel, SimilarityModelConfig},
 };
-use llmy_clap::OpenAISetup;
+use llmy_clap::{LLMYConfigSetup, OpenAISetup};
 use llmy_harness::Agent;
 #[cfg(feature = "memory-embed-search")]
 use llmy_harness::memory::AgentMemorySystemPromptCriteria;
@@ -28,6 +28,9 @@ use super::chat_commands::{ChatInput, parse_chat_input, run_chat_command};
 pub struct ChatArgs {
     #[command(flatten)]
     openai: OpenAISetup,
+
+    #[command(flatten)]
+    llmy_config: LLMYConfigSetup,
 
     /// Optional system prompt
     #[arg(long)]
@@ -69,8 +72,15 @@ pub struct ChatArgs {
 }
 
 pub async fn run_chat(args: ChatArgs) -> color_eyre::Result<()> {
-    let settings = args.openai.settings();
-    let llm = args.openai.clone().to_llm().await;
+    // The TOML config wins when given; its profiles carry their own settings
+    // (no per-step override), so the fallback chain can differ per profile.
+    let (llm, settings) = match args.llmy_config.may_llm().await? {
+        Some(llm) => (llm, None),
+        None => {
+            let settings = args.openai.settings();
+            (args.openai.clone().to_llm().await, Some(settings))
+        }
+    };
     let system = args
         .system
         .as_deref()
@@ -98,13 +108,11 @@ pub async fn run_chat(args: ChatArgs) -> color_eyre::Result<()> {
         match parse_chat_input(&input) {
             Ok(ChatInput::User(input)) => {
                 agent
-                    .step_with_user(input, &llm, Some("chat"), Some(settings.clone()))
+                    .step_with_user(input, &llm, Some("chat"), settings.clone())
                     .await?;
 
                 while print_last_step(&agent, is_tty) {
-                    agent
-                        .step(&llm, Some("chat"), Some(settings.clone()))
-                        .await?;
+                    agent.step(&llm, Some("chat"), settings.clone()).await?;
                 }
             }
             Ok(ChatInput::Command(command)) => {
@@ -113,7 +121,7 @@ pub async fn run_chat(args: ChatArgs) -> color_eyre::Result<()> {
                     &mut agent,
                     &llm,
                     Some("chat"),
-                    Some(settings.clone()),
+                    settings.clone(),
                     is_tty,
                 )
                 .await?;

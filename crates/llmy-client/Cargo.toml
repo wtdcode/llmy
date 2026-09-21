@@ -29,6 +29,7 @@ reqwest.workspace = true
 rust_decimal = { workspace = true, features = ["serde", "macros"] }
 
 llmy-tokenizer.workspace = true
+chrono.workspace = true
 llmy-types.workspace = true
 
 [features]

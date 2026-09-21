@@ -160,7 +160,7 @@ impl HarnessRunner {
 
         let db = HarnessStateDB::open(&options.state_db_path).await?;
         let run_id = db
-            .begin_run(&llm.model.to_string(), &options.prompt)
+            .begin_run(&llm.targets[0].model.to_string(), &options.prompt)
             .await?;
 
         let mut policy = ToolResultPolicy {
@@ -290,11 +290,13 @@ impl HarnessRunner {
     }
 
     /// Drive the agent loop until every finish gate passes (or a budget runs
-    /// out), then finalize databases and background work.
+    /// out), then finalize databases and background work. `settings`
+    /// overrides every LLM profile's own settings when given; `None` lets
+    /// each profile of a fallback chain run on its own.
     pub async fn run(
         mut self,
         llm: &LLM,
-        settings: &LLMSettings,
+        settings: Option<LLMSettings>,
         debug_prefix: Option<&str>,
     ) -> Result<HarnessOutcome, LLMYError> {
         self.agent.push_user_message(self.initial_prompt.clone());
@@ -320,10 +322,7 @@ impl HarnessRunner {
             }
             steps += 1;
 
-            let step = self
-                .agent
-                .step(llm, debug_prefix, Some(settings.clone()))
-                .await;
+            let step = self.agent.step(llm, debug_prefix, settings.clone()).await;
             let step = match step {
                 Ok(step) => step,
                 Err(error) => {

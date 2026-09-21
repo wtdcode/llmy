@@ -7,7 +7,7 @@
 
 ## General Coding Style For Rust
 
-- No 1-2 line helper.
+- No 1-2 line helper. Just make field public to avoid simple getters. Avoid any 1-2 line utils functions.
 - Think about the data flow first and design the data structs. Then construct the control flows.
 - Avoid functions that are used only once, unless the logic is complex enough. Always consider reusable components and functions.
 - Avoid free functions, always attach functions to some structs, i.e., member functions. This makes functions as transformers of the data flows. For really small necessary utils, merge them into a single file and the key point is to avoid duplication.
@@ -16,6 +16,7 @@
 - No `unwrap` in any case, always prefer `Result<...>` or `Option<T>` 
 - Avoid lifetime parameter if possible and accept cheap copies using types like `String` and `PathBuf`.
 - Always prefer BTreeMap.
+- Avoid dynamic dispatch like fn(&T) -> String, only if the code or callback is really only known during runtime, like typical JIT related stuff. Always prefer static dispatch, like enums, for readability and code maintaince.
 - Avoid global constants, always make parameters configuration via clap derive structs.
 - Place llm prompts in a single rust file.
 
