@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Args;
 use color_eyre::eyre::eyre;
 use llmy_agent::tool::ToolBox;
-use llmy_clap::{LLMYConfigSetup, OpenAISetup};
+use llmy_clap::OpenAISetup;
 use llmy_codegraph::{CodeGraphBuilder, CodeGraphStore, CodegraphContext};
 use llmy_harness_app::prompts::render_codegraph_section;
 use llmy_harness_app::{
@@ -15,9 +15,6 @@ use llmy_harness_app::{
 pub struct HarnessArgs {
     #[command(flatten)]
     openai: OpenAISetup,
-
-    #[command(flatten)]
-    llmy_config: LLMYConfigSetup,
 
     /// The task prompt, inline.
     #[arg(long, conflicts_with = "prompt_file")]
@@ -229,15 +226,8 @@ pub async fn run_harness(args: HarnessArgs) -> color_eyre::Result<()> {
         args.root.canonicalize()?
     };
 
-    // The TOML config wins when given; its profiles carry their own settings
-    // (no per-step override), so the fallback chain can differ per profile.
-    let (llm, settings) = match args.llmy_config.may_llm().await? {
-        Some(llm) => (llm, None),
-        None => {
-            let settings = args.openai.settings();
-            (args.openai.clone().to_llm().await, Some(settings))
-        }
-    };
+    let settings = args.openai.settings_override();
+    let llm = args.openai.clone().to_llm().await;
 
     let output_schema = args.resolve_output_schema().await?;
     let memory = args.resolve_memory().await?;

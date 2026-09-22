@@ -18,7 +18,7 @@ const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_AZURE_API_VERSION: &str = "2025-01-01-preview";
 
 mod config;
-pub use config::{LLMYConfig, LLMYConfigSetup};
+pub use config::LLMYConfig;
 
 // One source of truth for every defaulted knob: the clap flag attributes
 // (`default_value_t`) and each setup struct's `Default` impl (which backs
@@ -44,6 +44,17 @@ macro_rules! make_openai_args {
         /// [`crate::LLMYConfig`] TOML file, which resolves it env-isolated —
         /// see the `env_isolated` parameter of the `resolved_*`/`to_config`
         /// methods.
+        ///
+        /// `llmy-config` switches between the two: without it, `may_llm`/
+        /// `to_llm` build the single endpoint these flags describe, exactly
+        /// as before. With it, the LLM is the config file's fallback chain,
+        /// and this flag/env setup is additionally injected into the chain's
+        /// profile set under the name [`DEFAULT_PROFILE_NAME`] (when it
+        /// resolves a model), so the config's `fallback` list or
+        /// `llm-profiles` can reference the env-configured endpoint as
+        /// `"default"`. It joins only when referenced. Should the config
+        /// itself define a profile named `"default"`, the injected one wins
+        /// and the override is logged as a warning.
         #[derive(Args, Clone, Debug, serde::Deserialize)]
         #[serde(rename_all = "kebab-case", deny_unknown_fields, default)]
         pub struct $struct_name {
@@ -362,6 +373,25 @@ macro_rules! make_openai_args {
             )]
             pub allow_implicit_convert: bool,
 
+            /// Path to a llmy TOML config file with LLM profiles. When
+            /// given, `may_llm`/`to_llm` build the config's fallback chain
+            /// instead of this single endpoint — see the struct docs for how
+            /// this setup itself joins that chain. Never valid inside a
+            /// config profile.
+            #[arg(long = concat!($long, "llmy-config"), env = concat!($prefix, "LLMY_CONFIG"))]
+            #[serde(skip)]
+            pub llmy_config: Option<std::path::PathBuf>,
+
+            /// Profile names to use in fallback order (comma-separated),
+            /// overriding the config file's `fallback` list. Only meaningful
+            /// together with `llmy-config`.
+            #[arg(
+                long = concat!($long, "llm-profiles"),
+                value_delimiter = ',',
+                requires = "llmy_config"
+            )]
+            #[serde(skip)]
+            pub llm_profiles: Option<Vec<String>>,
         }
 
         /// A blank TOML profile: every knob at its documented default,
@@ -415,11 +445,29 @@ macro_rules! make_openai_args {
                     billing_log_tokens: DEFAULT_LLM_BILLING_LOG_TOKENS,
                     token_estimate_pct: DEFAULT_LLM_TOKEN_ESTIMATE_PCT,
                     allow_implicit_convert: false,
+                    llmy_config: None,
+                    llm_profiles: None,
                 }
             }
         }
 
         impl $struct_name {
+            /// The per-step settings override to pass into the agent loop
+            /// (`Agent::step`, `HarnessRunner::run`). In the plain env/flag
+            /// mode this is `Some(self.settings())`, pinning these settings
+            /// on every request — the behavior from before fallback chains
+            /// existed. In `llmy-config` mode it is `None`: an override
+            /// would clobber the per-profile settings of the chain, so each
+            /// profile must run on its own. Binaries should pass this value
+            /// through instead of re-deriving the distinction.
+            pub fn settings_override(&self) -> Option<LLMSettings> {
+                if self.llmy_config.is_none() {
+                    Some(self.settings())
+                } else {
+                    None
+                }
+            }
+
             pub fn settings(&self) -> LLMSettings {
                 LLMSettings {
                     llm_temperature: self.llm_temperature,
@@ -834,19 +882,50 @@ macro_rules! make_openai_args {
                 .await
             }
 
+            /// This flag/env setup as the profile named
+            /// [`DEFAULT_PROFILE_NAME`] — what joins a config-file fallback
+            /// chain when `llmy-config` is given. `None` when no model is
+            /// configured here (then there is nothing to inject). The
+            /// `biling-cap` flag becomes this profile's own cap; the chain's
+            /// global cap comes from the config file.
+            pub fn default_profile(&self) -> Result<Option<LLMProfile>, LLMYError> {
+                let Some(model) = self.resolved_model(false)? else {
+                    return Ok(None);
+                };
+                Ok(Some(LLMProfile {
+                    name: DEFAULT_PROFILE_NAME.to_string(),
+                    config: self.to_config(false)?,
+                    model: model.with_full_id(self.use_full_model_id),
+                    settings: self.settings(),
+                    cap: self.biling_cap,
+                }))
+            }
+
+            /// The LLM this setup describes, or `None` when nothing is
+            /// configured. With `llmy-config` given, the LLM is the config
+            /// file's fallback chain (this setup injected as the profile
+            /// named [`DEFAULT_PROFILE_NAME`] — see the struct docs);
+            /// otherwise the single endpoint of these flags, or `None`
+            /// without a model.
             pub async fn may_llm(self) -> Result<Option<LLM>, LLMYError> {
+                if let Some(path) = &self.llmy_config {
+                    let config = crate::LLMYConfig::load(path)?;
+                    let injected = self.default_profile()?;
+                    return Ok(Some(
+                        config
+                            .to_llm(self.llm_profiles.as_deref(), injected)
+                            .await?,
+                    ));
+                }
                 let Some(model) = self.resolved_model(false)? else { return Ok(None); };
                 Ok(Some(self.llm_new_inner(model).await?))
             }
 
             pub async fn to_llm(self) -> LLM {
-                let model = self
-                    .resolved_model(false)
-                    .expect("resolve model")
-                    .expect("LLM model not given");
-                self.llm_new_inner(model)
+                self.may_llm()
                     .await
                     .expect("construct LLM")
+                    .expect("LLM model not given (no --model/LLM_MODEL and no llmy-config)")
             }
         }
     };
@@ -1183,6 +1262,16 @@ mod tests {
             "x/1",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn the_settings_override_applies_only_without_a_config_file() {
+        assert!(parse(&[]).settings_override().is_some());
+        assert!(
+            parse(&["--opt-opt-llmy-config", "llmy.toml"])
+                .settings_override()
+                .is_none()
+        );
     }
 
     #[test]

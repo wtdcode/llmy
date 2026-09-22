@@ -3,10 +3,9 @@
 //! This complements the env/flag entry point — same structs, second door.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-use clap::Args;
 use color_eyre::eyre::eyre;
 use llmy_client::client::{DEFAULT_FALLBACK_COOLDOWN, LLM, LLMProfile};
 use llmy_types::error::LLMYError;
@@ -92,7 +91,15 @@ impl LLMYConfig {
     /// when given, else the file's `fallback` list, else the single profile.
     /// Several profiles with no order given is refused rather than silently
     /// ordered alphabetically; so are unknown names and duplicates.
-    pub fn selection(&self, cli_override: Option<&[String]>) -> Result<Vec<String>, LLMYError> {
+    ///
+    /// `injected` is the name of the env/flag profile joining the chain (see
+    /// [`crate::OpenAISetup`]): it is a valid name to reference, but never
+    /// picked by the defaults — only the config's own profiles are.
+    pub fn selection(
+        &self,
+        cli_override: Option<&[String]>,
+        injected: Option<&str>,
+    ) -> Result<Vec<String>, LLMYError> {
         let names: Vec<String> = match cli_override {
             Some(names) if !names.is_empty() => names.to_vec(),
             _ => match &self.fallback {
@@ -109,7 +116,7 @@ impl LLMYConfig {
         };
         let mut seen = BTreeSet::new();
         for name in &names {
-            if !self.profiles.contains_key(name) {
+            if !self.profiles.contains_key(name) && Some(name.as_str()) != injected {
                 return Err(LLMYError::Other(eyre!(
                     "unknown profile '{}'; the config defines: {}",
                     name,
@@ -168,13 +175,32 @@ impl LLMYConfig {
     }
 
     /// Build the fallback-chain LLM this config describes. `cli_override`
-    /// (from `--llm-profiles`) picks and orders a subset of the profiles.
-    pub async fn to_llm(&self, cli_override: Option<&[String]>) -> Result<LLM, LLMYError> {
-        let names = self.selection(cli_override)?;
-        let profiles = names
-            .iter()
-            .map(|name| self.build_profile(name))
-            .collect::<Result<Vec<_>, _>>()?;
+    /// (from `--llm-profiles`) picks and orders a subset of the profiles;
+    /// `injected` is the env/flag setup joining the profile set (see
+    /// [`crate::OpenAISetup`]) — referencable by its name, and winning over
+    /// a config profile of the same name with a warning.
+    pub async fn to_llm(
+        &self,
+        cli_override: Option<&[String]>,
+        injected: Option<LLMProfile>,
+    ) -> Result<LLM, LLMYError> {
+        let names = self.selection(cli_override, injected.as_ref().map(|p| p.name.as_str()))?;
+        let mut profiles = Vec::new();
+        for name in &names {
+            match injected.as_ref().filter(|profile| &profile.name == name) {
+                Some(profile) => {
+                    if self.profiles.contains_key(name) {
+                        tracing::warn!(
+                            "config profile '{}' is overridden by the env/flag setup \
+                             injected under the same name",
+                            name
+                        );
+                    }
+                    profiles.push(profile.clone());
+                }
+                None => profiles.push(self.build_profile(name)?),
+            }
+        }
         LLM::new_with_fallback_async(
             profiles,
             self.billing_cap.unwrap_or(rust_decimal::dec!(10.0)),
@@ -187,33 +213,6 @@ impl LLMYConfig {
             self.llm_debug.clone(),
         )
         .await
-    }
-}
-
-/// The CLI flags of the TOML entry point, meant to sit beside an
-/// [`OpenAISetup`] in a binary: when `--llmy-config`/`LLMY_CONFIG` is given
-/// the file wins, otherwise the flag/env setup serves as before.
-#[derive(Args, Clone, Debug)]
-pub struct LLMYConfigSetup {
-    /// Path to the llmy TOML config file with LLM profiles.
-    #[arg(long = "llmy-config", env = "LLMY_CONFIG")]
-    pub llmy_config: Option<PathBuf>,
-
-    /// Profile names to use in fallback order (comma-separated), overriding
-    /// the config file's `fallback` list.
-    #[arg(long = "llm-profiles", value_delimiter = ',', requires = "llmy_config")]
-    pub llm_profiles: Option<Vec<String>>,
-}
-
-impl LLMYConfigSetup {
-    /// The fallback-chain LLM the config file describes, or `None` when no
-    /// file was given.
-    pub async fn may_llm(&self) -> Result<Option<LLM>, LLMYError> {
-        let Some(path) = &self.llmy_config else {
-            return Ok(None);
-        };
-        let config = LLMYConfig::load(path)?;
-        Ok(Some(config.to_llm(self.llm_profiles.as_deref()).await?))
     }
 }
 
@@ -319,25 +318,28 @@ mod tests {
     #[test]
     fn selection_honors_fallback_order_override_and_validation() {
         let config = two_profile_config();
-        assert_eq!(config.selection(None).expect("order"), ["ali", "official"]);
+        assert_eq!(
+            config.selection(None, None).expect("order"),
+            ["ali", "official"]
+        );
 
         // The CLI override picks and reorders a subset.
         let onlyone = ["official".to_string()];
         assert_eq!(
-            config.selection(Some(&onlyone)).expect("order"),
+            config.selection(Some(&onlyone), None).expect("order"),
             ["official"]
         );
 
         // Unknown names and duplicates are refused.
         let unknown = ["nope".to_string()];
-        assert!(config.selection(Some(&unknown)).is_err());
+        assert!(config.selection(Some(&unknown), None).is_err());
         let dup = ["ali".to_string(), "ali".to_string()];
-        assert!(config.selection(Some(&dup)).is_err());
+        assert!(config.selection(Some(&dup), None).is_err());
 
         // Several profiles with no order at all is ambiguous.
         let mut orderless = config.clone();
         orderless.fallback = None;
-        assert!(orderless.selection(None).is_err());
+        assert!(orderless.selection(None, None).is_err());
 
         // A single profile needs no order.
         let single = LLMYConfig::parse_toml(
@@ -347,13 +349,13 @@ mod tests {
             "#,
         )
         .expect("config");
-        assert_eq!(single.selection(None).expect("order"), ["only"]);
+        assert_eq!(single.selection(None, None).expect("order"), ["only"]);
     }
 
     #[tokio::test]
     async fn to_llm_builds_the_chain_in_order_with_caps() {
         let config = two_profile_config();
-        let llm = config.to_llm(None).await.expect("llm");
+        let llm = config.to_llm(None, None).await.expect("llm");
 
         let names: Vec<&str> = llm.targets.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["ali", "official"]);
@@ -385,6 +387,102 @@ mod tests {
         assert_eq!(inherits.settings.llm_concurrent, 4);
         let overrides = config.build_profile("overrides").expect("profile");
         assert_eq!(overrides.settings.llm_concurrent, 0);
+    }
+
+    fn injected_profile(model: &str) -> LLMProfile {
+        LLMProfile {
+            name: llmy_client::client::DEFAULT_PROFILE_NAME.to_string(),
+            config: llmy_client::client::SupportedConfig::new("http://localhost:0/v1", "sk-env"),
+            model: model
+                .parse::<llmy_client::model::OpenAIModel>()
+                .expect("model"),
+            settings: OpenAISetup::default().settings(),
+            cap: None,
+        }
+    }
+
+    fn target_names(llm: &LLM) -> Vec<&str> {
+        llm.targets.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn the_env_setup_joins_the_chain_only_when_referenced() {
+        let config = two_profile_config();
+
+        // Not referenced: the chain is exactly the config's fallback list.
+        let llm = config
+            .to_llm(None, Some(injected_profile("env-model,1,1")))
+            .await
+            .expect("llm");
+        assert_eq!(target_names(&llm), ["ali", "official"]);
+
+        // Referenced by the CLI override: it joins in the given position.
+        let order = ["official".to_string(), "default".to_string()];
+        let llm = config
+            .to_llm(Some(&order), Some(injected_profile("env-model,1,1")))
+            .await
+            .expect("llm");
+        assert_eq!(target_names(&llm), ["official", "default"]);
+        assert_eq!(llm.targets[1].model.model_name(), "env-model");
+
+        // Without an injected profile the name is unknown.
+        assert!(config.to_llm(Some(&order), None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_injected_default_overrides_a_config_profile_of_that_name() {
+        let config = LLMYConfig::parse_toml(
+            r#"
+            fallback = ["default"]
+
+            [profiles.default]
+            model = "config-model,1,1"
+            openai-url = "http://localhost:0/v1"
+            "#,
+        )
+        .expect("config");
+
+        // The env/flag setup wins over the same-named config profile.
+        let llm = config
+            .to_llm(None, Some(injected_profile("env-model,1,1")))
+            .await
+            .expect("llm");
+        assert_eq!(llm.targets[0].model.model_name(), "env-model");
+
+        // Without it the config's own `default` serves untouched.
+        let llm = config.to_llm(None, None).await.expect("llm");
+        assert_eq!(llm.targets[0].model.model_name(), "config-model");
+    }
+
+    #[tokio::test]
+    async fn the_llmy_config_flag_switches_the_setup_to_the_chain() {
+        // Guards the env reads of the non-isolated `default_profile` path.
+        let _env = crate::tests::env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("llmy.toml");
+        std::fs::write(
+            &path,
+            r#"
+            fallback = ["a", "default"]
+
+            [profiles.a]
+            model = "a-model,1,1"
+            openai-url = "http://localhost:0/v1"
+            "#,
+        )
+        .expect("write config");
+
+        // The opt-opt flavor, so real env vars cannot interfere.
+        let setup = crate::OptOptOpenAISetup {
+            model: Some("env-model,1,1".parse().expect("model")),
+            openai_url: Some("http://localhost:0/v1".to_string()),
+            llmy_config: Some(path),
+            ..Default::default()
+        };
+
+        let llm = setup.may_llm().await.expect("llm").expect("chain");
+        assert_eq!(target_names(&llm), ["a", "default"]);
+        assert_eq!(llm.targets[1].model.model_name(), "env-model");
     }
 
     #[test]

@@ -3510,6 +3510,7 @@ dependencies = [
  "llmy-types",
  "rust_decimal",
  "serde",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",

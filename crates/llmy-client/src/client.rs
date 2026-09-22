@@ -761,6 +761,11 @@ pub struct LLM {
 /// first again — see [`LLM::new_with_fallback`].
 pub const DEFAULT_FALLBACK_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// The profile name of a single-endpoint client ([`LLM::new`]) — and the
+/// name an env/flag setup is injected under when it joins a config-file
+/// fallback chain.
+pub const DEFAULT_PROFILE_NAME: &str = "default";
+
 /// One upstream profile of an [`LLM`]: an endpoint config plus the model,
 /// settings, and optional spend cap to use through it. The first profile of
 /// a fallback chain is the primary; the rest take over, in order, when the
@@ -790,7 +795,7 @@ impl LLM {
         debug_backend: Option<DebugBackend>,
     ) -> Self {
         let profile = LLMProfile {
-            name: "default".to_string(),
+            name: DEFAULT_PROFILE_NAME.to_string(),
             config,
             model,
             settings,
