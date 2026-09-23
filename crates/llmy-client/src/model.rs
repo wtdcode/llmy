@@ -3,7 +3,9 @@ use std::{fmt, str::FromStr};
 use rust_decimal::{Decimal, dec};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub use llmy_tokenizer::{CachePolicy, ModelConfig, ModelId, ModelPricing, ModelTokens};
+pub use llmy_tokenizer::{
+    CachePolicy, LongContextPricing, ModelConfig, ModelId, ModelPricing, ModelTokens,
+};
 
 #[derive(Debug, Clone)]
 pub struct OpenAIModel {
@@ -81,6 +83,8 @@ impl OpenAIModel {
             output: Decimal::ZERO,
             input_cache_read: None,
             input_cache_write: None,
+            long_context: None,
+            off_peak: None,
         })
     }
 
@@ -141,18 +145,24 @@ impl FromStr for OpenAIModel {
                     output: values[1] / per_million,
                     input_cache_read: None,
                     input_cache_write: None,
+                    long_context: None,
+                    off_peak: None,
                 },
                 3 => ModelPricing {
                     input: values[0] / per_million,
                     output: values[1] / per_million,
                     input_cache_read: Some(values[2] / per_million),
                     input_cache_write: None,
+                    long_context: None,
+                    off_peak: None,
                 },
                 4 => ModelPricing {
                     input: values[0] / per_million,
                     output: values[1] / per_million,
                     input_cache_read: Some(values[2] / per_million),
                     input_cache_write: Some(values[3] / per_million),
+                    long_context: None,
+                    off_peak: None,
                 },
                 _ => {
                     return Err(
@@ -236,12 +246,12 @@ mod tests {
 
     #[test]
     fn custom_pricing_reuses_registered_model_limits() {
-        let model = OpenAIModel::from_str("DeepSeek V4 Flash,0.5,1.5,0.1").unwrap();
+        let model = OpenAIModel::from_str("DeepSeek V4.1 Flash,0.5,1.5,0.1").unwrap();
         let pricing = model.pricing();
 
-        assert_eq!(model.model_id_str(), "deepseek/deepseek-v4-flash");
+        assert_eq!(model.model_id_str(), "deepseek/deepseek-flash");
         assert_eq!(model.owner(), Some("deepseek"));
-        assert_eq!(model.model_name(), "deepseek-v4-flash");
+        assert_eq!(model.model_name(), "deepseek-flash");
         assert_eq!(model.config.max_input_tokens, 655360);
         assert_eq!(model.config.max_tokens, 393216);
         assert_eq!(pricing.input, rust_decimal::dec!(0.0000005));

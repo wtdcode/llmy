@@ -29,6 +29,31 @@ struct ModelTokens {
 }
 
 #[derive(Deserialize)]
+struct LongContextPricing {
+    threshold: u64,
+    input: f64,
+    output: f64,
+    #[serde(default)]
+    input_cache_read: Option<f64>,
+    #[serde(default)]
+    input_cache_write: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct OffPeakPricing {
+    /// Daily UTC "HH:MM" pairs during which the base (peak) rates apply.
+    peak_windows_utc: Vec<(String, String)>,
+    #[serde(default)]
+    peak_weekdays_only: bool,
+    input: f64,
+    output: f64,
+    #[serde(default)]
+    input_cache_read: Option<f64>,
+    #[serde(default)]
+    input_cache_write: Option<f64>,
+}
+
+#[derive(Deserialize)]
 struct ModelPricing {
     input: f64,
     output: f64,
@@ -36,6 +61,10 @@ struct ModelPricing {
     input_cache_read: Option<f64>,
     #[serde(default)]
     input_cache_write: Option<f64>,
+    #[serde(default)]
+    long_context: Option<LongContextPricing>,
+    #[serde(default)]
+    off_peak: Option<OffPeakPricing>,
 }
 
 /// Mirrors `llmy_tokenizer::CachePolicy`; absent in the JSON means the classic
@@ -69,6 +98,17 @@ struct ModelConfig {
     pricing: Option<ModelPricing>,
     #[serde(default)]
     cache_policy: CachePolicy,
+}
+
+/// A registry entry: a full config, or an alias pointing at another key.
+/// An alias becomes its own `ModelId` with the target's config — but keeps
+/// its own key as the wire model name, since proxies serving retired names
+/// (e.g. `deepseek-v4-flash-0731`) demand the literal string.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ModelEntry {
+    Alias { alias_of: String },
+    Config(Box<ModelConfig>),
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +145,17 @@ fn fmt_opt_decimal(v: Option<f64>) -> String {
         Some(val) => format!("Some({})", fmt_decimal(val)),
         None => "None".to_string(),
     }
+}
+
+/// Parse an off-peak window bound like "16:30" into minutes of day.
+fn minutes_of_day(hhmm: &str) -> u32 {
+    let (h, m) = hhmm
+        .split_once(':')
+        .unwrap_or_else(|| panic!("bad HH:MM window bound: {hhmm}"));
+    let hours: u32 = h.parse().unwrap();
+    let minutes: u32 = m.parse().unwrap();
+    assert!(hours < 24 && minutes < 60, "bad HH:MM window bound: {hhmm}");
+    hours * 60 + minutes
 }
 
 fn pascal_case(s: &str) -> String {
@@ -161,7 +212,23 @@ fn main() {
 
 fn generate_models(data_dir: &Path, out_dir: &str) {
     let json = fs::read_to_string(data_dir.join("models.json")).unwrap();
-    let models: HashMap<String, ModelConfig> = serde_json::from_str(&json).unwrap();
+    let entries: HashMap<String, ModelEntry> = serde_json::from_str(&json).unwrap();
+
+    // Resolve aliases (single hop; an alias of an alias is a data error).
+    let mut models: HashMap<String, &ModelConfig> = HashMap::new();
+    for (key, entry) in &entries {
+        let config = match entry {
+            ModelEntry::Config(config) => config.as_ref(),
+            ModelEntry::Alias { alias_of } => match entries.get(alias_of) {
+                Some(ModelEntry::Config(config)) => config.as_ref(),
+                Some(ModelEntry::Alias { .. }) => {
+                    panic!("{key}: alias_of {alias_of} is itself an alias")
+                }
+                None => panic!("{key}: alias_of {alias_of} does not exist"),
+            },
+        };
+        models.insert(key.clone(), config);
+    }
 
     let mut sorted: Vec<_> = models.iter().collect();
     sorted.sort_by_key(|(k, _)| k.as_str());
@@ -266,13 +333,47 @@ fn generate_models(data_dir: &Path, out_dir: &str) {
         let v = &variant_for_key[key.as_str()];
         let (owner, model_name) = split_owner_model(key);
         let pricing = match &c.pricing {
-            Some(p) => format!(
-                "Some(super::ModelPricing {{ input: {}, output: {}, input_cache_read: {}, input_cache_write: {} }})",
-                fmt_decimal(p.input),
-                fmt_decimal(p.output),
-                fmt_opt_decimal(p.input_cache_read),
-                fmt_opt_decimal(p.input_cache_write),
-            ),
+            Some(p) => {
+                let long_context = match &p.long_context {
+                    Some(l) => format!(
+                        "Some(super::LongContextPricing {{ threshold: {}, input: {}, output: {}, input_cache_read: {}, input_cache_write: {} }})",
+                        l.threshold,
+                        fmt_decimal(l.input),
+                        fmt_decimal(l.output),
+                        fmt_opt_decimal(l.input_cache_read),
+                        fmt_opt_decimal(l.input_cache_write),
+                    ),
+                    None => "None".to_string(),
+                };
+                let off_peak = match &p.off_peak {
+                    Some(o) => {
+                        let windows: Vec<String> = o
+                            .peak_windows_utc
+                            .iter()
+                            .map(|(s, e)| format!("({}, {})", minutes_of_day(s), minutes_of_day(e)))
+                            .collect();
+                        format!(
+                            "Some(super::OffPeakPricing {{ peak_windows: &[{}], peak_weekdays_only: {}, input: {}, output: {}, input_cache_read: {}, input_cache_write: {} }})",
+                            windows.join(", "),
+                            o.peak_weekdays_only,
+                            fmt_decimal(o.input),
+                            fmt_decimal(o.output),
+                            fmt_opt_decimal(o.input_cache_read),
+                            fmt_opt_decimal(o.input_cache_write),
+                        )
+                    }
+                    None => "None".to_string(),
+                };
+                format!(
+                    "Some(super::ModelPricing {{ input: {}, output: {}, input_cache_read: {}, input_cache_write: {}, long_context: {}, off_peak: {} }})",
+                    fmt_decimal(p.input),
+                    fmt_decimal(p.output),
+                    fmt_opt_decimal(p.input_cache_read),
+                    fmt_opt_decimal(p.input_cache_write),
+                    long_context,
+                    off_peak,
+                )
+            }
             None => "None".to_string(),
         };
 

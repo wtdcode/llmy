@@ -46,7 +46,13 @@ impl Display for TokenUsage {
 
 impl TokenUsage {
     pub fn input_cost(&self, model: &OpenAIModel) -> Decimal {
-        let pricing = model.pricing();
+        // The tier is picked by this usage's own prompt size — exact when
+        // `self` is one request's usage. Costing an aggregate of several
+        // requests through here is wrong for tiered models; aggregates
+        // accumulate per-request costs instead (see `BillingTree::record`).
+        let pricing = model
+            .pricing()
+            .for_request(self.input_tokens, chrono::Utc::now());
         // Cache reads and cache writes are disjoint subsets of the prompt; what
         // is left over is plain uncached input.
         let uncached = self
@@ -74,7 +80,12 @@ impl TokenUsage {
     }
 
     pub fn output_cost(&self, model: &OpenAIModel) -> Decimal {
-        let pricing = model.pricing();
+        // Long-context tiers are keyed on the PROMPT size, output included
+        // (OpenAI bills output at the long rate whenever the input crossed
+        // the threshold).
+        let pricing = model
+            .pricing()
+            .for_request(self.input_tokens, chrono::Utc::now());
         Decimal::from(self.output_tokens) * pricing.output
     }
 
@@ -252,6 +263,11 @@ pub struct BillingTree {
     nodes: BTreeMap<NodeId, BillingNode>,
     next_id: NodeId,
     by_prefix: BTreeMap<String, TokenUsage>,
+    /// Spend per `debug_prefix`, accumulated per request. Kept beside the
+    /// token buckets because tiered (long-context) pricing makes cost
+    /// non-linear in tokens: re-costing a summed usage would overcharge once
+    /// the sum crosses a threshold no single request crossed.
+    by_prefix_cost: BTreeMap<String, Decimal>,
 }
 
 impl Drop for BillingTree {
@@ -292,6 +308,7 @@ impl BillingTree {
             nodes,
             next_id: ROOT,
             by_prefix: BTreeMap::new(),
+            by_prefix_cost: BTreeMap::new(),
         }
     }
 
@@ -381,10 +398,9 @@ impl BillingTree {
         }
 
         // Dimension 2: flat per-debug_prefix breakdown (None => "").
-        *self
-            .by_prefix
-            .entry(prefix.unwrap_or("").to_string())
-            .or_default() += delta;
+        let prefix = prefix.unwrap_or("");
+        *self.by_prefix.entry(prefix.to_string()).or_default() += delta;
+        *self.by_prefix_cost.entry(prefix.to_string()).or_default() += dcost;
 
         match violation {
             Some(e) => Err(e),
@@ -478,6 +494,20 @@ impl BillingTree {
         self.by_prefix.clone()
     }
 
+    /// [`Self::usage_by_prefix`] with each bucket's accumulated spend in
+    /// USD. The spend is summed per request at that request's own pricing
+    /// tier, so it stays exact for tiered (long-context) models where
+    /// re-costing the summed usage would not.
+    pub fn billing_by_prefix(&self) -> BTreeMap<String, (TokenUsage, Decimal)> {
+        self.by_prefix
+            .iter()
+            .map(|(prefix, tokens)| {
+                let cost = self.by_prefix_cost.get(prefix).copied().unwrap_or_default();
+                (prefix.clone(), (*tokens, cost))
+            })
+            .collect()
+    }
+
     /// Usage for a single `debug_prefix` bucket.
     pub fn usage_for_prefix(&self, prefix: &str) -> TokenUsage {
         self.by_prefix.get(prefix).copied().unwrap_or_default()
@@ -554,6 +584,64 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_long_context_doubles_input_and_1_5x_output_past_272k() {
+        use crate::model::OpenAIModel;
+        use std::str::FromStr;
+        // Pins the registry data: OpenAI reprices the entire request past
+        // 272K input tokens at 2x input/cache-read/cache-write and 1.5x
+        // output, on every GPT-6 model.
+        for id in [
+            "openai/gpt-6-astra",
+            "openai/gpt-6-sol",
+            "openai/gpt-6-luna",
+        ] {
+            let pricing = OpenAIModel::from_str(id).unwrap().pricing();
+            let long = pricing.long_context.expect(id);
+            assert_eq!(long.threshold, 272_000, "{id}");
+            assert_eq!(long.input, pricing.input * rust_decimal::dec!(2), "{id}");
+            assert_eq!(
+                long.output,
+                pricing.output * rust_decimal::dec!(1.5),
+                "{id}"
+            );
+            assert_eq!(
+                long.input_cache_read,
+                pricing.input_cache_read.map(|p| p * rust_decimal::dec!(2)),
+                "{id}"
+            );
+            assert_eq!(
+                long.input_cache_write,
+                pricing.input_cache_write.map(|p| p * rust_decimal::dec!(2)),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn opus_5_5_pricing_comes_from_the_registry() {
+        use crate::model::OpenAIModel;
+        use std::str::FromStr;
+        let million = rust_decimal::dec!(1_000_000);
+        // Pins the launch pricing: $4/$20 per 1M, cache reads $0.20, cache
+        // writes at the usual 1.25x input; flat pricing (no length tiers).
+        let model = OpenAIModel::from_str("claude-opus-5.5").unwrap();
+        let pricing = model.pricing();
+        assert_eq!(pricing.input * million, rust_decimal::dec!(4));
+        assert_eq!(pricing.output * million, rust_decimal::dec!(20));
+        assert_eq!(
+            pricing.input_cache_read.unwrap() * million,
+            rust_decimal::dec!(0.2)
+        );
+        assert_eq!(
+            pricing.input_cache_write.unwrap() * million,
+            rust_decimal::dec!(5)
+        );
+        assert!(pricing.long_context.is_none());
+        assert_eq!(model.config.max_input_tokens, 872_000);
+        assert_eq!(model.config.max_tokens, 128_000);
+    }
+
+    #[test]
     fn gpt_5_6_writes_cost_1_25x_the_input_rate() {
         use crate::model::OpenAIModel;
         use std::str::FromStr;
@@ -572,6 +660,52 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    #[test]
+    fn long_context_reprices_the_whole_request_past_the_threshold() {
+        use crate::model::OpenAIModel;
+        use std::str::FromStr;
+        // gpt-6-astra: $10/$50 per 1M, cache read $1; past 272K input the
+        // WHOLE request bills at $20/$75, cache read $2.
+        let model = OpenAIModel::from_str("gpt-6-astra").unwrap();
+
+        // At the threshold exactly: still the base tier.
+        let at = usage(272_000, 1_000, 0, 0, 0);
+        assert_eq!(at.cost(&model), rust_decimal::dec!(2.77)); // 2.72 + 0.05
+
+        // One token past it: input doubles AND output goes to 1.5x, on the
+        // entire request rather than the overflow.
+        let over = usage(272_001, 1_000, 0, 0, 0);
+        assert_eq!(over.cost(&model), rust_decimal::dec!(5.51502)); // 5.44002 + 0.075
+
+        // Cached tokens bill at the long-context cache rate too.
+        let cached = usage(300_000, 0, 100_000, 0, 0);
+        assert_eq!(cached.input_cost(&model), rust_decimal::dec!(4.2)); // 200K*20e-6 + 100K*2e-6
+    }
+
+    #[test]
+    fn long_context_tier_without_cache_rates_bills_cache_at_tier_input() {
+        use crate::model::{LongContextPricing, OpenAIModel};
+        use std::str::FromStr;
+        let mut model = OpenAIModel::from_str("tier-test,2,4,1").unwrap();
+        let mut pricing = model.config.pricing.unwrap();
+        pricing.long_context = Some(LongContextPricing {
+            threshold: 100,
+            input: rust_decimal::dec!(0.000004),
+            output: rust_decimal::dec!(0.000008),
+            input_cache_read: None,
+            input_cache_write: None,
+        });
+        model.config.pricing = Some(pricing);
+
+        // Below the threshold the dedicated cache-read price applies...
+        let below = usage(100, 0, 40, 0, 0);
+        assert_eq!(below.input_cost(&model), rust_decimal::dec!(0.00016));
+        // ...above it, the tier has no cache prices, so cached tokens fall
+        // back to the tier's input rate — same rule as the flat fields.
+        let above = usage(200, 0, 40, 0, 0);
+        assert_eq!(above.input_cost(&model), rust_decimal::dec!(0.0008)); // 200 * 4e-6
     }
 
     #[test]
@@ -839,6 +973,31 @@ mod tests {
         // A scope only sees its own subtree, which is why the throttle reads
         // root rather than the calling scope.
         assert!(tree.node_snapshot(sub).tokens.total() < tree.root_snapshot().tokens.total());
+    }
+
+    #[test]
+    fn prefix_spend_is_accumulated_per_request_not_recosted() {
+        use crate::model::OpenAIModel;
+        use std::str::FromStr;
+        let model = OpenAIModel::from_str("gpt-6-astra").unwrap();
+        let mut tree = BillingTree::new(rust_decimal::dec!(1000));
+
+        // Two requests of 200K input each: both below the 272K threshold, so
+        // each bills at the base $10/1M...
+        tree.record(ROOT, Some("agent"), &model, input(200_000))
+            .unwrap();
+        tree.record(ROOT, Some("agent"), &model, input(200_000))
+            .unwrap();
+
+        let by_prefix = tree.billing_by_prefix();
+        let (tokens, cost) = by_prefix["agent"];
+        assert_eq!(tokens.input_tokens, 400_000);
+        // ...and the bucket's spend is the sum of the two ($4), NOT the
+        // 400K aggregate re-costed at the long-context tier ($8).
+        assert_eq!(cost, rust_decimal::dec!(4));
+        assert!(cost != tokens.cost(&model));
+        // The tree's own totals agree, since they accumulate the same way.
+        assert_eq!(tree.root_snapshot().current, rust_decimal::dec!(4));
     }
 
     #[test]

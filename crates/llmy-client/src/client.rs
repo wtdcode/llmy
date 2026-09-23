@@ -2064,7 +2064,7 @@ impl LLMInner {
                 billed = Some((snapshot, delta));
                 self.debug_backend
                     .as_ref()
-                    .map(|_| (snapshot, tree.usage_by_prefix()))
+                    .map(|_| (snapshot, tree.billing_by_prefix()))
             };
 
             if let (Some(backend), Some(handle), Some((snapshot, prefix_usage))) = (
@@ -2083,15 +2083,16 @@ impl LLMInner {
                     .record_billing(handle, snapshot, &usage_for_debug)
                     .await;
 
-                // Persist the cumulative per-debug_prefix breakdown (cost
-                // computed at this attempt's model). Not tied to the
-                // per-request handle.
+                // Persist the cumulative per-debug_prefix breakdown. The
+                // spend comes accumulated per request from the tree, which
+                // keeps it exact for tiered (long-context) pricing. Not tied
+                // to the per-request handle.
                 let prefix_rows: Vec<PrefixBilling> = prefix_usage
                     .iter()
-                    .map(|(prefix, tokens)| PrefixBilling {
+                    .map(|(prefix, (tokens, cost))| PrefixBilling {
                         prefix: prefix.clone(),
                         tokens: *tokens,
-                        cost_usd: tokens.cost(&target.model).to_f64().unwrap_or_default(),
+                        cost_usd: cost.to_f64().unwrap_or_default(),
                     })
                     .collect();
                 backend.record_prefix_billing(&prefix_rows).await;

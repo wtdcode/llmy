@@ -119,6 +119,69 @@ impl std::fmt::Display for CachePolicy {
     }
 }
 
+/// Time-of-day discounted pricing — DeepSeek's peak/off-peak (峰谷)
+/// mechanism. The base [`ModelPricing`] rates are the PEAK rates, in force
+/// inside the provider's peak windows; at every other moment a request
+/// bills at the discounted rates here.
+#[derive(Debug, Clone, Copy)]
+pub struct OffPeakPricing {
+    /// Daily UTC windows `[start, end)` in minutes-of-day during which the
+    /// base (peak) rates apply. A window wrapping midnight has start > end.
+    pub peak_windows: &'static [(u32, u32)],
+    /// Peak windows apply Monday–Friday (UTC) only; weekends bill off-peak
+    /// around the clock. Provider public holidays are NOT modeled — a
+    /// holiday falling on a weekday bills at peak in our ledger, an
+    /// over-estimate but never an under-estimate.
+    pub peak_weekdays_only: bool,
+    /// Per-token USD price for uncached input off-peak.
+    pub input: Decimal,
+    /// Per-token USD price for output off-peak.
+    pub output: Decimal,
+    /// Per-token USD price for cache reads off-peak (falls back to `input`
+    /// of this tier when absent).
+    pub input_cache_read: Option<Decimal>,
+    /// Per-token USD price for cache writes off-peak.
+    pub input_cache_write: Option<Decimal>,
+}
+
+impl OffPeakPricing {
+    /// Whether `at` falls inside a peak window, i.e. the base rates apply.
+    pub fn is_peak(&self, at: chrono::DateTime<chrono::Utc>) -> bool {
+        use chrono::{Datelike, Timelike, Weekday};
+        if self.peak_weekdays_only && matches!(at.weekday(), Weekday::Sat | Weekday::Sun) {
+            return false;
+        }
+        let minute = at.hour() * 60 + at.minute();
+        self.peak_windows.iter().any(|(start, end)| {
+            if start <= end {
+                (*start..*end).contains(&minute)
+            } else {
+                minute >= *start || minute < *end
+            }
+        })
+    }
+}
+
+/// The long-context pricing tier: once a request's prompt exceeds
+/// `threshold` input tokens, the provider reprices the ENTIRE request at
+/// these rates — OpenAI's rule for the GPT-6 series (2x input/cache, 1.5x
+/// output past 272K input tokens), not a marginal rate on the overflow.
+#[derive(Debug, Clone, Copy)]
+pub struct LongContextPricing {
+    /// Input-token count (cached tokens included) beyond which these rates
+    /// apply to the whole request.
+    pub threshold: u64,
+    /// Per-token USD price for uncached input at long context.
+    pub input: Decimal,
+    /// Per-token USD price for output at long context.
+    pub output: Decimal,
+    /// Per-token USD price for cache reads at long context (falls back to
+    /// this tier's `input` when absent).
+    pub input_cache_read: Option<Decimal>,
+    /// Per-token USD price for cache writes at long context.
+    pub input_cache_write: Option<Decimal>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ModelPricing {
     /// Per-token USD price for uncached input.
@@ -129,6 +192,51 @@ pub struct ModelPricing {
     pub input_cache_read: Option<Decimal>,
     /// Per-token USD price for cache writes.
     pub input_cache_write: Option<Decimal>,
+    /// Long-context tier; `None` means one flat tier at any length.
+    pub long_context: Option<LongContextPricing>,
+    /// Peak/off-peak time-of-day discount; `None` means the same rates
+    /// around the clock.
+    pub off_peak: Option<OffPeakPricing>,
+}
+
+impl ModelPricing {
+    /// The rates one request bills at, given its prompt size and the moment
+    /// it is billed: off-peak windows discount the whole request first, and
+    /// otherwise the long-context tier reprices it once the prompt (cached
+    /// tokens included) exceeds the tier's threshold. No known model has
+    /// both mechanisms; if one ever does, its off-peak rates carry no
+    /// length tiers here. Exact per request; summing tiered costs over
+    /// several requests is NOT the same as costing their summed usage, so
+    /// aggregate spend must be accumulated from per-request costs.
+    pub fn for_request(
+        &self,
+        input_tokens: u64,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> ModelPricing {
+        if let Some(off) = self.off_peak
+            && !off.is_peak(at)
+        {
+            return ModelPricing {
+                input: off.input,
+                output: off.output,
+                input_cache_read: off.input_cache_read,
+                input_cache_write: off.input_cache_write,
+                long_context: None,
+                off_peak: None,
+            };
+        }
+        match self.long_context {
+            Some(long) if input_tokens > long.threshold => ModelPricing {
+                input: long.input,
+                output: long.output,
+                input_cache_read: long.input_cache_read,
+                input_cache_write: long.input_cache_write,
+                long_context: None,
+                off_peak: None,
+            },
+            _ => *self,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -442,15 +550,82 @@ mod tests {
 
     #[test]
     fn test_deepseek_v4_model_config() {
-        let model = get_model("deepseek/deepseek-v4-flash").expect("known model");
+        // The retired names are `alias_of` entries served by DeepSeek V4.1
+        // Flash and billed at the Flash price: $0.30/$1.20 per 1M at peak,
+        // half of that off-peak (peak = UTC 01:00-04:00 and 06:00-10:00,
+        // weekdays only).
+        for key in [
+            "deepseek/deepseek-v4-flash",
+            "deepseek/deepseek-v4-flash-0731",
+            "deepseek/deepseek-flash",
+        ] {
+            let model = get_model(key).expect("known model");
 
-        assert_eq!(model.encoding(), Some(Encoding::DeepSeek));
-        assert_eq!(model.max_input_tokens, 655360);
-        assert_eq!(model.max_tokens, 393216);
-        assert_eq!(
-            model.pricing.expect("deepseek pricing").input,
-            rust_decimal::dec!(0.00000014)
-        );
+            assert_eq!(model.encoding(), Some(Encoding::DeepSeek), "{key}");
+            assert_eq!(model.max_input_tokens, 655360, "{key}");
+            assert_eq!(model.max_tokens, 393216, "{key}");
+            let pricing = model.pricing.expect("deepseek pricing");
+            assert_eq!(pricing.input, rust_decimal::dec!(0.0000003), "{key}");
+            assert_eq!(pricing.output, rust_decimal::dec!(0.0000012), "{key}");
+
+            let off = pricing.off_peak.expect("off-peak tier");
+            assert_eq!(off.peak_windows, &[(60, 240), (360, 600)], "{key}");
+            assert!(off.peak_weekdays_only, "{key}");
+            assert_eq!(off.input * rust_decimal::dec!(2), pricing.input, "{key}");
+            assert_eq!(off.output * rust_decimal::dec!(2), pricing.output, "{key}");
+            assert_eq!(
+                off.input_cache_read.map(|p| p * rust_decimal::dec!(2)),
+                pricing.input_cache_read,
+                "{key}"
+            );
+        }
+
+        // An alias borrows the target's config but keeps its own key as the
+        // wire model name — proxies serving retired names want the literal.
+        let alias = get_model("deepseek/deepseek-v4-flash-0731").expect("alias");
+        assert_eq!(alias.model_name, "deepseek-v4-flash-0731");
+        assert_eq!(alias.name, "DeepSeek V4.1 Flash");
+    }
+
+    #[test]
+    fn off_peak_windows_apply_outside_weekday_peaks() {
+        use chrono::TimeZone;
+        let pricing = get_model("deepseek/deepseek-flash")
+            .expect("known model")
+            .pricing
+            .expect("pricing");
+        let off = pricing.off_peak.expect("off-peak tier");
+        let utc = |y, mo, day, h, mi| chrono::Utc.with_ymd_and_hms(y, mo, day, h, mi, 0).unwrap();
+
+        // 2026-09-23 is a Wednesday: both peak windows apply...
+        assert!(off.is_peak(utc(2026, 9, 23, 2, 0)));
+        assert!(off.is_peak(utc(2026, 9, 23, 6, 0)));
+        // ...half-open bounds: the end minute is already off-peak...
+        assert!(off.is_peak(utc(2026, 9, 23, 3, 59)));
+        assert!(!off.is_peak(utc(2026, 9, 23, 4, 0)));
+        // ...and the gap between the windows is off-peak too.
+        assert!(!off.is_peak(utc(2026, 9, 23, 5, 0)));
+        assert!(!off.is_peak(utc(2026, 9, 23, 12, 0)));
+
+        // The same peak hour on Saturday bills off-peak.
+        assert!(!off.is_peak(utc(2026, 9, 26, 2, 0)));
+
+        // A request billed off-peak takes the discounted rates whole.
+        let discounted = pricing.for_request(1_000, utc(2026, 9, 26, 2, 0));
+        assert_eq!(discounted.input, off.input);
+        assert_eq!(discounted.output, off.output);
+        let peak = pricing.for_request(1_000, utc(2026, 9, 23, 2, 0));
+        assert_eq!(peak.input, pricing.input);
+
+        // A synthetic window wrapping midnight covers both sides of it.
+        let wrap = OffPeakPricing {
+            peak_windows: &[(23 * 60, 60)],
+            peak_weekdays_only: false,
+            ..off
+        };
+        assert!(wrap.is_peak(utc(2026, 9, 23, 23, 30)));
+        assert!(wrap.is_peak(utc(2026, 9, 24, 0, 30)));
+        assert!(!wrap.is_peak(utc(2026, 9, 24, 1, 0)));
     }
 
     #[test]

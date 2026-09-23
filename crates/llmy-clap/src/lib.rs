@@ -592,11 +592,15 @@ macro_rules! make_openai_args {
                                 $long, "llm-input-price and --", $long, "llm-output-price"
                             ))));
                         };
+                        // The price flags describe the base tier only; a
+                        // registry long-context tier (if any) is kept as-is.
                         ModelPricing {
                             input: input / per_million,
                             output: output / per_million,
                             input_cache_read: None,
                             input_cache_write: None,
+                            long_context: None,
+                            off_peak: None,
                         }
                     }
                 };
