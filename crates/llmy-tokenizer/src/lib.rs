@@ -588,6 +588,35 @@ mod tests {
     }
 
     #[test]
+    fn qwen_3_8_max_pricing_comes_from_the_registry() {
+        // Pins the Model Studio pricing: $2/$6 per 1M flat (no length
+        // tiers), implicit cache hits at 10% of input, explicit cache
+        // creation at 1.25x input. The 0902 snapshot is an alias keeping
+        // its own wire name.
+        let model = get_model("alibaba/qwen3.8-max").expect("known model");
+        assert_eq!(model.encoding(), Some(Encoding::Qwen));
+        assert_eq!(model.max_input_tokens, 983_616);
+        assert_eq!(model.max_tokens, 131_072);
+        let pricing = model.pricing.expect("pricing");
+        assert_eq!(pricing.input, rust_decimal::dec!(0.000002));
+        assert_eq!(pricing.output, rust_decimal::dec!(0.000006));
+        assert_eq!(
+            pricing.input_cache_read,
+            Some(rust_decimal::dec!(0.0000002))
+        );
+        assert_eq!(
+            pricing.input_cache_write,
+            Some(rust_decimal::dec!(0.0000025))
+        );
+        assert!(pricing.long_context.is_none());
+        assert!(pricing.off_peak.is_none());
+
+        let snapshot = get_model("alibaba/qwen3.8-max-0902").expect("alias");
+        assert_eq!(snapshot.model_name, "qwen3.8-max-0902");
+        assert_eq!(snapshot.pricing.expect("pricing").input, pricing.input);
+    }
+
+    #[test]
     fn off_peak_windows_apply_outside_weekday_peaks() {
         use chrono::TimeZone;
         let pricing = get_model("deepseek/deepseek-flash")
