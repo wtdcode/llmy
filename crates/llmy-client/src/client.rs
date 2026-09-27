@@ -1014,6 +1014,10 @@ impl LLMTarget {
         let client = LLMClient::new_with_app(config.clone(), settings.llm_app.as_ref());
         let content_filter: Arc<dyn OpenAIContentFilter> = if model.is_google() {
             Arc::new(GoogleContentFilter)
+        } else if model.is_qwen() {
+            // Qwen's tool parser types arguments by a single-string schema
+            // `type`; see [`crate::filters::QwenToolSchemaFilter`].
+            Arc::new(crate::filters::QwenToolSchemaFilter)
         } else {
             Arc::new(NoFilter)
         };
@@ -1895,15 +1899,13 @@ impl LLMInner {
             tracing::debug!("auto prompt cache key {}", claim.key());
             req.set_prompt_cache_key(claim.key());
         }
-        // The content-filter quirks are all chat-endpoint quirks; a native
-        // request goes out exactly as built.
-        if let LLMRequest::Chat(chat) = &mut req {
-            target
-                .content_filter
-                .read()
-                .expect("content_filter poisoned")
-                .filter_input(chat);
-        }
+        // Provider-quirk filtering on the request in its native wire form;
+        // a filter that only cares about one protocol matches its variant.
+        target
+            .content_filter
+            .read()
+            .expect("content_filter poisoned")
+            .filter_input(&mut req);
 
         // Keep the raw prefix (None => "") for the per-prefix billing dimension,
         // before it gets defaulted to "llm" for the debug backend below.
@@ -1963,7 +1965,7 @@ impl LLMInner {
                 })
         };
 
-        let resp = match resp {
+        let mut resp = match resp {
             Ok(resp) => resp,
             Err(e) => {
                 if let (Some(backend), Some(handle)) =
@@ -1976,15 +1978,23 @@ impl LLMInner {
                 return Err(e);
             }
         };
-        // The wire-truth JSON for the debug record, captured before the
-        // response is normalized into its chat view.
+        // The wire-truth JSON for the debug record, captured before any
+        // filtering or normalization touches the response.
         let resp_json = dbg_handle
             .as_ref()
             .map(|_| serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null));
+        // Provider-quirk filtering on the native wire response, before the
+        // assistant turn is extracted — so a fix also reaches the
+        // protocol-faithful message that conversation-state callers keep.
+        target
+            .content_filter
+            .read()
+            .expect("content_filter poisoned")
+            .filter_output(&mut resp);
         // The protocol-faithful assistant turn, before normalization sheds
         // anything the chat view cannot carry.
         let assistant = resp.to_message();
-        let mut resp = match resp.into_chat_view() {
+        let resp = match resp.into_chat_view() {
             Ok(view) => view,
             Err(e) => {
                 // A response that is itself a failure (e.g. a `failed`
@@ -2002,11 +2012,6 @@ impl LLMInner {
         if let Some(claim) = given_claim.as_ref() {
             claim.confirm(Self::reported_cached_tokens(&resp));
         }
-        target
-            .content_filter
-            .read()
-            .expect("content_filter poisoned")
-            .filter_output(&mut resp);
         if let (Some(backend), Some(handle), Some(dbg_req), Some(resp_json)) = (
             self.debug_backend.as_ref(),
             dbg_handle.as_ref(),
@@ -3207,6 +3212,33 @@ mod tests {
 
         let chat = test_llm().lower_request(user_request("hello")).unwrap();
         assert_eq!(chat.protocol(), "chat-completion");
+    }
+
+    #[test]
+    fn qwen_targets_get_the_tool_schema_filter_by_default() {
+        let config = SupportedConfig::new("http://localhost:0", "k");
+        let qwen = OpenAIModel::from_str("qwen3.8-max").unwrap();
+        assert!(qwen.is_qwen());
+        let llm = LLM::new(
+            config.clone(),
+            qwen,
+            rust_decimal::dec!(100),
+            test_settings(None),
+            None,
+        );
+        let filter = format!(
+            "{:?}",
+            llm.targets[0].content_filter.read().expect("filter")
+        );
+        assert!(filter.contains("QwenToolSchemaFilter"), "{filter}");
+
+        // Everyone else keeps the previous defaults.
+        let plain = test_llm();
+        let filter = format!(
+            "{:?}",
+            plain.targets[0].content_filter.read().expect("filter")
+        );
+        assert!(filter.contains("NoFilter"), "{filter}");
     }
 
     // --- fallback chain ------------------------------------------------------

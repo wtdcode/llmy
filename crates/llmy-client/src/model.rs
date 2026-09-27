@@ -46,6 +46,10 @@ impl OpenAIModel {
         self.owner() == Some("google")
     }
 
+    pub fn is_qwen(&self) -> bool {
+        self.owner() == Some("alibaba")
+    }
+
     /// Whether outgoing chat-completion requests send the canonical
     /// `owner/name` id (e.g. for OpenRouter) instead of the bare model name.
     pub fn use_full_id(&self) -> bool {

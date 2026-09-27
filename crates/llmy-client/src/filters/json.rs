@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::OpenAIContentFilter;
-use crate::resp::RawExtensibleChatCompletionResponse;
+use crate::client::LLMResponse;
 
 static MARKDOWN_TAG_FILTER: LazyLock<MarkdownTagFilter> = LazyLock::new(MarkdownTagFilter::new);
 
@@ -56,7 +56,12 @@ impl MarkdownTagFilter {
 }
 
 impl OpenAIContentFilter for MarkdownTagFilter {
-    fn filter_output(&self, resp: &mut RawExtensibleChatCompletionResponse) {
+    fn filter_output(&self, resp: &mut LLMResponse) {
+        // Fence-wrapped JSON is a chat-completion habit; native protocols
+        // pass through untouched.
+        let LLMResponse::Chat(resp) = resp else {
+            return;
+        };
         for choice in resp.choices.iter_mut() {
             let Some(content) = choice.message.content.as_deref() else {
                 continue;
@@ -75,8 +80,11 @@ mod tests {
     use crate::resp::FinishReason;
 
     fn filtered(content: &str) -> Option<String> {
-        let mut resp = build_resp(Some(content), FinishReason::Stop);
+        let mut resp = LLMResponse::Chat(build_resp(Some(content), FinishReason::Stop));
         MarkdownTagFilter::new().filter_output(&mut resp);
+        let LLMResponse::Chat(resp) = resp else {
+            panic!("a chat response stays chat");
+        };
         resp.choices[0].message.content.clone()
     }
 

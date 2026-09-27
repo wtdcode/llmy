@@ -1,23 +1,30 @@
 use std::fmt::Debug;
 
-use crate::req::RawExtensibleChatCompletionRequest;
-use crate::resp::RawExtensibleChatCompletionResponse;
+use crate::client::{LLMRequest, LLMResponse};
 
 mod google;
 mod json;
 mod no_filter;
+mod qwen;
 
 pub use google::GoogleContentFilter;
 pub use json::{MarkdownTagFilter, strip_markdown_fence};
 pub use no_filter::NoFilter;
+pub use qwen::QwenToolSchemaFilter;
 
 /// A hook applied to every outgoing request and incoming response, used to
-/// paper over provider-specific quirks (rejected fields, malformed tool calls,
-/// markdown-wrapped JSON, ...). The default impls are no-ops, so a filter only
+/// paper over provider-specific quirks (rejected fields, malformed tool
+/// calls, markdown-wrapped JSON, tool schemas a provider's parser cannot
+/// digest, ...). Both directions see the request/response in its native
+/// wire protocol — a filter that only cares about one protocol matches its
+/// variant and leaves the rest alone. Output filtering runs before the
+/// response is normalized, so fixes reach the protocol-faithful
+/// [`crate::client::Message`] that conversation-state callers keep, not
+/// just the chat view. The default impls are no-ops, so a filter only
 /// overrides the direction it cares about.
 pub trait OpenAIContentFilter: Send + Sync + Debug {
-    fn filter_input(&self, _req: &mut RawExtensibleChatCompletionRequest) {}
-    fn filter_output(&self, _resp: &mut RawExtensibleChatCompletionResponse) {}
+    fn filter_input(&self, _req: &mut LLMRequest) {}
+    fn filter_output(&self, _resp: &mut LLMResponse) {}
 }
 
 #[derive(Debug, Default)]
@@ -30,13 +37,13 @@ impl OpenAIContentFilterChain {
         Self { filters }
     }
 
-    fn chain_filter_input(&self, req: &mut RawExtensibleChatCompletionRequest) {
+    fn chain_filter_input(&self, req: &mut LLMRequest) {
         for filter in &self.filters {
             filter.filter_input(req);
         }
     }
 
-    fn chain_filter_output(&self, resp: &mut RawExtensibleChatCompletionResponse) {
+    fn chain_filter_output(&self, resp: &mut LLMResponse) {
         for filter in &self.filters {
             filter.filter_output(resp);
         }
@@ -44,11 +51,11 @@ impl OpenAIContentFilterChain {
 }
 
 impl OpenAIContentFilter for OpenAIContentFilterChain {
-    fn filter_input(&self, req: &mut RawExtensibleChatCompletionRequest) {
+    fn filter_input(&self, req: &mut LLMRequest) {
         self.chain_filter_input(req);
     }
 
-    fn filter_output(&self, resp: &mut RawExtensibleChatCompletionResponse) {
+    fn filter_output(&self, resp: &mut LLMResponse) {
         self.chain_filter_output(resp);
     }
 }
@@ -58,7 +65,7 @@ impl OpenAIContentFilter for OpenAIContentFilterChain {
 pub(crate) fn build_resp(
     content: Option<&str>,
     finish: crate::resp::FinishReason,
-) -> RawExtensibleChatCompletionResponse {
+) -> crate::resp::RawExtensibleChatCompletionResponse {
     use crate::resp::FinishReason;
     let body = serde_json::json!({
         "id": "chatcmpl-test",

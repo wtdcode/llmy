@@ -9,6 +9,7 @@ impl OpenAIContentFilter for NoFilter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::LLMResponse;
     use crate::filters::build_resp;
     use crate::resp::FinishReason;
 
@@ -16,9 +17,12 @@ mod tests {
     fn no_filter_is_a_noop() {
         let filter = NoFilter;
         let content = "<tool_call><function=a></function></tool_call>";
-        let mut resp = build_resp(Some(content), FinishReason::ToolCalls);
+        let mut resp = LLMResponse::Chat(build_resp(Some(content), FinishReason::ToolCalls));
         filter.filter_output(&mut resp);
 
+        let LLMResponse::Chat(resp) = resp else {
+            panic!("a chat response stays chat");
+        };
         assert_eq!(resp.choices[0].message.content.as_deref(), Some(content));
         assert!(resp.choices[0].message.tool_calls.is_none());
     }
