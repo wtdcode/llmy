@@ -30,7 +30,15 @@ jobs:
       if: startsWith(github.ref, 'refs/tags/v')
       env:
         TOKEN: ${{ secrets.CRATES_IO_KEY }}
+        # cargo waits for each published crate to show up in the crates.io
+        # index before publishing its dependents, and gives up after
+        # `publish.timeout` (default 60s). The index has taken longer than
+        # that for llmy-client on several tags in a row, aborting the eight
+        # crates behind it. The key is nightly-only (-Zpublish-timeout); this
+        # step already runs on nightly.
+        CARGO_UNSTABLE_PUBLISH_TIMEOUT: 'true'
+        CARGO_PUBLISH_TIMEOUT: '900'
       run: |
         cargo login $TOKEN && cargo test && cargo install cargo-release &&\
         git config --global user.email "mio@lazym.io" && git config --global user.name "lazymio" &&\
-        cargo release --execute --allow-branch '*' --no-confirm --no-push
+        cargo release --execute --unpublished --allow-branch '*' --no-confirm --no-push
