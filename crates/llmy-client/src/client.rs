@@ -1259,13 +1259,15 @@ impl LLMInner {
         primary.cache_keys.select(req, &primary.model, debug_prefix)
     }
 
-    /// Cached prompt tokens the provider reported, or zero if it reported none.
-    fn reported_cached_tokens(resp: &RawExtensibleChatCompletionResponse) -> u64 {
+    /// What the provider says it read from cache, or `None` when it reports no
+    /// such thing — some OpenAI-compatible backends never fill in
+    /// `prompt_tokens_details`, and that silence is not a miss.
+    fn reported_cached_tokens(resp: &RawExtensibleChatCompletionResponse) -> Option<u64> {
         resp.usage
             .as_ref()
             .and_then(|usage| usage.prompt_tokens_details.as_ref())
             .and_then(|details| details.cached_tokens)
-            .unwrap_or_default() as u64
+            .map(|cached| cached as u64)
     }
 
     /// Whether this request's billing line should go to INFO rather than DEBUG:
@@ -2465,6 +2467,8 @@ mod tests {
             auto_cache_key: true,
             cache_key_ttl: crate::cache_key::DEFAULT_TTL_SECS,
             cache_key_rpm: crate::cache_key::DEFAULT_MAX_RPM,
+            cache_key_healthy_ratio: crate::cache_key::DEFAULT_HEALTHY_HIT_RATIO,
+            cache_key_health_samples: crate::cache_key::DEFAULT_MIN_HEALTH_SAMPLES,
             billing_log_tokens: 100_000,
             token_estimate_pct: 10.0,
             allow_implicit_convert: false,
@@ -2794,7 +2798,7 @@ mod tests {
     fn landed(llm: &LLM, req: &mut RawExtensibleChatCompletionRequest) {
         if let Some(claim) = llm.auto_cache_key(req, None) {
             req.prompt_cache_key = Some(claim.key().to_string());
-            claim.confirm(0);
+            claim.confirm(Some(0));
         }
     }
 
@@ -2864,7 +2868,7 @@ mod tests {
         let mut third = extended("shared", "other branch");
         landed(&llm, &mut third);
         assert_eq!(third.prompt_cache_key.as_deref(), Some(&*shared_key));
-        second_claim.confirm(0);
+        second_claim.confirm(Some(0));
     }
 
     #[test]
@@ -2883,7 +2887,7 @@ mod tests {
             let attempt = claim.clone();
             assert_eq!(attempt.key(), claim.key());
         }
-        claim.confirm(0);
+        claim.confirm(Some(0));
 
         // A caller-supplied key short-circuits selection entirely.
         let mut given = user_request("hello");
@@ -3021,14 +3025,14 @@ mod tests {
             "{} should name the workload that opened it",
             planner.key()
         );
-        planner.confirm(0);
+        planner.confirm(Some(0));
 
         // A blank prefix must not leave a dangling separator in the key.
         let blank = llm
             .auto_cache_key(&user_request("something else"), Some("  "))
             .expect("auto key");
         assert!(!blank.key().contains("--"), "{}", blank.key());
-        blank.confirm(0);
+        blank.confirm(Some(0));
     }
 
     #[test]
@@ -3347,7 +3351,7 @@ mod tests {
         let claim = responses.targets[0]
             .auto_cache_key_request(&req, None)
             .expect("auto key");
-        claim.confirm(0);
+        claim.confirm(Some(0));
 
         // The anthropic protocol routes by content: no key, no claim.
         let anthropic = anthropic_llm();

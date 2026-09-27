@@ -329,15 +329,37 @@ macro_rules! make_openai_args {
             )]
             pub cache_key_ttl: u64,
 
-            /// Requests per minute one auto cache key takes before we spread to
-            /// another. OpenAI steers one key to one machine and warns that
-            /// sustaining more than 15/min costs hit rate.
+            /// Requests per minute one auto cache key takes on trust. OpenAI
+            /// steers one key to one machine and warns that sustaining more than
+            /// 15/min may overflow it; past this rate a key keeps taking requests
+            /// only while its cache keeps hitting, and spreads to another key
+            /// once the answers show it does not.
             #[arg(
                 long = concat!($long, "llm-cache-key-rpm"),
                 env = concat!($prefix, "LLM_CACHE_KEY_RPM"),
                 default_value_t = llmy_client::cache_key::DEFAULT_MAX_RPM,
             )]
             pub cache_key_rpm: u32,
+
+            /// Past the cache-key rate, the share (0–1) of the cached tokens
+            /// bet on a key that must have come back for it to keep taking
+            /// requests. Below it the key is treated as overflowing onto other
+            /// machines and traffic spreads to a new key.
+            #[arg(
+                long = concat!($long, "llm-cache-key-healthy-ratio"),
+                env = concat!($prefix, "LLM_CACHE_KEY_HEALTHY_RATIO"),
+                default_value_t = llmy_client::cache_key::DEFAULT_HEALTHY_HIT_RATIO,
+            )]
+            pub cache_key_healthy_ratio: f64,
+
+            /// Graded answers a cache key needs inside the minute before its
+            /// hit ratio can count against it; with fewer it is taken on trust.
+            #[arg(
+                long = concat!($long, "llm-cache-key-health-samples"),
+                env = concat!($prefix, "LLM_CACHE_KEY_HEALTH_SAMPLES"),
+                default_value_t = llmy_client::cache_key::DEFAULT_MIN_HEALTH_SAMPLES,
+            )]
+            pub cache_key_health_samples: usize,
 
             /// Log the running billing total at INFO once every this many
             /// tokens; the requests in between log it at DEBUG. Set to 0 to put
@@ -442,6 +464,8 @@ macro_rules! make_openai_args {
                     auto_cache_key: DEFAULT_LLM_AUTO_CACHE_KEY,
                     cache_key_ttl: llmy_client::cache_key::DEFAULT_TTL_SECS,
                     cache_key_rpm: llmy_client::cache_key::DEFAULT_MAX_RPM,
+                    cache_key_healthy_ratio: llmy_client::cache_key::DEFAULT_HEALTHY_HIT_RATIO,
+                    cache_key_health_samples: llmy_client::cache_key::DEFAULT_MIN_HEALTH_SAMPLES,
                     billing_log_tokens: DEFAULT_LLM_BILLING_LOG_TOKENS,
                     token_estimate_pct: DEFAULT_LLM_TOKEN_ESTIMATE_PCT,
                     allow_implicit_convert: false,
@@ -489,6 +513,8 @@ macro_rules! make_openai_args {
                     auto_cache_key: self.auto_cache_key,
                     cache_key_ttl: self.cache_key_ttl,
                     cache_key_rpm: self.cache_key_rpm,
+                    cache_key_healthy_ratio: self.cache_key_healthy_ratio,
+                    cache_key_health_samples: self.cache_key_health_samples,
                     billing_log_tokens: self.billing_log_tokens,
                     token_estimate_pct: self.token_estimate_pct,
                     allow_implicit_convert: self.allow_implicit_convert,

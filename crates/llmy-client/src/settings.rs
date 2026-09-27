@@ -138,8 +138,17 @@ pub struct LLMSettings {
     pub auto_cache_key: bool,
     /// How long an auto cache key survives without being used, in seconds.
     pub cache_key_ttl: u64,
-    /// Requests per minute one auto cache key takes before we spread to another.
+    /// Requests per minute one auto cache key takes on trust. Past it the key
+    /// keeps taking requests only while its cache keeps hitting; once the
+    /// answers show it overflowing we spread to another key.
     pub cache_key_rpm: u32,
+    /// Past that rate, the share of the cached tokens bet on a key that must
+    /// have come back for it to count as still hitting (see
+    /// [`crate::cache_key::CacheKeyConfig::healthy_hit_ratio`]).
+    pub cache_key_healthy_ratio: f64,
+    /// Graded answers a key needs inside the minute before its hit ratio can
+    /// count against it; with fewer it is taken on trust.
+    pub cache_key_health_samples: usize,
     /// Emit the running billing line at INFO once every this many tokens; every
     /// other request logs it at DEBUG. `0` puts every request at INFO.
     pub billing_log_tokens: u64,
@@ -165,6 +174,8 @@ impl LLMSettings {
             enabled: self.auto_cache_key,
             ttl: std::time::Duration::from_secs(self.cache_key_ttl),
             max_rpm: self.cache_key_rpm,
+            healthy_hit_ratio: self.cache_key_healthy_ratio,
+            min_health_samples: self.cache_key_health_samples,
         }
     }
 
@@ -222,6 +233,8 @@ mod retry_backoff_tests {
             auto_cache_key: false,
             cache_key_ttl: 0,
             cache_key_rpm: 0,
+            cache_key_healthy_ratio: 0.0,
+            cache_key_health_samples: 0,
             billing_log_tokens: 0,
             token_estimate_pct: 0.0,
             allow_implicit_convert: false,

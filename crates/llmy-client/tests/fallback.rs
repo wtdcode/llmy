@@ -39,6 +39,8 @@ fn test_settings() -> LLMSettings {
         auto_cache_key: false,
         cache_key_ttl: 0,
         cache_key_rpm: 0,
+        cache_key_healthy_ratio: llmy_client::cache_key::DEFAULT_HEALTHY_HIT_RATIO,
+        cache_key_health_samples: llmy_client::cache_key::DEFAULT_MIN_HEALTH_SAMPLES,
         billing_log_tokens: 0,
         token_estimate_pct: 100.0,
         allow_implicit_convert: false,

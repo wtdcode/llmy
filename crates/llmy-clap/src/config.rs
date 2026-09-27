@@ -270,6 +270,14 @@ mod tests {
             settings.cache_key_rpm,
             llmy_client::cache_key::DEFAULT_MAX_RPM
         );
+        assert_eq!(
+            settings.cache_key_healthy_ratio,
+            llmy_client::cache_key::DEFAULT_HEALTHY_HIT_RATIO
+        );
+        assert_eq!(
+            settings.cache_key_health_samples,
+            llmy_client::cache_key::DEFAULT_MIN_HEALTH_SAMPLES
+        );
         assert!(!settings.allow_implicit_convert);
         assert!(!settings.llm_stream);
     }

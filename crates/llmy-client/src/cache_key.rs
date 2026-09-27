@@ -12,9 +12,13 @@
 //!
 //! Selection walks the chain from the longest link down and takes the first one
 //! already claimed by a live key with request budget left, so the deepest shared
-//! prefix wins and a saturated key falls through to the next-best one. Claiming
-//! covers only the links the provider will really store a cache entry at, which
-//! is where the two [`CachePolicy`] flavours differ — see [`cache_points`].
+//! prefix wins and a saturated key falls through to the next-best one. Budget is
+//! the provider's ~15 req/min per key taken on trust; past that a key keeps
+//! taking requests only while the cache reads it promised keep coming back, so
+//! a fan-out sharing one machine is left alone until the provider visibly starts
+//! overflowing it (see [`CacheKeyConfig::healthy_hit_ratio`]). Claiming covers
+//! only the links the provider will really store a cache entry at, which is
+//! where the two [`CachePolicy`] flavours differ — see [`cache_points`].
 //!
 //! A claim is an assertion that a prefix is cached under a key, so it is only
 //! settled once a request carrying it has actually been answered. Until then it
@@ -46,8 +50,21 @@ const RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// OpenAI steers one cache key to one machine, and warns that sustaining more
 /// than ~15 requests/minute on a single key spills over to more machines and
-/// costs you hit rate. So that is the default ceiling before we spread out.
+/// costs you hit rate. Below this rate a key is trusted; past it the key has to
+/// keep proving the cache still hits (see [`CacheKeyConfig::healthy_hit_ratio`])
+/// before it takes more, because spreading early costs a guaranteed miss on the
+/// new key while the provider may well have coped.
 pub const DEFAULT_MAX_RPM: u32 = 15;
+
+/// Default for [`CacheKeyConfig::healthy_hit_ratio`]. A healthy key sits around
+/// 0.9–1.0 — the provider rounds cache reads down to 128-token blocks and our
+/// local count drifts a little from its — while traffic overflowing onto other
+/// machines lands well below, so the middle leaves margin on both sides.
+pub const DEFAULT_HEALTHY_HIT_RATIO: f64 = 0.5;
+
+/// Default for [`CacheKeyConfig::min_health_samples`]: enough graded answers
+/// that one odd miss cannot condemn a key on its own.
+pub const DEFAULT_MIN_HEALTH_SAMPLES: usize = 4;
 
 /// Below this share of the expected prefix actually coming back cached, routing
 /// is not buying what it should and the prompt shape is the likely culprit — a
@@ -69,7 +86,7 @@ const MIN_CACHEABLE_TOKENS: u64 = 1024;
 /// entry was still live.
 pub const DEFAULT_TTL_SECS: u64 = 4 * 60 * 60;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CacheKeyConfig {
     /// When false, requests without a caller-supplied key are sent without one.
     pub enabled: bool,
@@ -77,8 +94,21 @@ pub struct CacheKeyConfig {
     /// this exists to keep a long-lived client from growing forever, not to
     /// track the provider's own cache lifetime.
     pub ttl: Duration,
-    /// Requests per minute one key is allowed before we spread to another.
+    /// Requests per minute one key takes on trust. Past it the key keeps taking
+    /// requests only while its cache keeps hitting; see `healthy_hit_ratio`.
     pub max_rpm: u32,
+    /// Share of the cached tokens bet on a key that must have come back, over
+    /// the answers graded inside the trailing [`RATE_WINDOW`], for the key to
+    /// keep taking requests past `max_rpm`. Token-weighted, so a big prefix
+    /// missing counts for what it costs. Below it the key is treated as
+    /// overflowing onto other machines and traffic spreads to a new one.
+    pub healthy_hit_ratio: f64,
+    /// Graded answers a key needs inside the window before its hit ratio counts
+    /// against it. With fewer, the key is taken on trust: a fresh key's first
+    /// wave bets nothing and so grades nothing, and it must not be spread on
+    /// that silence — that is exactly the fan-out the trust is there to keep
+    /// together.
+    pub min_health_samples: usize,
 }
 
 impl Default for CacheKeyConfig {
@@ -87,6 +117,8 @@ impl Default for CacheKeyConfig {
             enabled: true,
             ttl: Duration::from_secs(DEFAULT_TTL_SECS),
             max_rpm: DEFAULT_MAX_RPM,
+            healthy_hit_ratio: DEFAULT_HEALTHY_HIT_RATIO,
+            min_health_samples: DEFAULT_MIN_HEALTH_SAMPLES,
         }
     }
 }
@@ -139,11 +171,38 @@ struct KeyState {
     key: String,
     /// Send times inside the trailing [`RATE_WINDOW`], for the req/min budget.
     sends: VecDeque<Instant>,
+    /// Answers graded inside the trailing [`RATE_WINDOW`]: what each request
+    /// bet on the cache against what the provider reported reading from it.
+    hits: VecDeque<HitSample>,
     last_used: Instant,
 }
 
+/// One answered request's cache bet, graded when it landed.
+#[derive(Debug)]
+struct HitSample {
+    at: Instant,
+    expected: u64,
+    cached: u64,
+}
+
 impl KeyState {
-    fn drop_stale_sends(&mut self, now: Instant) {
+    /// Share of the cached tokens bet on this key that came back, over the
+    /// graded answers still in the window; `None` until there are at least
+    /// `min_samples` of them to mean anything.
+    fn hit_ratio(&self, min_samples: usize) -> Option<f64> {
+        if self.hits.len() < min_samples {
+            return None;
+        }
+        let expected: u64 = self.hits.iter().map(|hit| hit.expected).sum();
+        let cached: u64 = self.hits.iter().map(|hit| hit.cached).sum();
+        Some(cached as f64 / expected as f64)
+    }
+
+    /// Whether the key may take one more request: under `max_rpm` always, past
+    /// it only while the cache demonstrably still hits. The rate is where the
+    /// provider says one machine *may* start overflowing; the hit ratio is
+    /// whether it actually has.
+    fn has_budget(&mut self, now: Instant, config: &CacheKeyConfig) -> bool {
         while let Some(oldest) = self.sends.front() {
             if now.duration_since(*oldest) >= RATE_WINDOW {
                 self.sends.pop_front();
@@ -151,11 +210,17 @@ impl KeyState {
                 break;
             }
         }
-    }
-
-    fn has_budget(&mut self, now: Instant, max_rpm: u32) -> bool {
-        self.drop_stale_sends(now);
-        (self.sends.len() as u32) < max_rpm
+        while let Some(oldest) = self.hits.front() {
+            if now.duration_since(oldest.at) >= RATE_WINDOW {
+                self.hits.pop_front();
+            } else {
+                break;
+            }
+        }
+        (self.sends.len() as u32) < config.max_rpm
+            || self
+                .hit_ratio(config.min_health_samples)
+                .is_none_or(|ratio| ratio >= config.healthy_hit_ratio)
     }
 
     fn record_send(&mut self, now: Instant) {
@@ -243,8 +308,11 @@ impl CacheKeyRegistry {
         // Whatever the matched prefix was measured at when it was claimed is
         // what we are betting comes back as a cache read; a fresh key bets on
         // nothing.
-        let max_rpm = self.config.max_rpm;
+        let config = self.config;
         let mut chosen = None;
+        // The best key we had to pass over, for the log line if we end up
+        // minting: that is the machine this request wanted and did not get.
+        let mut passed_over = None;
         for block in blocks.iter().rev() {
             let Some(&claim) = self.claims.get(&block.hash) else {
                 continue;
@@ -252,15 +320,33 @@ impl CacheKeyRegistry {
             let Some(state) = self.keys.get_mut(&claim.key) else {
                 continue;
             };
-            if state.has_budget(now, max_rpm) {
+            if state.has_budget(now, &config) {
                 chosen = Some(claim);
                 break;
             }
+            passed_over.get_or_insert(claim.key);
         }
 
         let (id, expected_cached_tokens) = match chosen {
             Some(claim) => (claim.key, claim.tokens),
-            None => (self.mint(now, label), 0),
+            None => {
+                // A key is only ever passed over for being past `max_rpm` with
+                // enough graded answers to show the cache is no longer hitting,
+                // so both numbers are there to report.
+                if let Some(state) = passed_over.and_then(|id| self.keys.get(&id)) {
+                    tracing::info!(
+                        "prompt cache key {} is at {} req/min and only {:.0}% of the cached \
+                         tokens bet on it came back; spreading to a new key",
+                        state.key,
+                        state.sends.len(),
+                        state
+                            .hit_ratio(config.min_health_samples)
+                            .unwrap_or_default()
+                            * 100.0
+                    );
+                }
+                (self.mint(now, label), 0)
+            }
         };
 
         // Only real cache points get claimed, or a key would advertise cached
@@ -324,14 +410,28 @@ impl CacheKeyRegistry {
     }
 
     /// Settle the claims of a request that landed: those prefixes really were
-    /// sent and answered, so later requests may route by them.
-    fn confirm(&mut self, held: &[PrefixHash]) {
+    /// sent and answered, so later requests may route by them. The answer is
+    /// also graded for the key's health — `cached` being what the provider
+    /// reported reading from cache against the `expected` bet — when the bet
+    /// was big enough to grade and the provider reported anything at all.
+    fn confirm(&mut self, key: KeyId, held: &[PrefixHash], expected: u64, cached: Option<u64>) {
         for hash in held {
             if let Some(claim) = self.claims.get_mut(hash) {
                 claim.settled = true;
                 claim.holders = claim.holders.saturating_sub(1);
             }
         }
+        if expected < MIN_CACHEABLE_TOKENS {
+            return;
+        }
+        let (Some(cached), Some(state)) = (cached, self.keys.get_mut(&key)) else {
+            return;
+        };
+        state.hits.push_back(HitSample {
+            at: Instant::now(),
+            expected,
+            cached,
+        });
     }
 
     /// Drop the claims of a request that never landed — unless a sibling settled
@@ -367,6 +467,7 @@ impl CacheKeyRegistry {
             KeyState {
                 key,
                 sends: VecDeque::new(),
+                hits: VecDeque::new(),
                 last_used: now,
             },
         );
@@ -525,18 +626,28 @@ impl CacheKeyClaim {
         }
     }
 
-    /// Settle the claims — call once the request has been answered — and report
-    /// how the bet went against the `cached_tokens` the provider reported.
+    /// Settle the claims — call once the request has been answered — and grade
+    /// the bet against `cached_tokens`, what the provider reported reading from
+    /// cache. `None` when it reported no such thing (some OpenAI-compatible
+    /// backends never fill in `prompt_tokens_details`): that settles the claims
+    /// but is not a miss, so it neither warns nor counts against the key.
     ///
     /// Idempotent: later calls, from a retry that also landed or another clone,
     /// do nothing.
-    pub fn confirm(&self, cached_tokens: u64) {
+    pub fn confirm(&self, cached_tokens: Option<u64>) {
         if self.0.settled.swap(true, Ordering::Relaxed) {
             return;
         }
-        self.0.report(cached_tokens);
+        if let Some(cached) = cached_tokens {
+            self.0.report(cached);
+        }
         if let Ok(mut registry) = self.0.keys.0.write() {
-            registry.confirm(&self.0.held);
+            registry.confirm(
+                self.0.id,
+                &self.0.held,
+                self.0.expected_cached_tokens,
+                cached_tokens,
+            );
         }
     }
 }
@@ -720,8 +831,32 @@ mod tests {
     fn sent(keys: &CacheKeys, messages: &[&str]) -> Option<String> {
         let claim = select(keys, messages)?;
         let key = claim.key().to_string();
-        claim.confirm(0);
+        claim.confirm(Some(0));
         Some(key)
+    }
+
+    /// Put a lineage on `head` with its misses on record: one fresh turn, then
+    /// [`DEFAULT_MIN_HEALTH_SAMPLES`] follow-ups each answered with nothing read from
+    /// cache. Returns the last of those claims, already confirmed, so a test
+    /// can still charge a retry against its key.
+    fn condemned(keys: &CacheKeys, head: &str) -> CacheKeyClaim {
+        let key = sent(keys, &[head]).unwrap();
+        let mut last = None;
+        for i in 0..DEFAULT_MIN_HEALTH_SAMPLES {
+            let claim = select(keys, &[head, &format!("miss{i}")]).unwrap();
+            assert_eq!(
+                claim.key(),
+                key,
+                "misses short of a verdict are still trust"
+            );
+            assert!(
+                claim.expected_cached_tokens() >= MIN_CACHEABLE_TOKENS,
+                "the head must be long enough for the answer to be graded"
+            );
+            claim.confirm(Some(0));
+            last = Some(claim);
+        }
+        last.unwrap()
     }
 
     /// What `PartialPrefix` claims for a request of `n` messages.
@@ -818,20 +953,76 @@ mod tests {
     }
 
     #[test]
-    fn a_saturated_key_spreads_to_a_new_one() {
+    fn a_saturated_key_is_trusted_until_its_answers_are_graded() {
         let keys = CacheKeys::new(CacheKeyConfig {
             max_rpm: 2,
             ..CacheKeyConfig::default()
         });
         let key = sent(&keys, &["a"]).unwrap();
-        assert_eq!(sent(&keys, &["a"]).as_deref(), Some(&*key));
-        // Third send inside the minute: the key is full, so we spread out.
-        let overflow = sent(&keys, &["a"]).unwrap();
-        assert_ne!(overflow, key);
+        // Well past two sends in the minute, but nothing these answers could
+        // be graded on: the fan-out stays on one machine rather than paying a
+        // miss per fragment on suspicion alone.
+        for _ in 0..DEFAULT_MIN_HEALTH_SAMPLES * 2 {
+            assert_eq!(sent(&keys, &["a"]).as_deref(), Some(&*key));
+        }
+        assert_eq!(keys.key_count(), 1);
+    }
+
+    #[test]
+    fn a_saturated_key_that_keeps_hitting_stays_put() {
+        let keys = CacheKeys::new(CacheKeyConfig {
+            max_rpm: 2,
+            ..CacheKeyConfig::default()
+        });
+        let head = "lorem ipsum dolor sit amet ".repeat(256);
+        let key = sent(&keys, &[&head]).unwrap();
+        for i in 0..DEFAULT_MIN_HEALTH_SAMPLES * 2 {
+            let claim = select(&keys, &[&head, &format!("q{i}")]).unwrap();
+            assert_eq!(claim.key(), key);
+            let expected = claim.expected_cached_tokens();
+            assert!(expected >= MIN_CACHEABLE_TOKENS);
+            // Everything bet on the cache came back: the provider is coping
+            // with this rate, so there is nothing to spread.
+            claim.confirm(Some(expected));
+        }
+        assert_eq!(keys.key_count(), 1);
+    }
+
+    #[test]
+    fn a_saturated_key_that_stops_hitting_spreads() {
+        let keys = CacheKeys::new(CacheKeyConfig {
+            max_rpm: 2,
+            ..CacheKeyConfig::default()
+        });
+        let head = "lorem ipsum dolor sit amet ".repeat(256);
+        let claim = condemned(&keys, &head);
+        // Past the rate with enough graded misses on record: that machine is
+        // overflowing, so the next request spreads to a new key ...
+        let overflow = select(&keys, &[&head, "next"]).unwrap();
+        assert_ne!(overflow.key(), claim.key());
         assert_eq!(keys.key_count(), 2);
-        // The original prefix still belongs to the original key, so once its
-        // budget frees up the lineage goes home rather than fragmenting.
-        assert_eq!(keys.settled(), claims_of(&["a"]).len());
+        // ... while the prefixes stay with the key that cached them — the head
+        // plus one per graded turn — so once its window clears the lineage
+        // goes home rather than fragmenting.
+        assert_eq!(keys.settled(), 1 + DEFAULT_MIN_HEALTH_SAMPLES);
+    }
+
+    #[test]
+    fn an_ungraded_answer_is_no_evidence_against_a_key() {
+        let keys = CacheKeys::new(CacheKeyConfig {
+            max_rpm: 2,
+            ..CacheKeyConfig::default()
+        });
+        let head = "lorem ipsum dolor sit amet ".repeat(256);
+        let key = sent(&keys, &[&head]).unwrap();
+        // A backend that never reports cached tokens: silence is not a miss,
+        // so the key is trusted however far past the rate it goes.
+        for i in 0..DEFAULT_MIN_HEALTH_SAMPLES * 2 {
+            let claim = select(&keys, &[&head, &format!("q{i}")]).unwrap();
+            assert_eq!(claim.key(), key);
+            claim.confirm(None);
+        }
+        assert_eq!(keys.key_count(), 1);
     }
 
     #[test]
@@ -845,7 +1036,7 @@ mod tests {
         // Turn 1 is a fresh key: nothing is expected back from it.
         let claim = keys.select(&turn1, &model, None).unwrap();
         assert_eq!(claim.expected_cached_tokens(), 0);
-        claim.confirm(0);
+        claim.confirm(Some(0));
 
         // Turn 2 matches turn 1's prefix, so the expectation is exactly what that
         // prefix was measured at when it was claimed — read back, not recomputed.
@@ -861,7 +1052,7 @@ mod tests {
                 as u64,
             "should be the tools block plus the first message"
         );
-        claim.confirm(expected);
+        claim.confirm(Some(expected));
 
         // Turn 3 matches turn 2's longer prefix, so it expects strictly more.
         let turn3 = request(&[&head, "and a follow-up", "more"]);
@@ -902,29 +1093,42 @@ mod tests {
         drop(first);
         assert_eq!(select(&keys, &["a", "z"]).unwrap().key(), key);
 
-        second.confirm(0);
-        third.confirm(0);
+        second.confirm(Some(0));
+        third.confirm(Some(0));
         assert!(keys.settled() > 0);
     }
 
     #[test]
     fn a_retry_costs_another_slot_of_the_key_s_budget() {
         // The provider counts total traffic per key, so a retried request is two
-        // requests on that key, not one.
-        let keys = CacheKeys::new(CacheKeyConfig {
-            max_rpm: 2,
+        // requests on that key, not one. The slot only matters on a key whose
+        // misses are on record, so start from one and set the rate one above
+        // what condemning it took.
+        let condemned_sends = 1 + DEFAULT_MIN_HEALTH_SAMPLES as u32;
+        let config = CacheKeyConfig {
+            max_rpm: condemned_sends + 1,
             ..CacheKeyConfig::default()
-        });
+        };
+        let head = "lorem ipsum dolor sit amet ".repeat(256);
 
-        let claim = select(&keys, &["a"]).unwrap();
-        let key = claim.key().to_string();
-        claim.charge_resend(); // one attempt failed and was re-sent
-        claim.confirm(0);
+        let control = CacheKeys::new(config);
+        let claim = condemned(&control, &head);
+        // One slot left at this rate, so the lineage stays home.
+        assert_eq!(
+            select(&control, &[&head, "next"]).unwrap().key(),
+            claim.key()
+        );
+        assert_eq!(control.key_count(), 1);
 
-        // Two sends spent the whole minute's budget, so the next request finds
-        // the prefix but no room and spreads to another machine.
-        assert_ne!(sent(&keys, &["a"]).unwrap(), key);
-        assert_eq!(keys.key_count(), 2);
+        let retried = CacheKeys::new(config);
+        let claim = condemned(&retried, &head);
+        claim.charge_resend(); // one of those attempts failed and was re-sent
+        // Same misses, but that re-send took the last slot: the key is full.
+        assert_ne!(
+            select(&retried, &[&head, "next"]).unwrap().key(),
+            claim.key()
+        );
+        assert_eq!(retried.key_count(), 2);
     }
 
     #[test]
@@ -1001,7 +1205,7 @@ mod tests {
         turn1.prompt_cache_options = Some(PromptCacheOptionsRaw::explicit());
         let claim = keys.select(&turn1, &breakpoint_model(), None).unwrap();
         let key = claim.key().to_string();
-        claim.confirm(0);
+        claim.confirm(Some(0));
 
         // Turn 2 keeps the same head, so it hits that entry and the same key,
         // even though nothing else about the request matches.
@@ -1010,7 +1214,7 @@ mod tests {
         turn2.prompt_cache_options = Some(PromptCacheOptionsRaw::explicit());
         let claim = keys.select(&turn2, &breakpoint_model(), None).unwrap();
         assert_eq!(claim.key(), key);
-        claim.confirm(0);
+        claim.confirm(Some(0));
         assert_eq!(keys.key_count(), 1);
 
         // A different head shares no cache point, so it gets its own machine.

@@ -1358,6 +1358,8 @@ mod tests {
             auto_cache_key: true,
             cache_key_ttl: llmy_client::cache_key::DEFAULT_TTL_SECS,
             cache_key_rpm: llmy_client::cache_key::DEFAULT_MAX_RPM,
+            cache_key_healthy_ratio: llmy_client::cache_key::DEFAULT_HEALTHY_HIT_RATIO,
+            cache_key_health_samples: llmy_client::cache_key::DEFAULT_MIN_HEALTH_SAMPLES,
             billing_log_tokens: 100_000,
             token_estimate_pct: 10.0,
             allow_implicit_convert: false,
