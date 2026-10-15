@@ -593,6 +593,15 @@ impl LLMRequest {
         }
     }
 
+    /// The model id this request goes out with.
+    fn model(&self) -> &str {
+        match self {
+            Self::Chat(req) => &req.model,
+            Self::Anthropic(req) => &req.model,
+            Self::Responses(req) => &req.model,
+        }
+    }
+
     /// Overwrite the model id this request goes out with — how a fallback
     /// target takes over a request originally built for another profile's
     /// model.
@@ -1381,7 +1390,10 @@ impl LLMInner {
     /// attempts (`timeout`/`retry` overrides win over the target's own
     /// settings); a target that exhausts its budget is cooled down and the
     /// next one takes over. Billing/cap errors abort the whole chain at
-    /// once, since neither retry nor fallback can recover a blown budget.
+    /// once, since neither retry nor fallback can recover a blown budget; so
+    /// does a model mismatch the target is set to fail on, since the caller
+    /// asked to be told rather than have the request quietly served
+    /// elsewhere.
     async fn complete_planned_once_with_retry(
         &self,
         planned: Vec<(LLMTarget, LLMRequest)>,
@@ -1425,7 +1437,9 @@ impl LLMInner {
                         }
                         return Ok(landed);
                     }
-                    Err(e @ LLMYError::Billing(_)) => return Err(e),
+                    Err(e @ (LLMYError::Billing(_) | LLMYError::ModelMismatch { .. })) => {
+                        return Err(e);
+                    }
                     Err(e) => {
                         tracing::warn!("Having an error {} during {} retry", e, idx);
                         last = Some(e);
@@ -1488,7 +1502,9 @@ impl LLMInner {
                         }
                         return Ok(value);
                     }
-                    Err(e @ LLMYError::Billing(_)) => return Err(e),
+                    Err(e @ (LLMYError::Billing(_) | LLMYError::ModelMismatch { .. })) => {
+                        return Err(e);
+                    }
                     Err(e) => {
                         tracing::warn!("Having an error {} during {} retry", e, idx);
                         last = Some(e);
@@ -1941,12 +1957,16 @@ impl LLMInner {
             &serde_json::to_string(&req)
         );
 
+        // What the answer's model is held against. It also stands in for a
+        // stream that never names its model: the best guess is the one asked
+        // for, which keeps such a stream from looking like a mismatch.
+        let requested_model = req.model().to_string();
         let now = std::time::SystemTime::now();
         let llm_fut = async {
             if use_stream {
                 target
                     .client
-                    .send_streaming(&mut req, target.model.api_model_name())
+                    .send_streaming(&mut req, &requested_model)
                     .await
             } else {
                 target.client.send(&req).await
@@ -2169,6 +2189,24 @@ impl LLMInner {
                 billing_snapshot,
                 speed,
                 client
+            );
+        }
+
+        // Held back until the answer is billed: the spend happened whichever
+        // model produced it. An empty name is a provider not saying, not a
+        // different model.
+        if !resp.model.is_empty() && !OpenAIModel::is_same_model(&requested_model, &resp.model) {
+            if target.settings.error_on_mismatched_model {
+                return Err(LLMYError::ModelMismatch {
+                    requested: requested_model,
+                    served: resp.model.clone(),
+                });
+            }
+            tracing::warn!(
+                "profile '{}' requested model {} but the answer came from {}",
+                target.name,
+                requested_model,
+                resp.model
             );
         }
         Ok((resp, assistant))
@@ -2472,6 +2510,7 @@ mod tests {
             billing_log_tokens: 100_000,
             token_estimate_pct: 10.0,
             allow_implicit_convert: false,
+            error_on_mismatched_model: false,
             llm_app: None,
             llm_concurrent: 0,
         }

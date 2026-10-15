@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -228,6 +228,17 @@ fn generate_models(data_dir: &Path, out_dir: &str) {
             },
         };
         models.insert(key.clone(), config);
+    }
+
+    // Distinct models need distinct display names: lookup accepts a display
+    // name, and it is how an alias is told apart from an unrelated model.
+    let mut display_names: BTreeMap<&str, &str> = BTreeMap::new();
+    for (key, entry) in &entries {
+        if let ModelEntry::Config(config) = entry
+            && let Some(other) = display_names.insert(config.name.as_str(), key.as_str())
+        {
+            panic!("{key} and {other} share the display name {:?}", config.name);
+        }
     }
 
     let mut sorted: Vec<_> = models.iter().collect();

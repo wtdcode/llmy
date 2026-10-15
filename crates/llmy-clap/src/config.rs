@@ -279,6 +279,7 @@ mod tests {
             llmy_client::cache_key::DEFAULT_MIN_HEALTH_SAMPLES
         );
         assert!(!settings.allow_implicit_convert);
+        assert!(!settings.error_on_mismatched_model);
         assert!(!settings.llm_stream);
     }
 

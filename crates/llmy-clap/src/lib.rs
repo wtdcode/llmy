@@ -395,6 +395,20 @@ macro_rules! make_openai_args {
             )]
             pub allow_implicit_convert: bool,
 
+            /// Fail a request whose answer comes from a different model than
+            /// the one asked for, instead of only logging a warning. Dated
+            /// snapshots (`gpt-4o` answered as `gpt-4o-2024-08-06`), an
+            /// `owner/` prefix and registry aliases count as the same model.
+            /// The failed request is still billed, and is neither retried nor
+            /// handed to a fallback profile.
+            #[arg(
+                long = concat!($long, "error-on-mismatched-model"),
+                env = concat!($prefix, "LLM_ERROR_ON_MISMATCHED_MODEL"),
+                default_value_t = false,
+                value_parser = clap::builder::BoolishValueParser::new()
+            )]
+            pub error_on_mismatched_model: bool,
+
             /// Path to a llmy TOML config file with LLM profiles. When
             /// given, `may_llm`/`to_llm` build the config's fallback chain
             /// instead of this single endpoint — see the struct docs for how
@@ -469,6 +483,7 @@ macro_rules! make_openai_args {
                     billing_log_tokens: DEFAULT_LLM_BILLING_LOG_TOKENS,
                     token_estimate_pct: DEFAULT_LLM_TOKEN_ESTIMATE_PCT,
                     allow_implicit_convert: false,
+                    error_on_mismatched_model: false,
                     llmy_config: None,
                     llm_profiles: None,
                 }
@@ -518,6 +533,7 @@ macro_rules! make_openai_args {
                     billing_log_tokens: self.billing_log_tokens,
                     token_estimate_pct: self.token_estimate_pct,
                     allow_implicit_convert: self.allow_implicit_convert,
+                    error_on_mismatched_model: self.error_on_mismatched_model,
                     llm_app: self.resolved_app_identity(),
                 }
             }
@@ -1050,6 +1066,21 @@ mod tests {
                 .settings()
                 .allow_implicit_convert
         );
+    }
+
+    #[test]
+    fn a_mismatched_model_only_warns_unless_asked_to_error() {
+        let _env = env_lock();
+        assert!(!parse(&[]).settings().error_on_mismatched_model);
+        assert!(
+            parse(&["--opt-opt-error-on-mismatched-model"])
+                .settings()
+                .error_on_mismatched_model
+        );
+        // A config profile opts in by the same name.
+        let profile: OpenAISetup =
+            toml::from_str("model = \"x,1,2\"\nerror-on-mismatched-model = true").expect("profile");
+        assert!(profile.settings().error_on_mismatched_model);
     }
 
     #[test]

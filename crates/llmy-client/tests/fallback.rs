@@ -1,6 +1,8 @@
 //! On-the-wire checks of the LLM fallback chain: a dead primary spills to
-//! the backup profile (with the model id rewritten to the backup's), and a
-//! profile over its own spend cap is skipped without failing the client.
+//! the backup profile (with the model id rewritten to the backup's), a
+//! profile over its own spend cap is skipped without failing the client, and
+//! an answer from the wrong model is only warned about unless the profile
+//! asks to fail on it — in which case it stops the chain like a blown cap.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -12,6 +14,7 @@ use llmy_client::req::{
     CreateChatCompletionRequestRaw,
 };
 use llmy_client::settings::LLMSettings;
+use llmy_types::error::LLMYError;
 use llmy_types::other::WithOtherFields;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -44,6 +47,7 @@ fn test_settings() -> LLMSettings {
         billing_log_tokens: 0,
         token_estimate_pct: 100.0,
         allow_implicit_convert: false,
+        error_on_mismatched_model: false,
         llm_app: None,
     }
 }
@@ -59,12 +63,13 @@ fn profile(name: &str, url: &str, model: &str) -> LLMProfile {
 }
 
 /// Serve `count` chat completions on `listener`, returning the raw request
-/// heads+bodies observed. Every response reports `prompt_tokens` prompt
-/// tokens so billing has something to record.
+/// heads+bodies observed. Every response says it came from `served_model` and
+/// reports `prompt_tokens` prompt tokens so billing has something to record.
 async fn serve_chat_completions(
     listener: TcpListener,
     count: usize,
     prompt_tokens: u64,
+    served_model: String,
 ) -> Vec<String> {
     let mut seen = Vec::new();
     for _ in 0..count {
@@ -98,7 +103,7 @@ async fn serve_chat_completions(
             "id": "chatcmpl-test",
             "object": "chat.completion",
             "created": 1,
-            "model": "served-model",
+            "model": served_model,
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": "ok"},
@@ -135,7 +140,12 @@ fn user_request(model: &str) -> CreateChatCompletionRequestRaw {
 async fn a_dead_primary_falls_over_to_the_backup_with_its_model_id() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let backup_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
-    let server = tokio::spawn(serve_chat_completions(listener, 1, 10));
+    let server = tokio::spawn(serve_chat_completions(
+        listener,
+        1,
+        10,
+        "backup-model".into(),
+    ));
 
     // Port 1 refuses connections immediately: the primary's whole retry
     // budget burns fast and the chain moves on.
@@ -183,8 +193,18 @@ async fn a_profile_over_its_own_cap_spills_to_the_next() {
     let first_url = format!("http://{}/v1", first.local_addr().expect("addr"));
     let second_url = format!("http://{}/v1", second.local_addr().expect("addr"));
     // 1M prompt tokens at $1/1M => every request costs about $1.
-    let first_server = tokio::spawn(serve_chat_completions(first, 1, 1_000_000));
-    let second_server = tokio::spawn(serve_chat_completions(second, 1, 1_000_000));
+    let first_server = tokio::spawn(serve_chat_completions(
+        first,
+        1,
+        1_000_000,
+        "first-model".into(),
+    ));
+    let second_server = tokio::spawn(serve_chat_completions(
+        second,
+        1,
+        1_000_000,
+        "second-model".into(),
+    ));
 
     let mut capped = profile("capped", &first_url, "first-model,1,1");
     capped.cap = Some(rust_decimal::dec!(0.5));
@@ -213,4 +233,86 @@ async fn a_profile_over_its_own_cap_spills_to_the_next() {
         seen[0]
     );
     drop(first_server);
+}
+
+#[tokio::test]
+async fn an_answer_from_another_model_is_kept_by_default() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+    let server = tokio::spawn(serve_chat_completions(
+        listener,
+        1,
+        10,
+        "other-model".into(),
+    ));
+
+    let llm = LLM::new_with_fallback(
+        vec![profile("only", &url, "asked-model,1,1")],
+        rust_decimal::dec!(100),
+        Duration::from_secs(60),
+        None,
+    )
+    .expect("llm");
+
+    // Only a warning: the answer comes back, still saying who served it.
+    let resp = llm
+        .complete_once_with_retry(&user_request("asked-model"), None, None, None)
+        .await
+        .expect("answer kept");
+    assert_eq!(resp.model, "other-model");
+    server.await.expect("server");
+}
+
+#[tokio::test]
+async fn an_answer_from_another_model_stops_the_chain_when_asked_to() {
+    let strict_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let backup_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let strict_url = format!("http://{}/v1", strict_listener.local_addr().expect("addr"));
+    let backup_url = format!("http://{}/v1", backup_listener.local_addr().expect("addr"));
+    let strict_server = tokio::spawn(serve_chat_completions(
+        strict_listener,
+        1,
+        1_000_000,
+        "other-model".into(),
+    ));
+    // A backup that would answer correctly — the error must still win.
+    let backup_server = tokio::spawn(serve_chat_completions(
+        backup_listener,
+        1,
+        10,
+        "backup-model".into(),
+    ));
+
+    let mut strict = profile("strict", &strict_url, "asked-model,1,1");
+    strict.settings.error_on_mismatched_model = true;
+    let llm = LLM::new_with_fallback(
+        vec![strict, profile("backup", &backup_url, "backup-model,1,1")],
+        rust_decimal::dec!(100),
+        Duration::from_secs(60),
+        None,
+    )
+    .expect("llm");
+
+    // With two attempts budgeted and a working backup, anything but this
+    // error means the mismatch was retried or handed on.
+    let err = llm
+        .complete_once_with_retry(&user_request("asked-model"), None, None, None)
+        .await
+        .expect_err("mismatch");
+    match err {
+        LLMYError::ModelMismatch { requested, served } => {
+            assert_eq!(requested, "asked-model");
+            assert_eq!(served, "other-model");
+        }
+        other => panic!("expected a model mismatch, got {other:?}"),
+    }
+    strict_server.await.expect("strict server");
+
+    // The answer was produced, so it was billed; the backup was never asked.
+    assert!(*llm.targets[0].spent.read().unwrap() > rust_decimal::Decimal::ZERO);
+    assert_eq!(
+        *llm.targets[1].spent.read().unwrap(),
+        rust_decimal::Decimal::ZERO
+    );
+    backup_server.abort();
 }

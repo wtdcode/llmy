@@ -97,6 +97,12 @@ pub enum LLMYError {
     STDJSON(#[from] serde_json::Error),
     #[error("billing error: {0}")]
     Billing(BillingExhausted),
+    /// The API answered from a different model than the request asked for,
+    /// with `error_on_mismatched_model` set. Raised only once the answer is
+    /// billed — the spend happened whichever model produced it — and never
+    /// retried or failed over: asking again would not change who serves it.
+    #[error("model mismatch: requested {requested}, served by {served}")]
+    ModelMismatch { requested: String, served: String },
     #[error("incorrect tool call for tool {0} with args {1} given schema {2:?}")]
     IncorrectToolCall(String, String, schemars::Schema),
     /// A well-formed tool call that the tool itself refused: the arguments
@@ -183,6 +189,7 @@ impl LLMYError {
             Self::OpenAI(_) => "openai",
             Self::STDJSON(_) => "json",
             Self::Billing(_) => "billing",
+            Self::ModelMismatch { .. } => "model_mismatch",
             Self::IncorrectToolCall(..) => "incorrect_tool_call",
             Self::ToolCallRejected(..) => "tool_call_rejected",
             Self::UnknownToolCall(_) => "unknown_tool_call",

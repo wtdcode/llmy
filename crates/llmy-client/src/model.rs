@@ -102,6 +102,57 @@ impl OpenAIModel {
     pub fn info(&self) -> (u64, u64) {
         (self.config.max_input_tokens, self.config.max_tokens)
     }
+
+    /// Whether an answer reporting `served` as its model comes from the model
+    /// a request asked for as `requested`. Providers routinely answer with a
+    /// more specific name than the one asked for, so beyond a case-insensitive
+    /// exact match this accepts:
+    /// - an `owner/` prefix on either side, which aggregators and proxies add
+    ///   or drop;
+    /// - a dated snapshot of the requested name — `-2024-08-06` (OpenAI),
+    ///   `-20250929` (Anthropic), `-0731` (DeepSeek, Qwen) — including a
+    ///   requested `-latest` answered by any snapshot;
+    /// - two names the registry resolves to one model: an alias and its
+    ///   target, or two aliases of the same target. Aliases carry their
+    ///   target's display name, which the registry keeps unique per model.
+    pub fn is_same_model(requested: &str, served: &str) -> bool {
+        let requested_lower = requested.to_ascii_lowercase();
+        let served_lower = served.to_ascii_lowercase();
+        let requested_bare = requested_lower
+            .rsplit_once('/')
+            .map_or(requested_lower.as_str(), |(_, name)| name);
+        let served_bare = served_lower
+            .rsplit_once('/')
+            .map_or(served_lower.as_str(), |(_, name)| name);
+        if requested_bare == served_bare {
+            return true;
+        }
+
+        let snapshot_of = requested_bare
+            .strip_suffix("-latest")
+            .unwrap_or(requested_bare);
+        let is_snapshot = served_bare
+            .strip_prefix(snapshot_of)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|stamp| {
+                let groups_are_digits = stamp
+                    .split('-')
+                    .all(|group| !group.is_empty() && group.bytes().all(|b| b.is_ascii_digit()));
+                let digits = stamp.bytes().filter(u8::is_ascii_digit).count();
+                groups_are_digits && (digits == 4 || digits == 8)
+            });
+        if is_snapshot {
+            return true;
+        }
+
+        match (
+            find_registered_model(requested_bare),
+            find_registered_model(served_bare),
+        ) {
+            (Some((_, requested)), Some((_, served))) => requested.name == served.name,
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for OpenAIModel {
@@ -247,6 +298,54 @@ fn find_registered_model(name: &str) -> Option<(ModelId, ModelConfig)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_under_a_more_specific_name_is_the_same_model() {
+        for (requested, served) in [
+            ("gpt-4o", "gpt-4o"),
+            ("GPT-4o", "gpt-4o"),
+            // Aggregators and proxies add or drop the owner.
+            ("openai/gpt-4o", "gpt-4o"),
+            ("gpt-4o", "openai/gpt-4o"),
+            // Dated snapshots, in each provider's stamp format.
+            ("gpt-4o", "gpt-4o-2024-08-06"),
+            ("gpt-4", "gpt-4-0613"),
+            ("claude-sonnet-4-5", "claude-sonnet-4-5-20250929"),
+            ("claude-3-5-sonnet-latest", "claude-3-5-sonnet-20241022"),
+            ("deepseek-v4-flash", "deepseek-v4-flash-0731"),
+            ("qwen3.8-max", "qwen3.8-max-0902"),
+            // Registry aliases: alias and target, and two aliases of one target.
+            ("deepseek-v4-flash", "deepseek-flash"),
+            ("deepseek-v4.1-flash", "deepseek-v4-flash-0731"),
+        ] {
+            assert!(
+                OpenAIModel::is_same_model(requested, served),
+                "{requested} answered as {served} should match"
+            );
+        }
+    }
+
+    #[test]
+    fn an_answer_from_another_model_is_a_mismatch() {
+        for (requested, served) in [
+            ("gpt-4o", "gpt-4o-mini"),
+            // A stamp only excuses the name it follows.
+            ("gpt-4o", "gpt-4o-mini-2024-07-18"),
+            ("gpt-4o", "gpt-4o-2024-08-06-preview"),
+            ("gpt-4o", "gpt-4o-12"),
+            ("claude-opus-4-5", "claude-sonnet-4-5-20250929"),
+            // Both registered, but as different models.
+            ("deepseek-v4-flash", "deepseek-v4-pro"),
+            // A runtime substitution Codex's backend has been seen making.
+            ("gpt-6-astra", "gpt-5.6-luna"),
+            ("gpt-4o", "served-model"),
+        ] {
+            assert!(
+                !OpenAIModel::is_same_model(requested, served),
+                "{requested} answered as {served} should not match"
+            );
+        }
+    }
 
     #[test]
     fn custom_pricing_reuses_registered_model_limits() {

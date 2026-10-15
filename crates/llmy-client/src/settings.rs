@@ -160,6 +160,11 @@ pub struct LLMSettings {
     /// refused (`LLMY_ALLOW_IMPLICIT_CONVERT`). Only requests already in the
     /// backend's own format are sent without it.
     pub allow_implicit_convert: bool,
+    /// What to do when the API answers from a different model than the request
+    /// asked for (see [`crate::model::OpenAIModel::is_same_model`] for what
+    /// counts as the same): off, log a warning and keep the answer; on, fail
+    /// the request with [`llmy_types::error::LLMYError::ModelMismatch`].
+    pub error_on_mismatched_model: bool,
     /// Application identity announced on every request (`User-Agent` plus
     /// app marker headers): llmy itself, a mimicked known client, or a
     /// custom value. Like `llm_concurrent`, applied when the client is
@@ -238,6 +243,7 @@ mod retry_backoff_tests {
             billing_log_tokens: 0,
             token_estimate_pct: 0.0,
             allow_implicit_convert: false,
+            error_on_mismatched_model: false,
             llm_app: None,
         }
     }
