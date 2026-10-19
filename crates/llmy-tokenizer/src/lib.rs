@@ -19,6 +19,9 @@ mod generated_qwen {
 mod generated_glm {
     include!(concat!(env!("OUT_DIR"), "/glm_generated.rs"));
 }
+mod generated_minimax {
+    include!(concat!(env!("OUT_DIR"), "/minimax_generated.rs"));
+}
 
 pub use generated_models::ModelId;
 
@@ -35,6 +38,7 @@ pub enum Encoding {
     DeepSeek,
     Qwen,
     Glm,
+    MiniMax,
 }
 
 impl Encoding {
@@ -47,6 +51,7 @@ impl Encoding {
             "deepseek" => Some(Self::DeepSeek),
             "qwen" => Some(Self::Qwen),
             "glm" => Some(Self::Glm),
+            "minimax" => Some(Self::MiniMax),
             _ => None,
         }
     }
@@ -60,6 +65,7 @@ impl Encoding {
             Self::DeepSeek => "deepseek",
             Self::Qwen => "qwen",
             Self::Glm => "glm",
+            Self::MiniMax => "minimax",
         }
     }
 }
@@ -369,6 +375,7 @@ static CLAUDE_BPE: OnceLock<CoreBPE> = OnceLock::new();
 static DEEPSEEK_BPE: OnceLock<CoreBPE> = OnceLock::new();
 static QWEN_BPE: OnceLock<CoreBPE> = OnceLock::new();
 static GLM_BPE: OnceLock<CoreBPE> = OnceLock::new();
+static MINIMAX_BPE: OnceLock<CoreBPE> = OnceLock::new();
 static CL100K_BPE: OnceLock<CoreBPE> = OnceLock::new();
 static O200K_BPE: OnceLock<CoreBPE> = OnceLock::new();
 static P50K_BPE: OnceLock<CoreBPE> = OnceLock::new();
@@ -414,6 +421,14 @@ pub fn get_bpe(encoding: Encoding) -> &'static CoreBPE {
                 generated_glm::GLM_TOKEN_COUNT,
                 generated_glm::GLM_SPECIAL_TOKENS,
                 generated_glm::GLM_PAT_STR,
+            )
+        }),
+        Encoding::MiniMax => MINIMAX_BPE.get_or_init(|| {
+            build_embedded_bpe(
+                generated_minimax::MINIMAX_BPE_DATA,
+                generated_minimax::MINIMAX_TOKEN_COUNT,
+                generated_minimax::MINIMAX_SPECIAL_TOKENS,
+                generated_minimax::MINIMAX_PAT_STR,
             )
         }),
     }
@@ -490,6 +505,7 @@ mod tests {
         let deepseek = [2usize, 10, 8, 12, 12];
         let qwen = [2usize, 10, 8, 11, 12];
         let glm = [2usize, 10, 8, 10, 12];
+        let minimax = [2usize, 10, 7, 11, 11];
         for (s, want) in samples.iter().zip(deepseek) {
             assert_eq!(encode(s, Encoding::DeepSeek).len(), want, "{s:?}");
         }
@@ -500,6 +516,12 @@ mod tests {
         // (151k of the 154k entries), so it stands in for them too.
         for (s, want) in samples.iter().zip(glm) {
             assert_eq!(encode(s, Encoding::Glm).len(), want, "{s:?}");
+        }
+        // The MiniMax vocab is MiniMax-M3's; M2 publishes the identical BPE
+        // (same vocab, merges and pre-tokenizer). M3.1 Flash has no published
+        // tokenizer and is assumed to keep its family's.
+        for (s, want) in samples.iter().zip(minimax) {
+            assert_eq!(encode(s, Encoding::MiniMax).len(), want, "{s:?}");
         }
     }
 
@@ -614,6 +636,73 @@ mod tests {
         let snapshot = get_model("alibaba/qwen3.8-max-0902").expect("alias");
         assert_eq!(snapshot.model_name, "qwen3.8-max-0902");
         assert_eq!(snapshot.pricing.expect("pricing").input, pricing.input);
+    }
+
+    #[test]
+    fn minimax_m3_family_pricing_comes_from_the_registry() {
+        // Pins the MiniMax pay-as-you-go table: M3.1 Flash at $0.15/$0.60
+        // per 1M flat with cache reads at $0.015; M3 at $0.30/$1.20 up to
+        // 512K input tokens and double past it. Neither lists a cache-write
+        // price. The preview name is an alias keeping its own wire name.
+        // MiniMax matches model ids case-sensitively, so the keys keep its
+        // casing while lookup ignores case.
+        let flash = get_model("minimax/minimax-m3.1-flash").expect("known model");
+        assert_eq!(flash.model_name, "MiniMax-M3.1-Flash");
+        assert_eq!(flash.encoding(), Some(Encoding::MiniMax));
+        assert_eq!(flash.max_input_tokens, 1_000_000);
+        assert_eq!(flash.max_tokens, 131_072);
+        let pricing = flash.pricing.expect("pricing");
+        assert_eq!(pricing.input, rust_decimal::dec!(0.00000015));
+        assert_eq!(pricing.output, rust_decimal::dec!(0.0000006));
+        assert_eq!(
+            pricing.input_cache_read,
+            Some(rust_decimal::dec!(0.000000015))
+        );
+        assert!(pricing.input_cache_write.is_none());
+        assert!(pricing.long_context.is_none());
+
+        let preview = get_model("minimax/minimax-m3.1-flash-preview").expect("alias");
+        assert_eq!(preview.model_name, "MiniMax-M3.1-Flash-Preview");
+        assert_eq!(preview.pricing.expect("pricing").input, pricing.input);
+
+        let m3 = get_model("minimax/minimax-m3").expect("known model");
+        assert_eq!(m3.encoding(), Some(Encoding::MiniMax));
+        let pricing = m3.pricing.expect("pricing");
+        assert_eq!(pricing.input, rust_decimal::dec!(0.0000003));
+        let long = pricing.long_context.expect("long-context tier");
+        assert_eq!(long.threshold, 524_288);
+        assert_eq!(long.input, rust_decimal::dec!(0.0000006));
+        assert_eq!(long.output, rust_decimal::dec!(0.0000024));
+        assert_eq!(long.input_cache_read, Some(rust_decimal::dec!(0.00000012)));
+
+        // The M2 series publishes the same BPE, so it counts with the real
+        // vocab too. Its highspeed routes cost twice the standard tokens;
+        // cache pricing is per generation, not per route.
+        for (standard, cache_read) in [
+            ("minimax/minimax-m2.1", rust_decimal::dec!(0.00000003)),
+            ("minimax/minimax-m2.5", rust_decimal::dec!(0.00000003)),
+            ("minimax/minimax-m2.7", rust_decimal::dec!(0.00000006)),
+        ] {
+            let base = get_model(standard).expect("known model");
+            let fast = get_model(&format!("{standard}-highspeed")).expect("known model");
+            assert_eq!(base.encoding(), Some(Encoding::MiniMax), "{standard}");
+            assert_eq!(fast.encoding(), Some(Encoding::MiniMax), "{standard}");
+            let (base, fast) = (
+                base.pricing.expect("pricing"),
+                fast.pricing.expect("pricing"),
+            );
+            assert_eq!(fast.input, base.input * rust_decimal::dec!(2), "{standard}");
+            assert_eq!(
+                fast.output,
+                base.output * rust_decimal::dec!(2),
+                "{standard}"
+            );
+            assert_eq!(base.input_cache_read, Some(cache_read), "{standard}");
+            assert_eq!(fast.input_cache_read, Some(cache_read), "{standard}");
+        }
+        let m2 = get_model("minimax/minimax-m2").expect("known model");
+        assert_eq!(m2.encoding(), Some(Encoding::MiniMax));
+        assert_eq!(m2.max_input_tokens, 204_800);
     }
 
     #[test]

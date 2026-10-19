@@ -198,12 +198,14 @@ fn main() {
     generate_bpe(&data_dir, &out_dir, "deepseek", "DEEPSEEK");
     generate_bpe(&data_dir, &out_dir, "qwen", "QWEN");
     generate_bpe(&data_dir, &out_dir, "glm", "GLM");
+    generate_bpe(&data_dir, &out_dir, "minimax", "MINIMAX");
 
     println!("cargo::rerun-if-changed=data/models.json");
     println!("cargo::rerun-if-changed=data/claude.json");
     println!("cargo::rerun-if-changed=data/deepseek.json");
     println!("cargo::rerun-if-changed=data/qwen.json");
     println!("cargo::rerun-if-changed=data/glm.json");
+    println!("cargo::rerun-if-changed=data/minimax.json");
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +240,16 @@ fn generate_models(data_dir: &Path, out_dir: &str) {
             && let Some(other) = display_names.insert(config.name.as_str(), key.as_str())
         {
             panic!("{key} and {other} share the display name {:?}", config.name);
+        }
+    }
+
+    // A key keeps its provider's exact casing, because its model part is the
+    // wire name and some providers match it case-sensitively; lookup ignores
+    // case, so no two keys may differ by case alone.
+    let mut lowered: BTreeMap<String, &str> = BTreeMap::new();
+    for key in entries.keys() {
+        if let Some(other) = lowered.insert(key.to_ascii_lowercase(), key.as_str()) {
+            panic!("{key} and {other} differ only by case");
         }
     }
 
@@ -312,13 +324,14 @@ fn generate_models(data_dir: &Path, out_dir: &str) {
 
     // parse_known
     out.push_str(
-        "    /// Look up a variant by its canonical identifier. Returns `None` for unknown ids.\n",
+        "    /// Look up a variant by its canonical identifier, ignoring ASCII case. Returns `None` for unknown ids.\n",
     );
     out.push_str("    pub fn parse_known(s: &str) -> Option<Self> {\n");
-    out.push_str("        match s {\n");
+    out.push_str("        match s.to_ascii_lowercase().as_str() {\n");
     for (key, _) in &sorted {
         let v = &variant_for_key[key.as_str()];
-        out.push_str(&format!("            {key:?} => Some(ModelId::{v}),\n"));
+        let lowered = key.to_ascii_lowercase();
+        out.push_str(&format!("            {lowered:?} => Some(ModelId::{v}),\n"));
     }
     out.push_str("            _ => None,\n");
     out.push_str("        }\n");

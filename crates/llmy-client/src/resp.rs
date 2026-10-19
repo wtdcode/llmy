@@ -464,3 +464,41 @@ impl From<RawExtensibleChatCompletionResponse> for CreateChatCompletionResponse 
         response.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_tier(tier: &str) -> RawExtensibleChatCompletionResponse {
+        serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "MiniMax-M3",
+            "service_tier": tier,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "OK"},
+                "finish_reason": "stop"
+            }]
+        }))
+        .expect("response with a service tier")
+    }
+
+    #[test]
+    fn a_provider_s_own_service_tier_does_not_fail_the_response() {
+        // MiniMax-M3 answers with `"service_tier": "standard"`.
+        assert_eq!(
+            with_tier("standard").service_tier,
+            Some(ServiceTier::Standard)
+        );
+        assert_eq!(
+            with_tier("priority").service_tier,
+            Some(ServiceTier::Priority)
+        );
+        assert_eq!(
+            with_tier("on_demand").service_tier,
+            Some(ServiceTier::Other("on_demand".to_string()))
+        );
+    }
+}

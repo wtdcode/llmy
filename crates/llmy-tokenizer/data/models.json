@@ -2609,8 +2609,8 @@
     },
     "maxInputTokens": 136000
   },
-  "minimax/minimax-m2": {
-    "encoding": "claude",
+  "minimax/MiniMax-M2": {
+    "encoding": "minimax",
     "tokens": {
       "baseOverhead": 40,
       "perMessage": 4,
@@ -2623,15 +2623,232 @@
       "perEnum": 9,
       "perNestedObject": 10,
       "perArrayOfObjects": 11,
-      "contentMultiplier": 1.1
+      "contentMultiplier": 1
     },
     "name": "MiniMax M2",
-    "maxTokens": 262114,
+    "maxTokens": 65536,
     "pricing": {
-      "input": 2.7e-07,
-      "output": 1.15e-06
+      "input": 3e-07,
+      "output": 1.2e-06,
+      "input_cache_read": 3e-08,
+      "input_cache_write": 3.75e-07
     },
-    "maxInputTokens": 0
+    "maxInputTokens": 204800
+  },
+  "minimax/MiniMax-M2.1": {
+    "encoding": "minimax",
+    "tokens": {
+      "baseOverhead": 40,
+      "perMessage": 4,
+      "toolsExist": 147,
+      "perTool": 51,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11,
+      "contentMultiplier": 1
+    },
+    "name": "MiniMax M2.1",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 3e-07,
+      "output": 1.2e-06,
+      "input_cache_read": 3e-08,
+      "input_cache_write": 3.75e-07
+    },
+    "maxInputTokens": 204800
+  },
+  "minimax/MiniMax-M2.1-highspeed": {
+    "encoding": "minimax",
+    "tokens": {
+      "baseOverhead": 40,
+      "perMessage": 4,
+      "toolsExist": 147,
+      "perTool": 51,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11,
+      "contentMultiplier": 1
+    },
+    "name": "MiniMax M2.1 Highspeed",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 6e-07,
+      "output": 2.4e-06,
+      "input_cache_read": 3e-08,
+      "input_cache_write": 3.75e-07
+    },
+    "maxInputTokens": 204800
+  },
+  "minimax/MiniMax-M2.5": {
+    "encoding": "minimax",
+    "tokens": {
+      "baseOverhead": 40,
+      "perMessage": 4,
+      "toolsExist": 147,
+      "perTool": 51,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11,
+      "contentMultiplier": 1
+    },
+    "name": "MiniMax M2.5",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 3e-07,
+      "output": 1.2e-06,
+      "input_cache_read": 3e-08,
+      "input_cache_write": 3.75e-07
+    },
+    "maxInputTokens": 204800
+  },
+  "minimax/MiniMax-M2.5-highspeed": {
+    "encoding": "minimax",
+    "tokens": {
+      "baseOverhead": 40,
+      "perMessage": 4,
+      "toolsExist": 147,
+      "perTool": 51,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11,
+      "contentMultiplier": 1
+    },
+    "name": "MiniMax M2.5 Highspeed",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 6e-07,
+      "output": 2.4e-06,
+      "input_cache_read": 3e-08,
+      "input_cache_write": 3.75e-07
+    },
+    "maxInputTokens": 204800
+  },
+  "minimax/MiniMax-M2.7": {
+    "encoding": "minimax",
+    "tokens": {
+      "baseOverhead": 40,
+      "perMessage": 4,
+      "toolsExist": 147,
+      "perTool": 51,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11,
+      "contentMultiplier": 1
+    },
+    "name": "MiniMax M2.7",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 3e-07,
+      "output": 1.2e-06,
+      "input_cache_read": 6e-08,
+      "input_cache_write": 3.75e-07
+    },
+    "maxInputTokens": 204800
+  },
+  "minimax/MiniMax-M2.7-highspeed": {
+    "encoding": "minimax",
+    "tokens": {
+      "baseOverhead": 40,
+      "perMessage": 4,
+      "toolsExist": 147,
+      "perTool": 51,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11,
+      "contentMultiplier": 1
+    },
+    "name": "MiniMax M2.7 Highspeed",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 6e-07,
+      "output": 2.4e-06,
+      "input_cache_read": 6e-08,
+      "input_cache_write": 3.75e-07
+    },
+    "maxInputTokens": 204800
+  },
+  "minimax/MiniMax-M3.1-Flash": {
+    "encoding": "minimax",
+    "tokens": {
+      "baseOverhead": 40,
+      "perMessage": 4,
+      "toolsExist": 147,
+      "perTool": 51,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11,
+      "contentMultiplier": 1
+    },
+    "name": "MiniMax M3.1 Flash",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 1.5e-07,
+      "output": 6e-07,
+      "input_cache_read": 1.5e-08
+    },
+    "maxInputTokens": 1000000
+  },
+  "minimax/MiniMax-M3.1-Flash-Preview": {
+    "alias_of": "minimax/MiniMax-M3.1-Flash"
+  },
+  "minimax/MiniMax-M3": {
+    "encoding": "minimax",
+    "tokens": {
+      "baseOverhead": 40,
+      "perMessage": 4,
+      "toolsExist": 147,
+      "perTool": 51,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11,
+      "contentMultiplier": 1
+    },
+    "name": "MiniMax M3",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 3e-07,
+      "output": 1.2e-06,
+      "input_cache_read": 6e-08,
+      "long_context": {
+        "threshold": 524288,
+        "input": 6e-07,
+        "output": 2.4e-06,
+        "input_cache_read": 1.2e-07
+      }
+    },
+    "maxInputTokens": 1000000
   },
   "moonshotai/kimi-k2-thinking": {
     "encoding": "o200k_base",

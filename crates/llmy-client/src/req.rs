@@ -98,6 +98,9 @@ pub enum ResponseModalities {
 // Service tier
 // ---------------------------------------------------------------------------
 
+/// Responses echo the tier that served them, and providers name their own
+/// tiers (MiniMax reports `standard`), so an unrecognized name is kept as-is
+/// rather than failing the whole response over a field that only reports.
 #[derive(Clone, Serialize, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceTier {
@@ -106,6 +109,9 @@ pub enum ServiceTier {
     Flex,
     Scale,
     Priority,
+    Standard,
+    #[serde(untagged)]
+    Other(String),
 }
 
 // ---------------------------------------------------------------------------

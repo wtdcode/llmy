@@ -284,7 +284,7 @@ fn find_registered_model(name: &str) -> Option<(ModelId, ModelConfig)> {
         let canonical = id.as_str();
         let short = id.model_name();
         let config = id.to_model_config()?;
-        if canonical == name
+        if canonical.eq_ignore_ascii_case(name)
             || short.eq_ignore_ascii_case(name)
             || config.name.eq_ignore_ascii_case(name)
         {
@@ -363,6 +363,44 @@ mod tests {
             pricing.input_cache_read.unwrap(),
             rust_decimal::dec!(0.0000001)
         );
+    }
+
+    #[test]
+    fn minimax_ids_go_out_in_minimax_s_own_casing() {
+        // MiniMax rejects `minimax-m3.1-flash`; however the model is named,
+        // the request must carry `MiniMax-M3.1-Flash`.
+        for name in [
+            "MiniMax-M3.1-Flash",
+            "minimax-m3.1-flash",
+            "minimax/minimax-m3.1-flash",
+            "MiniMax M3.1 Flash",
+        ] {
+            let model = OpenAIModel::from_str(name).unwrap();
+            assert_eq!(model.model_id_str(), "minimax/MiniMax-M3.1-Flash", "{name}");
+            assert_eq!(model.api_model_name(), "MiniMax-M3.1-Flash", "{name}");
+        }
+        let model = OpenAIModel::from_str("minimax/MiniMax-M3")
+            .unwrap()
+            .with_full_id(true);
+        assert_eq!(model.api_model_name(), "minimax/MiniMax-M3");
+
+        // Every MiniMax text model the API still serves is registered and
+        // goes out under exactly the id it is served as.
+        for served in [
+            "MiniMax-M2",
+            "MiniMax-M2.1",
+            "MiniMax-M2.1-highspeed",
+            "MiniMax-M2.5",
+            "MiniMax-M2.5-highspeed",
+            "MiniMax-M2.7",
+            "MiniMax-M2.7-highspeed",
+            "MiniMax-M3",
+            "MiniMax-M3.1-Flash",
+        ] {
+            let model = OpenAIModel::from_str(served).unwrap();
+            assert!(!matches!(model.model_id(), ModelId::Custom(_)), "{served}");
+            assert_eq!(model.api_model_name(), served);
+        }
     }
 
     #[test]
