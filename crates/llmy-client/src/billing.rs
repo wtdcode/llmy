@@ -584,15 +584,20 @@ mod tests {
     }
 
     #[test]
-    fn gpt_6_long_context_doubles_input_and_1_5x_output_past_272k() {
+    fn gpt_5_6_and_later_long_context_doubles_input_and_1_5x_output_past_272k() {
         use crate::model::OpenAIModel;
         use std::str::FromStr;
         // Pins the registry data: OpenAI reprices the entire request past
         // 272K input tokens at 2x input/cache-read/cache-write and 1.5x
-        // output, on every GPT-6 model.
+        // output, on every GPT-5.6 and GPT-6 model — except gpt-5.6-cyber,
+        // whose 272K input cap leaves no request for the tier to apply to.
         for id in [
+            "openai/gpt-5.6-sol",
+            "openai/gpt-5.6-terra",
+            "openai/gpt-5.6-luna",
             "openai/gpt-6-astra",
             "openai/gpt-6-sol",
+            "openai/gpt-6.1-sol",
             "openai/gpt-6-luna",
         ] {
             let pricing = OpenAIModel::from_str(id).unwrap().pricing();
@@ -652,6 +657,7 @@ mod tests {
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
             "openai/gpt-5.6-luna",
+            "openai/gpt-5.6-cyber",
         ] {
             let pricing = OpenAIModel::from_str(id).unwrap().pricing();
             assert_eq!(
@@ -660,6 +666,57 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    #[test]
+    fn gpt_5_6_and_6_1_sol_pricing_comes_from_the_registry() {
+        use crate::model::OpenAIModel;
+        use std::str::FromStr;
+        let million = rust_decimal::dec!(1_000_000);
+        // Pins OpenAI's current Standard rates per 1M (input, cached input,
+        // output). GPT-5.6 Sol's are promotional, guaranteed at least through
+        // 2026-11-21. gpt-6.1-sol caches at 5% of input where the rest of the
+        // family caches at 10%.
+        for (id, input, cached, output) in [
+            (
+                "openai/gpt-5.6-sol",
+                rust_decimal::dec!(4),
+                rust_decimal::dec!(0.4),
+                rust_decimal::dec!(20),
+            ),
+            (
+                "openai/gpt-5.6-terra",
+                rust_decimal::dec!(2),
+                rust_decimal::dec!(0.2),
+                rust_decimal::dec!(12),
+            ),
+            (
+                "openai/gpt-5.6-luna",
+                rust_decimal::dec!(0.2),
+                rust_decimal::dec!(0.02),
+                rust_decimal::dec!(1.2),
+            ),
+            (
+                "openai/gpt-5.6-cyber",
+                rust_decimal::dec!(12.5),
+                rust_decimal::dec!(1.25),
+                rust_decimal::dec!(75),
+            ),
+            (
+                "openai/gpt-6.1-sol",
+                rust_decimal::dec!(2),
+                rust_decimal::dec!(0.1),
+                rust_decimal::dec!(10),
+            ),
+        ] {
+            let pricing = OpenAIModel::from_str(id).unwrap().pricing();
+            assert_eq!(pricing.input * million, input, "{id}");
+            assert_eq!(pricing.input_cache_read.unwrap() * million, cached, "{id}");
+            assert_eq!(pricing.output * million, output, "{id}");
+        }
+        let cyber = OpenAIModel::from_str("gpt-5.6-cyber").unwrap();
+        assert!(cyber.pricing().long_context.is_none());
+        assert_eq!(cyber.config.max_input_tokens, 272_000);
     }
 
     #[test]
