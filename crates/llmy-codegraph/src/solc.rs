@@ -24,9 +24,10 @@ use llmy_types::error::LLMYError;
 use serde::Deserialize;
 
 use crate::extract::{
-    FileExtraction, RawCallSite, RawCallable, RawModule, RawParent, RawState, RawStateRef,
+    FileExtraction, RawCallSite, RawCallable, RawDeclaration, RawModule, RawParent, RawState,
+    RawStateRef,
 };
-use crate::model::{CallableKind, Language, LineSpan, ModuleKind, StateKind};
+use crate::model::{CallableKind, DeclarationKind, Language, LineSpan, ModuleKind, StateKind};
 
 /// Names of the Yul builtins that leave the contract: value or code moves,
 /// or another account's code runs.
@@ -293,6 +294,7 @@ impl SolcExtractor {
         };
         let mut modules = vec![];
         let mut free_functions = vec![];
+        let mut declarations = vec![];
         for part in &unit.ast.nodes {
             match part {
                 SourceUnitPart::ContractDefinition(contract) => {
@@ -300,6 +302,25 @@ impl SolcExtractor {
                 }
                 SourceUnitPart::FunctionDefinition(function) => {
                     free_functions.push(file.function(function));
+                }
+                SourceUnitPart::StructDefinition(d) => {
+                    declarations.push(file.declaration(DeclarationKind::Struct, &d.name, &d.src));
+                }
+                SourceUnitPart::EnumDefinition(d) => {
+                    declarations.push(file.declaration(DeclarationKind::Enum, &d.name, &d.src));
+                }
+                SourceUnitPart::EventDefinition(d) => {
+                    declarations.push(file.declaration(DeclarationKind::Event, &d.name, &d.src));
+                }
+                SourceUnitPart::ErrorDefinition(d) => {
+                    declarations.push(file.declaration(DeclarationKind::Error, &d.name, &d.src));
+                }
+                SourceUnitPart::UserDefinedValueTypeDefinition(d) => {
+                    declarations.push(file.declaration(DeclarationKind::UserType, &d.name, &d.src));
+                }
+                SourceUnitPart::UsingForDirective(d) => declarations.push(file.using_for(&d.src)),
+                SourceUnitPart::VariableDeclaration(d) => {
+                    declarations.push(file.declaration(DeclarationKind::Constant, &d.name, &d.src));
                 }
                 _ => {}
             }
@@ -319,6 +340,7 @@ impl SolcExtractor {
                 parents: vec![],
                 callables: free_functions,
                 states: vec![],
+                declarations: vec![],
                 node_id: Some(unit.ast.id as i64),
             });
         }
@@ -326,6 +348,7 @@ impl SolcExtractor {
             file: relative.to_path_buf(),
             language: Language::Solidity,
             modules,
+            declarations,
             parse_errors: 0,
         })
     }
@@ -374,6 +397,7 @@ impl UnitReader<'_> {
             .collect();
         let mut states = vec![];
         let mut callables = vec![];
+        let mut declarations = vec![];
         for part in &contract.nodes {
             match part {
                 ContractDefinitionPart::VariableDeclaration(variable)
@@ -387,6 +411,24 @@ impl UnitReader<'_> {
                 ContractDefinitionPart::ModifierDefinition(modifier) => {
                     callables.push(self.modifier(modifier));
                 }
+                ContractDefinitionPart::StructDefinition(d) => {
+                    declarations.push(self.declaration(DeclarationKind::Struct, &d.name, &d.src));
+                }
+                ContractDefinitionPart::EnumDefinition(d) => {
+                    declarations.push(self.declaration(DeclarationKind::Enum, &d.name, &d.src));
+                }
+                ContractDefinitionPart::EventDefinition(d) => {
+                    declarations.push(self.declaration(DeclarationKind::Event, &d.name, &d.src));
+                }
+                ContractDefinitionPart::ErrorDefinition(d) => {
+                    declarations.push(self.declaration(DeclarationKind::Error, &d.name, &d.src));
+                }
+                ContractDefinitionPart::UserDefinedValueTypeDefinition(d) => {
+                    declarations.push(self.declaration(DeclarationKind::UserType, &d.name, &d.src));
+                }
+                ContractDefinitionPart::UsingForDirective(d) => {
+                    declarations.push(self.using_for(&d.src));
+                }
                 _ => {}
             }
         }
@@ -397,7 +439,38 @@ impl UnitReader<'_> {
             parents,
             callables,
             states,
+            declarations,
             node_id: Some(contract.id as i64),
+        }
+    }
+
+    fn declaration(
+        &self,
+        kind: DeclarationKind,
+        name: &str,
+        src: &SourceLocation,
+    ) -> RawDeclaration {
+        RawDeclaration {
+            kind,
+            name: name.to_string(),
+            span: self.lines.span_of(src),
+        }
+    }
+
+    /// A `using … for` directive, named by its text without `using` and `;`.
+    fn using_for(&self, src: &SourceLocation) -> RawDeclaration {
+        let name = self
+            .text_of(src)
+            .trim()
+            .trim_start_matches("using")
+            .trim_end_matches(';')
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        RawDeclaration {
+            kind: DeclarationKind::UsingFor,
+            name,
+            span: self.lines.span_of(src),
         }
     }
 
@@ -992,7 +1065,7 @@ mod tests {
 
     use super::SolcBuildInfo;
     use crate::builder::CodeGraphBuilder;
-    use crate::model::{AccessKind, CalleeRef, CodeGraph, ModuleKind, ParentRef};
+    use crate::model::{AccessKind, CalleeRef, CodeGraph, DeclarationKind, ModuleKind, ParentRef};
 
     fn fixture_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/solc")
@@ -1150,6 +1223,114 @@ mod tests {
             graph.state_edges.iter().any(|e| e.callable_id == held
                 && e.state_id == token
                 && e.access == AccessKind::Read)
+        );
+    }
+
+    #[tokio::test]
+    async fn declarations_are_extracted_at_file_and_contract_level() {
+        let graph = graph().await;
+        let kinds_of =
+            |declarations: Vec<&crate::model::Declaration>| -> Vec<(DeclarationKind, String)> {
+                declarations
+                    .into_iter()
+                    .map(|d| (d.kind, d.name.clone()))
+                    .collect()
+            };
+        let file = graph.file_declarations(std::path::Path::new("src/Sample.sol"));
+        assert_eq!(
+            kinds_of(file),
+            vec![
+                (DeclarationKind::Constant, "SAMPLE_LIMIT".to_string()),
+                (DeclarationKind::Struct, "Range".to_string()),
+                (DeclarationKind::Enum, "Side".to_string()),
+                (DeclarationKind::Error, "OutOfRange".to_string()),
+                (DeclarationKind::Event, "Settled".to_string()),
+                (DeclarationKind::UserType, "Price".to_string()),
+                (DeclarationKind::UsingFor, "MathLib for uint256".to_string()),
+            ]
+        );
+        let module = |name: &str| {
+            graph
+                .modules
+                .values()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("module {name}"))
+                .id
+        };
+        assert_eq!(
+            kinds_of(graph.declarations_of_module(module("Book"))),
+            vec![
+                (DeclarationKind::UsingFor, "MathLib for uint256".to_string()),
+                (DeclarationKind::Enum, "Status".to_string()),
+                (DeclarationKind::Event, "Filled".to_string()),
+                (DeclarationKind::Error, "AlreadyClosed".to_string()),
+                (DeclarationKind::UserType, "OrderId".to_string()),
+                (DeclarationKind::Struct, "Order".to_string()),
+            ]
+        );
+        assert_eq!(
+            kinds_of(graph.declarations_of_module(module("Vault"))),
+            vec![(DeclarationKind::Struct, "Position".to_string())]
+        );
+        let range = graph.find_declarations(None, "Range");
+        assert_eq!(range.len(), 1);
+        assert_eq!((range[0].span.start_line, range[0].span.end_line), (80, 83));
+        assert!(graph.find_declarations(Some("Book"), "Range").is_empty());
+        assert_eq!(graph.find_declarations(Some("Book"), "Order").len(), 1);
+        // The file-level function joins a library named after the file.
+        callable(&graph, "Sample", "freeClamp");
+    }
+
+    #[tokio::test]
+    async fn metadata_and_type_definitions_read_from_the_ast_graph() {
+        let tools = crate::tools::CodegraphContext::new(graph().await, fixture_root()).tool_box();
+        let call = |tool: &str, args: &str| {
+            let tools = &tools;
+            let (tool, args) = (tool.to_string(), args.to_string());
+            async move {
+                tools
+                    .invoke(tool, args)
+                    .await
+                    .expect("tool exists")
+                    .expect("tool ran")
+            }
+        };
+        let book = call("read_contract_metadata", r#"{"module": "Book"}"#).await;
+        for expected in [
+            "using:\n  - MathLib for uint256 (line 102)",
+            "  - struct Order (lines 112..115)",
+            "  - orders [state variable] (line 117): Order[] internal orders;",
+            "file-level declarations in src/Sample.sol:",
+            "  - struct Range (lines 80..83)",
+            "  - using for MathLib for uint256 (line 99)",
+        ] {
+            assert!(book.contains(expected), "missing {expected:?} in:\n{book}");
+        }
+        let range = call("read_type_definition", r#"{"name": "Range"}"#).await;
+        assert!(
+            range.contains("struct Range in file level (src/Sample.sol:80..83)"),
+            "{range}"
+        );
+        assert!(range.contains("uint256 hi;"), "{range}");
+        let in_file = call(
+            "read_type_definition",
+            r#"{"name": "Range", "file": "./src/Sample.sol"}"#,
+        )
+        .await;
+        assert!(in_file.contains("struct Range in file level"), "{in_file}");
+        let wrong_file = call(
+            "read_type_definition",
+            r#"{"name": "Range", "file": "src/Other.sol"}"#,
+        )
+        .await;
+        assert!(
+            wrong_file.contains("it is declared in: file level (src/Sample.sol)"),
+            "{wrong_file}"
+        );
+        let constant = call("read_type_definition", r#"{"name": "SAMPLE_LIMIT"}"#).await;
+        assert!(
+            constant.contains("uint256 constant SAMPLE_LIMIT = 10;"),
+            "{constant}"
         );
     }
 }

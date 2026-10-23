@@ -139,8 +139,10 @@ impl RustExtractor {
                 parents: vec![],
                 callables,
                 states,
+                declarations: vec![],
                 node_id: None,
             }],
+            declarations: vec![],
             parse_errors,
         })
     }

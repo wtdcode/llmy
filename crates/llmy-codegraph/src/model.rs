@@ -108,6 +108,36 @@ impl StateKind {
     }
 }
 
+/// A declaration that is neither a callable nor storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclarationKind {
+    Struct,
+    Enum,
+    Event,
+    Error,
+    /// A Solidity user-defined value type (`type Price is uint128;`).
+    UserType,
+    /// A `using … for` directive.
+    UsingFor,
+    /// A constant declared at file level (inside a module it is a state item).
+    Constant,
+}
+
+impl DeclarationKind {
+    pub fn render(&self) -> &'static str {
+        match self {
+            Self::Struct => "struct",
+            Self::Enum => "enum",
+            Self::Event => "event",
+            Self::Error => "error",
+            Self::UserType => "user-defined value type",
+            Self::UsingFor => "using for",
+            Self::Constant => "constant",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessKind {
@@ -166,6 +196,21 @@ pub struct StateItem {
     pub span: LineSpan,
 }
 
+/// A struct, enum, event, error, user-defined value type, `using … for`
+/// directive or file-level constant, inside a module or at file level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Declaration {
+    pub id: i64,
+    /// The declaring module; `None` for a file-level declaration.
+    pub module_id: Option<i64>,
+    pub kind: DeclarationKind,
+    /// The declared name; for `using … for`, the directive without `using`
+    /// and `;` (`SafeERC20 for IERC20`).
+    pub name: String,
+    pub file: PathBuf,
+    pub span: LineSpan,
+}
+
 /// A syntactically resolved callee. Name-based resolution over tree-sitter
 /// cannot always pick a single target, so ambiguity is first-class.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +262,8 @@ pub struct CodeGraph {
     pub call_edges: Vec<CallEdge>,
     pub state_edges: Vec<StateEdge>,
     pub inherit_edges: Vec<InheritEdge>,
+    #[serde(default)]
+    pub declarations: BTreeMap<i64, Declaration>,
 }
 
 impl CodeGraph {
@@ -239,6 +286,48 @@ impl CodeGraph {
         self.states
             .values()
             .filter(|s| s.module_id == module_id)
+            .collect()
+    }
+
+    pub fn declarations_of_module(&self, module_id: i64) -> Vec<&Declaration> {
+        self.declarations
+            .values()
+            .filter(|d| d.module_id == Some(module_id))
+            .collect()
+    }
+
+    /// The file-level declarations of `file`.
+    pub fn file_declarations(&self, file: &Path) -> Vec<&Declaration> {
+        self.declarations
+            .values()
+            .filter(|d| d.module_id.is_none() && d.file == file)
+            .collect()
+    }
+
+    /// Find declarations by name, optionally scoped to a module name (which
+    /// excludes file-level ones). `using … for` directives have no name to
+    /// find them by.
+    pub fn find_declarations(&self, module: Option<&str>, name: &str) -> Vec<&Declaration> {
+        self.declarations
+            .values()
+            .filter(|d| d.kind != DeclarationKind::UsingFor && d.name == name)
+            .filter(|d| match module {
+                Some(module) => d
+                    .module_id
+                    .and_then(|id| self.modules.get(&id))
+                    .is_some_and(|m| m.name == module),
+                None => true,
+            })
+            .collect()
+    }
+
+    /// Direct parents of a module in declaration order: resolved module ids
+    /// or the names of parents outside the graph.
+    pub fn parents_of(&self, module_id: i64) -> Vec<&ParentRef> {
+        self.inherit_edges
+            .iter()
+            .filter(|e| e.module_id == module_id)
+            .map(|e| &e.parent)
             .collect()
     }
 
@@ -408,10 +497,11 @@ impl CodeGraph {
 
     pub fn counts(&self) -> String {
         format!(
-            "{} modules, {} callables, {} state items, {} call edges, {} state edges, {} inheritance edges",
+            "{} modules, {} callables, {} state items, {} declarations, {} call edges, {} state edges, {} inheritance edges",
             self.modules.len(),
             self.callables.len(),
             self.states.len(),
+            self.declarations.len(),
             self.call_edges.len(),
             self.state_edges.len(),
             self.inherit_edges.len()

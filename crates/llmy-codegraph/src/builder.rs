@@ -11,15 +11,19 @@ use color_eyre::eyre::eyre;
 use ignore::WalkBuilder;
 use llmy_types::error::LLMYError;
 
-use crate::extract::{FileExtraction, SourceFile};
+use crate::extract::{FileExtraction, RawDeclaration, SourceFile};
 use crate::model::{
-    CallEdge, Callable, CalleeRef, CodeGraph, InheritEdge, Language, Module, ParentRef, StateEdge,
-    StateItem,
+    CallEdge, Callable, CalleeRef, CodeGraph, Declaration, InheritEdge, Language, Module,
+    ParentRef, StateEdge, StateItem,
 };
 use crate::move_lang::{MoveAptosExtractor, MoveSuiExtractor};
 use crate::rust_lang::RustExtractor;
 use crate::solc::{SolcBuildInfo, SolcExtractor};
 use crate::solidity::SolidityExtractor;
+
+/// Part of every fingerprint, so a cached graph built before the model gained
+/// a field (declarations in schema 2) is rebuilt instead of served short.
+const GRAPH_SCHEMA: &str = "graph-schema:2";
 
 const SOLIDITY_BUILTINS: [&str; 22] = [
     "require",
@@ -119,6 +123,7 @@ impl CodeGraphBuilder {
         }
 
         fingerprint_entries.sort();
+        fingerprint_entries.push(GRAPH_SCHEMA.to_string());
         if let Some(solc) = &self.solc {
             fingerprint_entries.push(format!("solc:{}", solc.fingerprint));
         }
@@ -139,6 +144,7 @@ impl CodeGraphBuilder {
             .map(|(source, _)| format!("{}:{}", source.relative.display(), source.content.len()))
             .collect();
         entries.sort();
+        entries.push(GRAPH_SCHEMA.to_string());
         Ok(entries.join("\n"))
     }
 
@@ -253,9 +259,15 @@ impl GraphAssembler {
         let mut next_state = 1i64;
 
         for extraction in extractions {
+            for raw in extraction.declarations {
+                assembler.add_declaration(None, &extraction.file, raw);
+            }
             for raw_module in extraction.modules {
                 let module_id = next_module;
                 next_module += 1;
+                for raw in raw_module.declarations {
+                    assembler.add_declaration(Some(module_id), &extraction.file, raw);
+                }
                 assembler.graph.modules.insert(
                     module_id,
                     Module {
@@ -359,6 +371,21 @@ impl GraphAssembler {
         assembler.resolve_calls(pending_calls);
         assembler.resolve_states(pending_states);
         assembler.graph
+    }
+
+    fn add_declaration(&mut self, module_id: Option<i64>, file: &Path, raw: RawDeclaration) {
+        let id = self.graph.declarations.len() as i64 + 1;
+        self.graph.declarations.insert(
+            id,
+            Declaration {
+                id,
+                module_id,
+                kind: raw.kind,
+                name: raw.name,
+                file: file.to_path_buf(),
+                span: raw.span,
+            },
+        );
     }
 
     fn builtin(language: Language, name: &str) -> bool {

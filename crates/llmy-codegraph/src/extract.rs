@@ -8,7 +8,7 @@ use color_eyre::eyre::eyre;
 use llmy_types::error::LLMYError;
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
-use crate::model::{CallableKind, Language, LineSpan, ModuleKind, StateKind};
+use crate::model::{CallableKind, DeclarationKind, Language, LineSpan, ModuleKind, StateKind};
 
 unsafe extern "C" {
     fn tree_sitter_move_on_aptos() -> *const std::ffi::c_void;
@@ -78,6 +78,15 @@ pub struct RawParent {
     pub declaration: Option<i64>,
 }
 
+/// A struct, enum, event, error, user-defined value type, `using … for`
+/// directive or file-level constant, before ids are assigned.
+#[derive(Debug, Clone)]
+pub struct RawDeclaration {
+    pub kind: DeclarationKind,
+    pub name: String,
+    pub span: LineSpan,
+}
+
 #[derive(Debug, Clone)]
 pub struct RawModule {
     pub name: String,
@@ -86,6 +95,7 @@ pub struct RawModule {
     pub parents: Vec<RawParent>,
     pub callables: Vec<RawCallable>,
     pub states: Vec<RawState>,
+    pub declarations: Vec<RawDeclaration>,
     pub node_id: Option<i64>,
 }
 
@@ -95,6 +105,8 @@ pub struct FileExtraction {
     pub file: PathBuf,
     pub language: Language,
     pub modules: Vec<RawModule>,
+    /// Declarations outside every module.
+    pub declarations: Vec<RawDeclaration>,
     /// Number of ERROR nodes tree-sitter produced — used for dialect picking
     /// and reported as a quality signal.
     pub parse_errors: usize,

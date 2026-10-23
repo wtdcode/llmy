@@ -16,4 +16,4 @@ pub use builder::{BuildResult, CodeGraphBuilder};
 pub use model::CodeGraph;
 pub use solc::{ForgeAstOptions, SolcBuildInfo};
 pub use store::CodeGraphStore;
-pub use tools::CodegraphContext;
+pub use tools::{CodegraphContext, CodegraphToolOptions};

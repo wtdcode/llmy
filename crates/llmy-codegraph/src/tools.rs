@@ -2,7 +2,7 @@
 //! and per-callable source reading, call-edge lookups and state
 //! cross-references.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -11,9 +11,33 @@ use llmy_types::error::LLMYError;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::model::{AccessKind, Callable, CodeGraph, Module};
+use crate::model::{
+    AccessKind, Callable, CodeGraph, Declaration, DeclarationKind, LineSpan, Module, ParentRef,
+};
 
 const MAX_SOURCE_MATCHES: usize = 3;
+/// Characters of a state item's declaration `read_contract_metadata` shows.
+const MAX_DECLARATION_CHARS: usize = 240;
+
+/// Which tools [`CodegraphContext::tool_box_with`] offers and how much one
+/// module read returns.
+#[derive(Debug, Clone, Copy)]
+pub struct CodegraphToolOptions {
+    /// Offer `read_module_source`.
+    pub module_source: bool,
+    /// Bytes one `read_module_source` reply returns per module, cut at a line
+    /// boundary; the reply says where to continue.
+    pub max_read_bytes: usize,
+}
+
+impl Default for CodegraphToolOptions {
+    fn default() -> Self {
+        Self {
+            module_source: true,
+            max_read_bytes: 8192,
+        }
+    }
+}
 
 /// Shared context for every codegraph tool.
 #[derive(Debug, Clone)]
@@ -44,32 +68,104 @@ impl CodegraphContext {
         for module in self.graph.modules.values() {
             let callables = self.graph.callables_of_module(module.id);
             let states = self.graph.states_of_module(module.id);
+            let declarations = self.graph.declarations_of_module(module.id);
             lines.push(format!(
-                "- {} {} ({}, {}): {} callables, {} state items",
+                "- {} {} ({}, {}): {} callables, {} state items, {} declarations",
                 module.kind.render(),
                 module.name,
                 module.language.render(),
                 module.file.display(),
                 callables.len(),
-                states.len()
+                states.len(),
+                declarations.len()
             ));
         }
         lines.join("\n")
     }
 
+    /// Every codegraph tool, `read_module_source` included.
     pub fn tool_box(&self) -> ToolBox {
+        self.tool_box_with(CodegraphToolOptions::default())
+    }
+
+    pub fn tool_box_with(&self, options: CodegraphToolOptions) -> ToolBox {
         let mut tools = ToolBox::new();
         tools.add_tool(CodegraphOverviewTool::new(self.clone()));
-        tools.add_tool(ListCallablesTool::new(self.clone()));
+        tools.add_tool(ReadContractMetadataTool::new(self.clone()));
         tools.add_tool(LookupCallableTool::new(self.clone()));
         tools.add_tool(LookupStateTool::new(self.clone()));
         tools.add_tool(ReadCallableSourceTool::new(self.clone()));
-        tools.add_tool(ReadModuleSourceTool::new(self.clone()));
+        tools.add_tool(ReadTypeDefinitionTool::new(self.clone()));
+        if options.module_source {
+            tools.add_tool(ReadModuleSourceTool::new(
+                self.clone(),
+                options.max_read_bytes,
+            ));
+        }
         tools
     }
 
     fn modules_named(&self, name: &str) -> Vec<&Module> {
         self.graph.modules_by_name(name)
+    }
+
+    fn render_lines(span: LineSpan) -> String {
+        if span.start_line == span.end_line {
+            format!("line {}", span.start_line)
+        } else {
+            format!("lines {}..{}", span.start_line, span.end_line)
+        }
+    }
+
+    fn render_parent(&self, parent: &ParentRef) -> String {
+        match parent {
+            ParentRef::Resolved(id) => match self.graph.modules.get(id) {
+                Some(m) => format!("{} ({})", m.name, m.file.display()),
+                None => format!("#{id}"),
+            },
+            ParentRef::External(name) => format!("{name} (not in the code graph)"),
+        }
+    }
+
+    /// Ancestors beyond the direct parents, nearest first: each parent's own
+    /// parents in declaration order, breadth first, each once.
+    fn further_ancestors(&self, module_id: i64) -> Vec<String> {
+        let direct: Vec<&ParentRef> = self.graph.parents_of(module_id);
+        let mut seen: Vec<ParentRef> = direct.iter().map(|p| (*p).clone()).collect();
+        let mut frontier: Vec<i64> = direct
+            .iter()
+            .filter_map(|p| match p {
+                ParentRef::Resolved(id) => Some(*id),
+                ParentRef::External(_) => None,
+            })
+            .collect();
+        let mut out = vec![];
+        while !frontier.is_empty() {
+            let mut next = vec![];
+            for id in frontier {
+                for parent in self.graph.parents_of(id) {
+                    if seen.contains(parent) || *parent == ParentRef::Resolved(module_id) {
+                        continue;
+                    }
+                    seen.push(parent.clone());
+                    out.push(self.render_parent(parent));
+                    if let ParentRef::Resolved(parent_id) = parent {
+                        next.push(*parent_id);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        out
+    }
+
+    fn render_declaration_line(declaration: &Declaration) -> String {
+        format!(
+            "  - {} {} ({})",
+            declaration.kind.render(),
+            declaration.name,
+            Self::render_lines(declaration.span)
+        )
     }
 
     fn render_callable_line(&self, callable: &Callable) -> String {
@@ -169,7 +265,7 @@ pub struct CodegraphOverviewArgs {}
     arguments = CodegraphOverviewArgs,
     invoke = overview,
     name = "codegraph_overview",
-    description = "Show the code graph overview: indexed counts and every module/contract with its file, callable count and state item count.",
+    description = "Show the code graph overview: indexed counts and every module/contract with its file and its callable, state item and declaration counts.",
 )]
 pub struct CodegraphOverviewTool {
     context: CodegraphContext,
@@ -185,31 +281,33 @@ impl CodegraphOverviewTool {
     }
 }
 
-/// Arguments accepted by [`ListCallablesTool`].
+/// Arguments accepted by [`ReadContractMetadataTool`].
 #[derive(Deserialize, JsonSchema)]
-pub struct ListCallablesArgs {
-    /// Module / contract name to list.
+pub struct ReadContractMetadataArgs {
+    /// Module / contract name.
     pub module: String,
 }
 
-/// Lists a module's callables and state items.
+/// The shape of one module: what it inherits, the libraries it attaches, the
+/// types, events and errors it declares, its state and its callables.
 #[derive(Debug, Clone)]
 #[llmy_agent::tool(
-    arguments = ListCallablesArgs,
-    invoke = list,
-    name = "list_callables",
-    description = "List every callable (with kind and signature) and state item of one module/contract.",
+    arguments = ReadContractMetadataArgs,
+    invoke = read,
+    name = "read_contract_metadata",
+    description = "Describe one module/contract by name: its direct parents and further ancestors, `using … for` directives, the structs, enums, events, errors and user-defined value types it declares, every state item with its declaration, every callable with its signature and lines, and the file-level declarations of its file. Read a listed type with `read_type_definition`, a callable with `read_callable_source`.",
 )]
-pub struct ListCallablesTool {
+pub struct ReadContractMetadataTool {
     context: CodegraphContext,
 }
 
-impl ListCallablesTool {
+impl ReadContractMetadataTool {
     pub fn new(context: CodegraphContext) -> Self {
         Self { context }
     }
 
-    async fn list(&self, args: ListCallablesArgs) -> Result<String, LLMYError> {
+    async fn read(&self, args: ReadContractMetadataArgs) -> Result<String, LLMYError> {
+        let graph = &self.context.graph;
         let modules = self.context.modules_named(&args.module);
         if modules.is_empty() {
             return Ok(format!(
@@ -219,35 +317,98 @@ impl ListCallablesTool {
         }
         let mut sections = vec![];
         for module in modules {
+            let source = tokio::fs::read_to_string(self.context.root.join(&module.file))
+                .await
+                .unwrap_or_default();
+            let source_lines: Vec<&str> = source.lines().collect();
             let mut lines = vec![format!(
-                "{} {} ({}, {})",
+                "{} {} ({}, {}:{}..{})",
                 module.kind.render(),
                 module.name,
                 module.language.render(),
-                module.file.display()
+                module.file.display(),
+                module.span.start_line,
+                module.span.end_line
             )];
-            let states = self.context.graph.states_of_module(module.id);
+            let parents = graph.parents_of(module.id);
+            if !parents.is_empty() {
+                lines.push(format!(
+                    "inherits: {}",
+                    parents
+                        .iter()
+                        .map(|p| self.context.render_parent(p))
+                        .join(", ")
+                ));
+                let further = self.context.further_ancestors(module.id);
+                if !further.is_empty() {
+                    lines.push(format!("further ancestors: {}", further.join(", ")));
+                }
+            }
+            let declarations = graph.declarations_of_module(module.id);
+            let (using, declared): (Vec<&Declaration>, Vec<&Declaration>) = declarations
+                .into_iter()
+                .partition(|d| d.kind == DeclarationKind::UsingFor);
+            if !using.is_empty() {
+                lines.push("using:".to_string());
+                for directive in using {
+                    lines.push(format!(
+                        "  - {} ({})",
+                        directive.name,
+                        CodegraphContext::render_lines(directive.span)
+                    ));
+                }
+            }
+            if !declared.is_empty() {
+                lines.push("declarations:".to_string());
+                for declaration in declared {
+                    lines.push(CodegraphContext::render_declaration_line(declaration));
+                }
+            }
+            let states = graph.states_of_module(module.id);
             if !states.is_empty() {
                 lines.push("state items:".to_string());
                 for state in states {
+                    // The declaration as written carries visibility,
+                    // constant/immutable and the initial value.
+                    let written = source_lines
+                        .get(
+                            state.span.start_line.saturating_sub(1)
+                                ..state.span.end_line.min(source_lines.len()),
+                        )
+                        .map(|l| l.join(" ").split_whitespace().join(" "))
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_else(|| state.type_text.clone());
+                    let written = match written.char_indices().nth(MAX_DECLARATION_CHARS) {
+                        Some((cut, _)) => format!("{}…", &written[..cut]),
+                        None => written,
+                    };
                     lines.push(format!(
-                        "  - {} [{}]: {} (line {})",
+                        "  - {} [{}] ({}): {}",
                         state.name,
                         state.kind.render(),
-                        state.type_text,
-                        state.span.start_line
+                        CodegraphContext::render_lines(state.span),
+                        written
                     ));
                 }
             }
             lines.push("callables:".to_string());
-            for callable in self.context.graph.callables_of_module(module.id) {
+            for callable in graph.callables_of_module(module.id) {
                 lines.push(format!(
-                    "  - [{}] {} (lines {}..{})",
+                    "  - [{}] {} ({})",
                     callable.kind.render(),
                     callable.signature,
-                    callable.span.start_line,
-                    callable.span.end_line
+                    CodegraphContext::render_lines(callable.span)
                 ));
+            }
+            let file_level = graph.file_declarations(&module.file);
+            if !file_level.is_empty() {
+                lines.push(format!(
+                    "file-level declarations in {}:",
+                    module.file.display()
+                ));
+                for declaration in file_level {
+                    lines.push(CodegraphContext::render_declaration_line(declaration));
+                }
             }
             sections.push(lines.join("\n"));
         }
@@ -451,31 +612,148 @@ impl ReadCallableSourceTool {
     }
 }
 
+/// Arguments accepted by [`ReadTypeDefinitionTool`].
+#[derive(Deserialize, JsonSchema)]
+pub struct ReadTypeDefinitionArgs {
+    /// Name of the struct, enum, event, error, user-defined value type or
+    /// file-level constant.
+    pub name: String,
+    /// Optional name of the module/contract that declares it (file-level
+    /// declarations have none).
+    #[serde(default)]
+    pub module: Option<String>,
+    /// Optional file that declares it, relative to the project root: the way
+    /// to pick one of several file-level declarations sharing a name.
+    #[serde(default)]
+    pub file: Option<String>,
+}
+
+/// Reads a struct, enum, event, error, user-defined value type or file-level
+/// constant by name.
+#[derive(Debug, Clone)]
+#[llmy_agent::tool(
+    arguments = ReadTypeDefinitionArgs,
+    invoke = read,
+    name = "read_type_definition",
+    description = "Read the definition of a struct, enum, event, custom error, user-defined value type or file-level constant by name, optionally scoped to the module/contract or the file that declares it. `read_contract_metadata` lists what a contract and its file declare.",
+)]
+pub struct ReadTypeDefinitionTool {
+    context: CodegraphContext,
+}
+
+impl ReadTypeDefinitionTool {
+    pub fn new(context: CodegraphContext) -> Self {
+        Self { context }
+    }
+
+    async fn read(&self, args: ReadTypeDefinitionArgs) -> Result<String, LLMYError> {
+        let graph = &self.context.graph;
+        let owner = |declaration: &Declaration| match declaration.module_id {
+            Some(id) => graph
+                .modules
+                .get(&id)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| format!("#{id}")),
+            None => "file level".to_string(),
+        };
+        let where_declared = |declarations: &[&Declaration]| {
+            declarations
+                .iter()
+                .map(|d| format!("{} ({})", owner(d), d.file.display()))
+                .join(", ")
+        };
+        let file = args
+            .file
+            .as_deref()
+            .map(|f| Path::new(f.trim_start_matches("./")).to_path_buf());
+        let matches: Vec<&Declaration> = graph
+            .find_declarations(args.module.as_deref(), &args.name)
+            .into_iter()
+            .filter(|d| file.as_ref().is_none_or(|f| &d.file == f))
+            .collect();
+        if matches.is_empty() {
+            let elsewhere = graph.find_declarations(None, &args.name);
+            let scoped = args.module.is_some() || args.file.is_some();
+            return Ok(if scoped && !elsewhere.is_empty() {
+                format!(
+                    "No declaration named {:?} in that module or file; it is declared in: {}.",
+                    args.name,
+                    where_declared(&elsewhere)
+                )
+            } else {
+                format!(
+                    "No struct, enum, event, error, user-defined value type or file-level constant named {:?} in the code graph.",
+                    args.name
+                )
+            });
+        }
+        let mut sections = vec![];
+        for declaration in matches.iter().take(MAX_SOURCE_MATCHES) {
+            let source = graph
+                .read_span(&self.context.root, &declaration.file, declaration.span)
+                .await?;
+            sections.push(format!(
+                "{} {} in {} ({}:{}..{})\n```\n{}\n```",
+                declaration.kind.render(),
+                declaration.name,
+                owner(declaration),
+                declaration.file.display(),
+                declaration.span.start_line,
+                declaration.span.end_line,
+                source
+            ));
+        }
+        if matches.len() > MAX_SOURCE_MATCHES {
+            sections.push(format!(
+                "[{} more matches omitted: {}; scope with `module` or `file`]",
+                matches.len() - MAX_SOURCE_MATCHES,
+                where_declared(&matches[MAX_SOURCE_MATCHES..])
+            ));
+        }
+        Ok(sections.join("\n\n"))
+    }
+}
+
 /// Arguments accepted by [`ReadModuleSourceTool`].
 #[derive(Deserialize, JsonSchema)]
 pub struct ReadModuleSourceArgs {
     /// Module / contract name.
     pub module: String,
+    /// Optional file line number to start from, inside the module. Defaults
+    /// to the module's first line.
+    #[serde(default)]
+    pub start_line: Option<usize>,
+    /// Optional number of lines to read from `start_line`.
+    #[serde(default)]
+    pub line_count: Option<usize>,
 }
 
-/// Reads a whole module/contract source by name.
+/// Reads a module/contract source by name, whole or a line range, capped in
+/// bytes.
 #[derive(Debug, Clone)]
 #[llmy_agent::tool(
     arguments = ReadModuleSourceArgs,
     invoke = read,
     name = "read_module_source",
-    description = "Read the full source of a module/contract by name.",
+    description = "Read the source of a module/contract by name, whole or from `start_line` (a file line number) for `line_count` lines. One reply is capped in size and says where to continue; prefer `read_contract_metadata`, `read_callable_source` and `read_type_definition` for the parts you need.",
 )]
 pub struct ReadModuleSourceTool {
     context: CodegraphContext,
+    max_read_bytes: usize,
 }
 
 impl ReadModuleSourceTool {
-    pub fn new(context: CodegraphContext) -> Self {
-        Self { context }
+    pub fn new(context: CodegraphContext, max_read_bytes: usize) -> Self {
+        Self {
+            context,
+            max_read_bytes,
+        }
     }
 
     async fn read(&self, args: ReadModuleSourceArgs) -> Result<String, LLMYError> {
+        if args.start_line == Some(0) || args.line_count == Some(0) {
+            return Ok("start_line and line_count must be at least 1".to_string());
+        }
         let matches = self.context.modules_named(&args.module);
         if matches.is_empty() {
             return Ok(format!(
@@ -485,21 +763,141 @@ impl ReadModuleSourceTool {
         }
         let mut sections = vec![];
         for module in matches.iter().take(MAX_SOURCE_MATCHES) {
-            let source = self
-                .context
-                .graph
-                .read_span(&self.context.root, &module.file, module.span)
-                .await?;
-            sections.push(format!(
-                "{} {} ({}:{}..{})\n```\n{}\n```",
+            let span = module.span;
+            let header = format!(
+                "{} {} ({}:{}..{})",
                 module.kind.render(),
                 module.name,
                 module.file.display(),
-                module.span.start_line,
-                module.span.end_line,
-                source
+                span.start_line,
+                span.end_line
+            );
+            let from = args
+                .start_line
+                .unwrap_or(span.start_line)
+                .max(span.start_line);
+            if from > span.end_line {
+                sections.push(format!(
+                    "{header}\nstart_line {from} is past the module's last line {}",
+                    span.end_line
+                ));
+                continue;
+            }
+            let to = args
+                .line_count
+                .map(|n| from.saturating_add(n - 1))
+                .unwrap_or(span.end_line)
+                .min(span.end_line);
+            let text = self
+                .context
+                .graph
+                .read_span(
+                    &self.context.root,
+                    &module.file,
+                    LineSpan {
+                        start_line: from,
+                        end_line: to,
+                    },
+                )
+                .await
+                .unwrap_or_default();
+            // Whole lines up to the cap; a single longer line is cut at a
+            // char boundary.
+            let mut shown = String::new();
+            let mut last = from - 1;
+            for line in text.lines() {
+                let first = last < from;
+                if !first && shown.len() + 1 + line.len() > self.max_read_bytes {
+                    break;
+                }
+                if first && line.len() > self.max_read_bytes {
+                    let mut cut = self.max_read_bytes;
+                    while cut > 0 && !line.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    shown.push_str(&line[..cut]);
+                    last += 1;
+                    break;
+                }
+                if !first {
+                    shown.push('\n');
+                }
+                shown.push_str(line);
+                last += 1;
+            }
+            let mut section = format!("{header}, lines {from}..{last}\n```\n{shown}\n```");
+            if last < to {
+                section.push_str(&format!(
+                    "\n[{} more lines up to line {to}; continue with start_line={}]",
+                    to - last,
+                    last + 1
+                ));
+            }
+            sections.push(section);
+        }
+        if matches.len() > MAX_SOURCE_MATCHES {
+            sections.push(format!(
+                "[{} more modules named {:?} omitted]",
+                matches.len() - MAX_SOURCE_MATCHES,
+                args.module
             ));
         }
         Ok(sections.join("\n\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::model::{InheritEdge, Language, ModuleKind};
+
+    /// Leaf is Mid; Mid is Base, Context (outside the graph); Base is Context.
+    fn layered() -> CodegraphContext {
+        let mut graph = CodeGraph::default();
+        for (id, name) in [(1, "Base"), (2, "Mid"), (3, "Leaf")] {
+            graph.modules.insert(
+                id,
+                Module {
+                    id,
+                    language: Language::Solidity,
+                    kind: ModuleKind::Contract,
+                    name: name.to_string(),
+                    file: PathBuf::from("a.sol"),
+                    span: LineSpan {
+                        start_line: 1,
+                        end_line: 2,
+                    },
+                },
+            );
+        }
+        for (module_id, parent) in [
+            (3, ParentRef::Resolved(2)),
+            (2, ParentRef::Resolved(1)),
+            (2, ParentRef::External("Context".to_string())),
+            (1, ParentRef::External("Context".to_string())),
+        ] {
+            graph.inherit_edges.push(InheritEdge { module_id, parent });
+        }
+        CodegraphContext::new(graph, PathBuf::from("/nonexistent"))
+    }
+
+    #[tokio::test]
+    async fn metadata_lists_direct_parents_then_further_ancestors_once() {
+        let metadata = layered()
+            .tool_box()
+            .invoke(
+                "read_contract_metadata".to_string(),
+                r#"{"module": "Leaf"}"#.to_string(),
+            )
+            .await
+            .expect("tool exists")
+            .expect("tool ran");
+        assert!(metadata.contains("inherits: Mid (a.sol)\n"), "{metadata}");
+        assert!(
+            metadata.contains("further ancestors: Base (a.sol), Context (not in the code graph)\n"),
+            "{metadata}"
+        );
     }
 }

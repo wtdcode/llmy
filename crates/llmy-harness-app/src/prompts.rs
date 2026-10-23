@@ -233,11 +233,13 @@ pub fn render_codegraph_section(overview: &str) -> String {
     format!(
         "# Code graph\n\
 A pre-built code index of this project is available through the codegraph tools. ALWAYS prefer \
-them over grep for code navigation: `lookup_callable` (call edges in/out plus state accesses of \
-a function), `lookup_state` (who reads/writes a state item), `read_callable_source` and \
-`read_module_source` (source by contract/module or function), `codegraph_overview` (the module \
-map). Call edges are resolved syntactically: edges marked ambiguous or external need source-level \
-confirmation before you rely on them.\n\n{overview}"
+them over grep for code navigation: `read_contract_metadata` (a contract's parents, `using` \
+directives, declared types/events/errors, state and callables), `lookup_callable` (call edges \
+in/out plus state accesses of a function), `lookup_state` (who reads/writes a state item), \
+`read_callable_source` and `read_type_definition` (source of a function, or of a struct, enum, \
+event, error or user-defined type), `read_module_source` (a contract's source, in capped line \
+ranges), `codegraph_overview` (the module map). Call edges are resolved syntactically: edges \
+marked ambiguous or external need source-level confirmation before you rely on them.\n\n{overview}"
     )
 }
 

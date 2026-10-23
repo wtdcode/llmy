@@ -74,3 +74,49 @@ contract Vault {
         }
     }
 }
+
+uint256 constant SAMPLE_LIMIT = 10;
+
+struct Range {
+    uint256 lo;
+    uint256 hi;
+}
+
+enum Side { Buy, Sell }
+
+error OutOfRange(uint256 value);
+
+event Settled(address indexed who, uint256 amount);
+
+type Price is uint128;
+
+library MathLib {
+    function clamp(uint256 x) internal pure returns (uint256) {
+        return x > SAMPLE_LIMIT ? SAMPLE_LIMIT : x;
+    }
+}
+
+using MathLib for uint256;
+
+contract Book {
+    using MathLib for uint256;
+
+    enum Status { Open, Closed }
+
+    event Filled(uint256 indexed id, Side side);
+
+    error AlreadyClosed(uint256 id);
+
+    type OrderId is bytes32;
+
+    struct Order {
+        uint256 size;
+        Price price;
+    }
+
+    Order[] internal orders;
+}
+
+function freeClamp(uint256 x) pure returns (uint256) {
+    return x.clamp();
+}

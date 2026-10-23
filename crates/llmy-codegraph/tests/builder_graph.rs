@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use llmy_codegraph::model::{AccessKind, CallableKind, CalleeRef, Language, StateKind};
-use llmy_codegraph::{CodeGraphBuilder, CodeGraphStore, CodegraphContext};
+use llmy_codegraph::{CodeGraphBuilder, CodeGraphStore, CodegraphContext, CodegraphToolOptions};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -268,4 +268,96 @@ async fn tools_render_overview_and_xrefs() {
         .expect("tool ran");
     assert!(state.contains("writers:"), "{state}");
     assert!(state.contains("Vault.deposit"), "{state}");
+
+    let metadata = tools
+        .invoke(
+            "read_contract_metadata".to_string(),
+            r#"{"module": "Vault"}"#.to_string(),
+        )
+        .await
+        .expect("tool exists")
+        .expect("tool ran");
+    for expected in [
+        "contract Vault (Solidity, src/Vault.sol:7..38)",
+        "inherits: Ownable (src/Base.sol), IVault (src/IVault.sol)",
+        "  - event Swept (line 37)",
+        "  - balances [state variable] (line 8): mapping(address => uint256) public balances;",
+        "  - [modifier] modifier nonReentrant() (lines 12..17)",
+    ] {
+        assert!(
+            metadata.contains(expected),
+            "missing {expected:?} in:\n{metadata}"
+        );
+    }
+
+    let event = tools
+        .invoke(
+            "read_type_definition".to_string(),
+            r#"{"name": "Swept"}"#.to_string(),
+        )
+        .await
+        .expect("tool exists")
+        .expect("tool ran");
+    assert!(
+        event.contains("event Swept in Vault (src/Vault.sol:37..37)"),
+        "{event}"
+    );
+    assert!(
+        event.contains("event Swept(address token, uint256 amount);"),
+        "{event}"
+    );
+    let elsewhere = tools
+        .invoke(
+            "read_type_definition".to_string(),
+            r#"{"name": "Swept", "module": "Ownable"}"#.to_string(),
+        )
+        .await
+        .expect("tool exists")
+        .expect("tool ran");
+    assert!(
+        elsewhere.contains("it is declared in: Vault"),
+        "{elsewhere}"
+    );
+
+    let range = tools
+        .invoke(
+            "read_module_source".to_string(),
+            r#"{"module": "Vault", "start_line": 12, "line_count": 3}"#.to_string(),
+        )
+        .await
+        .expect("tool exists")
+        .expect("tool ran");
+    assert!(range.contains("lines 12..14"), "{range}");
+    assert!(
+        range.contains("modifier nonReentrant") && !range.contains("function deposit"),
+        "{range}"
+    );
+
+    let capped = context
+        .tool_box_with(CodegraphToolOptions {
+            module_source: true,
+            max_read_bytes: 200,
+        })
+        .invoke(
+            "read_module_source".to_string(),
+            r#"{"module": "Vault"}"#.to_string(),
+        )
+        .await
+        .expect("tool exists")
+        .expect("tool ran");
+    assert!(capped.contains("continue with start_line="), "{capped}");
+    let without = context
+        .tool_box_with(CodegraphToolOptions {
+            module_source: false,
+            ..CodegraphToolOptions::default()
+        })
+        .invoke(
+            "read_module_source".to_string(),
+            r#"{"module": "Vault"}"#.to_string(),
+        )
+        .await;
+    assert!(
+        without.is_none(),
+        "read_module_source must be absent when disabled"
+    );
 }

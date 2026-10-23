@@ -10,10 +10,10 @@ use llmy_types::error::LLMYError;
 use tree_sitter::Node;
 
 use crate::extract::{
-    FileExtraction, GrammarSet, NodeUtil, RawCallSite, RawCallable, RawModule, RawParent, RawState,
-    RawStateRef, SourceFile,
+    FileExtraction, GrammarSet, NodeUtil, RawCallSite, RawCallable, RawDeclaration, RawModule,
+    RawParent, RawState, RawStateRef, SourceFile,
 };
-use crate::model::{CallableKind, Language, ModuleKind, StateKind};
+use crate::model::{CallableKind, DeclarationKind, Language, ModuleKind, StateKind};
 
 const CONTAINER_KINDS: [&str; 3] = [
     "contract_declaration",
@@ -40,17 +40,79 @@ impl SolidityExtractor {
         let root = tree.root_node();
         let parse_errors = GrammarSet::count_errors(root);
 
-        let modules = root
+        let mut modules: Vec<RawModule> = root
             .descendants_of_kinds(&CONTAINER_KINDS, false)
             .into_iter()
             .map(|node| Self::extract_container(node, &file.content))
             .collect();
 
+        // File-level functions form one library named after the file, as the
+        // compiler-AST extractor does; the other file-level items are
+        // declarations without a module.
+        let mut free_functions = vec![];
+        let mut declarations = vec![];
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            if child.kind() == "function_definition" {
+                free_functions.push(Self::extract_callable(child, &file.content));
+            } else if let Some(declaration) = Self::extract_declaration(child, &file.content) {
+                declarations.push(declaration);
+            }
+        }
+        if !free_functions.is_empty() {
+            modules.push(RawModule {
+                name: file
+                    .relative
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "<file>".to_string()),
+                kind: ModuleKind::Library,
+                span: root.line_span(),
+                parents: vec![],
+                callables: free_functions,
+                states: vec![],
+                declarations: vec![],
+                node_id: None,
+            });
+        }
+
         Ok(FileExtraction {
             file: file.relative.clone(),
             language: Language::Solidity,
             modules,
+            declarations,
             parse_errors,
+        })
+    }
+
+    /// A struct, enum, event, error, user-defined value type, `using … for`
+    /// directive or file-level constant; `None` for any other node.
+    fn extract_declaration(node: Node<'_>, source: &str) -> Option<RawDeclaration> {
+        let kind = match node.kind() {
+            "struct_declaration" => DeclarationKind::Struct,
+            "enum_declaration" => DeclarationKind::Enum,
+            "event_definition" => DeclarationKind::Event,
+            "error_declaration" => DeclarationKind::Error,
+            "user_defined_type_definition" => DeclarationKind::UserType,
+            "using_directive" => DeclarationKind::UsingFor,
+            "constant_variable_declaration" => DeclarationKind::Constant,
+            _ => return None,
+        };
+        let name = match kind {
+            DeclarationKind::UsingFor => node
+                .text_of(source)
+                .trim()
+                .trim_start_matches("using")
+                .trim_end_matches(';')
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => node.child_of_kind("identifier")?.text_of(source),
+        };
+        Some(RawDeclaration {
+            kind,
+            name,
+            span: node.line_span(),
         })
     }
 
@@ -76,6 +138,7 @@ impl SolidityExtractor {
 
         let mut states = vec![];
         let mut callables = vec![];
+        let mut declarations = vec![];
         if let Some(body) = node.child_of_kind("contract_body") {
             for declaration in body.children_of_kind("state_variable_declaration") {
                 let Some(state_name) = declaration
@@ -101,6 +164,8 @@ impl SolidityExtractor {
             for child in body.children(&mut cursor) {
                 if CALLABLE_KINDS.contains(&child.kind()) {
                     callables.push(Self::extract_callable(child, source));
+                } else if let Some(declaration) = Self::extract_declaration(child, source) {
+                    declarations.push(declaration);
                 }
             }
         }
@@ -112,6 +177,7 @@ impl SolidityExtractor {
             parents,
             callables,
             states,
+            declarations,
             node_id: None,
         }
     }
@@ -435,5 +501,82 @@ interface IToken {
         assert!(!helper.state_refs.iter().any(|r| r.name == "local"));
         // `msg.sender`'s property never leaks in as a read.
         assert!(!increment.state_refs.iter().any(|r| r.name == "sender"));
+    }
+
+    #[test]
+    fn declarations_and_free_functions_are_extracted() {
+        let extraction = extract(
+            r#"
+pragma solidity ^0.8.20;
+uint256 constant LIMIT = 7;
+struct Range { uint lo; uint hi; }
+enum Side { Buy, Sell }
+error OutOfRange(uint x);
+event Settled(address indexed who);
+type Price is uint128;
+using MathLib for uint256;
+function clampFree(uint a) pure returns (uint) { return a; }
+contract Book is Base {
+    using SafeERC20 for IERC20;
+    struct Order {
+        uint size;
+    }
+    enum Status { Open, Closed }
+    event Filled(uint indexed id);
+    error AlreadyClosed(uint id);
+    type OrderId is bytes32;
+    uint256 public constant FEE = 30;
+    function f() external {}
+}
+"#,
+        );
+        let kinds = |declarations: &[RawDeclaration]| -> Vec<(DeclarationKind, String)> {
+            declarations
+                .iter()
+                .map(|d| (d.kind, d.name.clone()))
+                .collect()
+        };
+        assert_eq!(
+            kinds(&extraction.declarations),
+            vec![
+                (DeclarationKind::Constant, "LIMIT".to_string()),
+                (DeclarationKind::Struct, "Range".to_string()),
+                (DeclarationKind::Enum, "Side".to_string()),
+                (DeclarationKind::Error, "OutOfRange".to_string()),
+                (DeclarationKind::Event, "Settled".to_string()),
+                (DeclarationKind::UserType, "Price".to_string()),
+                (DeclarationKind::UsingFor, "MathLib for uint256".to_string()),
+            ]
+        );
+        let book = extraction
+            .modules
+            .iter()
+            .find(|m| m.name == "Book")
+            .expect("Book");
+        assert_eq!(
+            kinds(&book.declarations),
+            vec![
+                (
+                    DeclarationKind::UsingFor,
+                    "SafeERC20 for IERC20".to_string()
+                ),
+                (DeclarationKind::Struct, "Order".to_string()),
+                (DeclarationKind::Enum, "Status".to_string()),
+                (DeclarationKind::Event, "Filled".to_string()),
+                (DeclarationKind::Error, "AlreadyClosed".to_string()),
+                (DeclarationKind::UserType, "OrderId".to_string()),
+            ]
+        );
+        let order = &book.declarations[1];
+        assert_eq!((order.span.start_line, order.span.end_line), (13, 15));
+        // A constant inside a contract stays a state item.
+        assert!(book.states.iter().any(|s| s.name == "FEE"));
+        let free = extraction
+            .modules
+            .iter()
+            .find(|m| m.name == "test")
+            .expect("file-level functions form a library named after the file");
+        assert_eq!(free.kind, ModuleKind::Library);
+        assert_eq!(free.callables[0].name, "clampFree");
     }
 }

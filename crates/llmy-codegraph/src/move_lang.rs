@@ -33,6 +33,7 @@ impl MoveAptosExtractor {
             file: file.relative.clone(),
             language: Language::MoveAptos,
             modules,
+            declarations: vec![],
             parse_errors,
         })
     }
@@ -87,6 +88,7 @@ impl MoveAptosExtractor {
             parents: vec![],
             callables,
             states,
+            declarations: vec![],
             node_id: None,
         }
     }
@@ -199,6 +201,7 @@ impl MoveSuiExtractor {
             file: file.relative.clone(),
             language: Language::MoveSui,
             modules,
+            declarations: vec![],
             parse_errors,
         })
     }
@@ -260,6 +263,7 @@ impl MoveSuiExtractor {
             parents: vec![],
             callables,
             states,
+            declarations: vec![],
             node_id: None,
         }
     }
