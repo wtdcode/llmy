@@ -20,16 +20,11 @@ use serde::de::DeserializeOwned;
 use tokio_stream::StreamExt;
 
 use crate::req::{
-    ChatCompletionMessageToolCallRaw, ChatCompletionMessageToolCalls,
-    ChatCompletionMessageToolCallsRaw, ChatCompletionRequestMessageRaw,
-    ChatCompletionRequestSystemMessageRaw, ChatCompletionRequestUserMessageRaw,
-    ChatCompletionStreamOptionsRaw, ChatCompletionTools, CreateChatCompletionRequestRaw,
-    FunctionCallRaw, PromptCacheMode, PromptCacheOptionsRaw, Role,
+    ChatCompletionRequestMessageRaw, ChatCompletionRequestSystemMessageRaw,
+    ChatCompletionRequestUserMessageRaw, ChatCompletionStreamOptionsRaw, ChatCompletionTools,
+    CreateChatCompletionRequestRaw, PromptCacheMode, PromptCacheOptionsRaw,
 };
-use crate::resp::{
-    ChatChoice, ChatChoiceRaw, ChatCompletionResponseMessageRaw, CompletionUsage,
-    CreateChatCompletionResponseRaw, CreateChatCompletionStreamResponse, FinishReason,
-};
+use crate::resp::{ChatStreamAccumulator, CreateChatCompletionStreamResponse};
 
 pub use crate::anthropic::{AnthropicConfig, DEFAULT_ANTHROPIC_VERSION};
 use crate::anthropic::{
@@ -49,13 +44,6 @@ use crate::{
     billing::{BillingTree, NodeId, ROOT, TokenBilling, TokenUsage},
     settings::{LLMSettings, Reasoning},
 };
-
-#[derive(Clone, Debug, Default)]
-struct ToolCallAcc {
-    id: String,
-    name: String,
-    arguments: String,
-}
 
 #[derive(Debug, Clone)]
 pub enum SupportedConfig {
@@ -390,7 +378,6 @@ impl LLMClient {
     }
 
     /// Aggregate a chat-completion chunk stream into one full response.
-    #[allow(deprecated)]
     async fn chat_streaming(
         &self,
         req: &mut RawExtensibleChatCompletionRequest,
@@ -406,159 +393,11 @@ impl LLMClient {
         }
 
         let mut stream = self.create_chat_stream_extensible(&*req).await?;
-
-        let mut id: Option<String> = None;
-        let mut created: Option<u32> = None;
-        let mut model: Option<String> = None;
-        let mut service_tier = None;
-        let mut system_fingerprint = None;
-        let mut usage: Option<CompletionUsage> = None;
-
-        let mut contents: Vec<String> = Vec::new();
-        let mut finish_reasons: Vec<Option<FinishReason>> = Vec::new();
-        let mut tool_calls: Vec<Vec<ToolCallAcc>> = Vec::new();
-
-        while let Some(item) = stream.next().await {
-            let chunk: CreateChatCompletionStreamResponse = item?;
-            // Take ownership of the inner raw chunk so we can move fields out of `WithOtherFields`.
-            let chunk = chunk.inner;
-            if id.is_none() {
-                id = Some(chunk.id.clone());
-            }
-            created = Some(chunk.created);
-            model = Some(chunk.model.clone());
-            service_tier = chunk.service_tier.clone();
-            #[allow(deprecated)]
-            {
-                system_fingerprint = chunk.system_fingerprint.clone();
-            }
-            if let Some(u) = chunk.usage.clone() {
-                usage = Some(u);
-            }
-
-            for ch in chunk.choices.into_iter() {
-                let ch = ch.inner;
-                let idx = ch.index as usize;
-                if contents.len() <= idx {
-                    contents.resize_with(idx + 1, String::new);
-                    finish_reasons.resize_with(idx + 1, || None);
-                    tool_calls.resize_with(idx + 1, Vec::new);
-                }
-                let delta = ch.delta.inner;
-                if let Some(content) = delta.content {
-                    contents[idx].push_str(&content);
-                }
-                if let Some(tcs) = delta.tool_calls {
-                    for tc in tcs.into_iter() {
-                        let tc = tc.inner;
-                        let tc_idx = tc.index as usize;
-                        if tool_calls[idx].len() <= tc_idx {
-                            tool_calls[idx].resize_with(tc_idx + 1, ToolCallAcc::default);
-                        }
-                        let acc = &mut tool_calls[idx][tc_idx];
-                        if let Some(id) = tc.id {
-                            acc.id = id;
-                        }
-                        if let Some(func) = tc.function {
-                            let func = func.inner;
-                            if let Some(name) = func.name {
-                                acc.name = name;
-                            }
-                            if let Some(args) = func.arguments {
-                                acc.arguments.push_str(&args);
-                            }
-                        }
-                    }
-                }
-                if ch.finish_reason.is_some() {
-                    finish_reasons[idx] = ch.finish_reason;
-                }
-            }
+        let mut acc = ChatStreamAccumulator::default();
+        while let Some(chunk) = stream.next().await {
+            acc.push(chunk?);
         }
-
-        let mut choices: Vec<ChatChoice> = Vec::new();
-        for (idx, content) in contents.into_iter().enumerate() {
-            let finish_reason = finish_reasons.get(idx).cloned().unwrap_or(None);
-            let built_tool_calls: Vec<ChatCompletionMessageToolCalls> = tool_calls
-                .get(idx)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|t| !t.name.trim().is_empty() || !t.arguments.trim().is_empty())
-                .map(|t| {
-                    let raw = ChatCompletionMessageToolCallRaw {
-                        id: if t.id.trim().is_empty() {
-                            format!("toolcall-{}", idx)
-                        } else {
-                            t.id
-                        },
-                        function: WithOtherFields::new(FunctionCallRaw {
-                            name: t.name,
-                            arguments: t.arguments,
-                        }),
-                    };
-                    WithOtherFields::new(ChatCompletionMessageToolCallsRaw::Function(
-                        WithOtherFields::new(raw),
-                    ))
-                })
-                .collect();
-            let tool_calls_opt = if built_tool_calls.is_empty() {
-                None
-            } else {
-                Some(built_tool_calls)
-            };
-            #[allow(deprecated)]
-            let message = WithOtherFields::new(ChatCompletionResponseMessageRaw {
-                content: if content.is_empty() {
-                    None
-                } else {
-                    Some(content)
-                },
-                refusal: None,
-                tool_calls: tool_calls_opt,
-                annotations: None,
-                role: Role::Assistant,
-                function_call: None,
-                audio: None,
-            });
-            choices.push(WithOtherFields::new(ChatChoiceRaw {
-                index: idx as u32,
-                message,
-                finish_reason,
-                logprobs: None,
-            }));
-        }
-        if choices.is_empty() {
-            #[allow(deprecated)]
-            let message = WithOtherFields::new(ChatCompletionResponseMessageRaw {
-                content: Some(String::new()),
-                refusal: None,
-                tool_calls: None,
-                annotations: None,
-                role: Role::Assistant,
-                function_call: None,
-                audio: None,
-            });
-            choices.push(WithOtherFields::new(ChatChoiceRaw {
-                index: 0,
-                message,
-                finish_reason: None,
-                logprobs: None,
-            }));
-        }
-
-        #[allow(deprecated)]
-        let resp_raw = CreateChatCompletionResponseRaw {
-            id: id.unwrap_or_else(|| "stream".to_string()),
-            choices,
-            created: created.unwrap_or(0),
-            model: model.unwrap_or_else(|| fallback_model.to_string()),
-            service_tier,
-            system_fingerprint,
-            object: "chat.completion".to_string(),
-            usage,
-        };
-        Ok(RawExtensibleChatCompletionResponse::new(resp_raw))
+        Ok(acc.finish(fallback_model))
     }
 }
 
@@ -2482,6 +2321,7 @@ fn apply_provider_request_extensions(
 mod tests {
     use super::*;
     use crate::req::ReasoningEffort;
+    use crate::resp::{CreateChatCompletionResponseRaw, FinishReason};
     use crate::settings::{LLMToolChoice, Reasoning};
     use std::str::FromStr;
 

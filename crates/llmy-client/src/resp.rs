@@ -10,6 +10,8 @@ use std::ops::{Deref, DerefMut};
 use llmy_types::other::{OtherFields, WithOtherFields};
 use serde::{Deserialize, Serialize};
 
+use crate::req::ChatCompletionMessageToolCallRaw;
+
 // Shared types defined in req.rs (request side) but used in responses.
 pub use crate::req::{
     ChatCompletionMessageCustomToolCall, ChatCompletionMessageToolCall,
@@ -328,6 +330,257 @@ pub type CreateChatCompletionStreamResponse =
     WithOtherFields<CreateChatCompletionStreamResponseRaw>;
 
 // ---------------------------------------------------------------------------
+// Stream aggregation
+// ---------------------------------------------------------------------------
+
+/// Padding the provider adds to stream chunks to blur their sizes
+/// (`stream_options.include_obfuscation`). It is noise, not content, so it is
+/// never carried into the aggregated response.
+const OBFUSCATION_FIELD: &str = "obfuscation";
+
+/// Folds a chat-completion chunk stream back into the response the same
+/// request would have got unstreamed. Deltas are fragments: text — content,
+/// refusal, tool-call arguments, and provider extras on the delta such as
+/// `reasoning_content` — is appended in arrival order. Everything else a
+/// chunk carries (ids, usage, provider extras on the chunk, a choice or a tool
+/// call) repeats or updates from chunk to chunk, so the latest value wins.
+#[derive(Debug, Default)]
+pub struct ChatStreamAccumulator {
+    id: Option<String>,
+    created: Option<u32>,
+    model: Option<String>,
+    service_tier: Option<ServiceTier>,
+    system_fingerprint: Option<String>,
+    usage: Option<CompletionUsage>,
+    extras: OtherFields,
+    choices: Vec<StreamedChoice>,
+}
+
+/// One choice of a chat stream as it accumulates.
+#[derive(Debug, Default)]
+struct StreamedChoice {
+    content: String,
+    refusal: String,
+    finish_reason: Option<FinishReason>,
+    tool_calls: Vec<StreamedToolCall>,
+    /// Provider extras on the deltas; they land on the message.
+    message_extras: OtherFields,
+    /// Provider extras on the choice itself.
+    choice_extras: OtherFields,
+}
+
+/// One tool call of a streamed choice as it accumulates.
+#[derive(Debug, Default)]
+struct StreamedToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+    /// Provider extras on the call, e.g. Gemini's `extra_content` carrying the
+    /// `thought_signature` its replay needs.
+    extras: OtherFields,
+    function_extras: OtherFields,
+}
+
+impl ChatStreamAccumulator {
+    pub fn push(&mut self, chunk: CreateChatCompletionStreamResponse) {
+        let WithOtherFields {
+            inner: chunk,
+            mut other,
+        } = chunk;
+        other.remove(OBFUSCATION_FIELD);
+        self.extras.extend(other);
+        if self.id.is_none() {
+            self.id = Some(chunk.id);
+        }
+        self.created = Some(chunk.created);
+        self.model = Some(chunk.model);
+        self.service_tier = chunk.service_tier;
+        #[allow(deprecated)]
+        {
+            self.system_fingerprint = chunk.system_fingerprint;
+        }
+        if chunk.usage.is_some() {
+            self.usage = chunk.usage;
+        }
+        for choice in chunk.choices {
+            let index = choice.inner.index as usize;
+            if self.choices.len() <= index {
+                self.choices.resize_with(index + 1, StreamedChoice::default);
+            }
+            self.choices[index].push(choice);
+        }
+    }
+
+    /// The full response. `fallback_model` names it when no chunk did.
+    pub fn finish(self, fallback_model: &str) -> RawExtensibleChatCompletionResponse {
+        let mut choices: Vec<ChatChoice> = self
+            .choices
+            .into_iter()
+            .enumerate()
+            .map(|(index, choice)| choice.finish(index))
+            .collect();
+        if choices.is_empty() {
+            #[allow(deprecated)]
+            let message = WithOtherFields::new(ChatCompletionResponseMessageRaw {
+                content: Some(String::new()),
+                refusal: None,
+                tool_calls: None,
+                annotations: None,
+                role: Role::Assistant,
+                function_call: None,
+                audio: None,
+            });
+            choices.push(WithOtherFields::new(ChatChoiceRaw {
+                index: 0,
+                message,
+                finish_reason: None,
+                logprobs: None,
+            }));
+        }
+        #[allow(deprecated)]
+        let response = CreateChatCompletionResponseRaw {
+            id: self.id.unwrap_or_else(|| "stream".to_string()),
+            choices,
+            created: self.created.unwrap_or(0),
+            model: self.model.unwrap_or_else(|| fallback_model.to_string()),
+            service_tier: self.service_tier,
+            system_fingerprint: self.system_fingerprint,
+            object: "chat.completion".to_string(),
+            usage: self.usage,
+        };
+        RawExtensibleChatCompletionResponse::from_response(WithOtherFields {
+            inner: response,
+            other: self.extras,
+        })
+    }
+}
+
+impl StreamedChoice {
+    fn push(&mut self, choice: ChatChoiceStream) {
+        let WithOtherFields {
+            inner: choice,
+            other,
+        } = choice;
+        self.choice_extras.extend(other);
+        if choice.finish_reason.is_some() {
+            self.finish_reason = choice.finish_reason;
+        }
+        let WithOtherFields {
+            inner: delta,
+            other: delta_extras,
+        } = choice.delta;
+        if let Some(content) = delta.content {
+            self.content.push_str(&content);
+        }
+        if let Some(refusal) = delta.refusal {
+            self.refusal.push_str(&refusal);
+        }
+        // A provider that streams reasoning sends `"reasoning_content": null`
+        // on every content delta once it is done thinking, so a null is no
+        // update: taking it as one would erase the reasoning gathered so far.
+        for (key, value) in delta_extras {
+            if value.is_null() || key == OBFUSCATION_FIELD {
+                continue;
+            }
+            match self.message_extras.entry(key) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(value);
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    match (slot.get_mut(), value) {
+                        (serde_json::Value::String(text), serde_json::Value::String(more)) => {
+                            text.push_str(&more)
+                        }
+                        (serde_json::Value::Array(items), serde_json::Value::Array(more)) => {
+                            items.extend(more)
+                        }
+                        (current, value) => *current = value,
+                    }
+                }
+            }
+        }
+        for call in delta.tool_calls.into_iter().flatten() {
+            let WithOtherFields { inner: call, other } = call;
+            let index = call.index as usize;
+            if self.tool_calls.len() <= index {
+                self.tool_calls
+                    .resize_with(index + 1, StreamedToolCall::default);
+            }
+            let slot = &mut self.tool_calls[index];
+            slot.extras.extend(other);
+            if let Some(id) = call.id {
+                slot.id = id;
+            }
+            if let Some(function) = call.function {
+                let WithOtherFields {
+                    inner: function,
+                    other,
+                } = function;
+                slot.function_extras.extend(other);
+                if let Some(name) = function.name {
+                    slot.name = name;
+                }
+                if let Some(arguments) = function.arguments {
+                    slot.arguments.push_str(&arguments);
+                }
+            }
+        }
+    }
+
+    fn finish(self, index: usize) -> ChatChoice {
+        let tool_calls: Vec<ChatCompletionMessageToolCalls> = self
+            .tool_calls
+            .into_iter()
+            .filter(|call| !call.name.trim().is_empty() || !call.arguments.trim().is_empty())
+            .map(|call| {
+                let raw = ChatCompletionMessageToolCallRaw {
+                    id: if call.id.trim().is_empty() {
+                        format!("toolcall-{}", index)
+                    } else {
+                        call.id
+                    },
+                    function: WithOtherFields {
+                        inner: FunctionCallRaw {
+                            name: call.name,
+                            arguments: call.arguments,
+                        },
+                        other: call.function_extras,
+                    },
+                };
+                WithOtherFields::new(ChatCompletionMessageToolCallsRaw::Function(
+                    WithOtherFields {
+                        inner: raw,
+                        other: call.extras,
+                    },
+                ))
+            })
+            .collect();
+        #[allow(deprecated)]
+        let message = WithOtherFields {
+            inner: ChatCompletionResponseMessageRaw {
+                content: (!self.content.is_empty()).then_some(self.content),
+                refusal: (!self.refusal.is_empty()).then_some(self.refusal),
+                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                annotations: None,
+                role: Role::Assistant,
+                function_call: None,
+                audio: None,
+            },
+            other: self.message_extras,
+        };
+        WithOtherFields {
+            inner: ChatChoiceRaw {
+                index: index as u32,
+                message,
+                finish_reason: self.finish_reason,
+                logprobs: None,
+            },
+            other: self.choice_extras,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public extensible wrappers (preserved from the old API)
 // ---------------------------------------------------------------------------
 
@@ -483,6 +736,123 @@ mod tests {
             }]
         }))
         .expect("response with a service tier")
+    }
+
+    fn chunk(
+        choices: serde_json::Value,
+        extras: serde_json::Value,
+    ) -> CreateChatCompletionStreamResponse {
+        let mut value = serde_json::json!({
+            "id": "chatcmpl-stream",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "deepseek-v4-flash-0731",
+            "choices": choices,
+        });
+        if let (Some(fields), Some(extras)) = (value.as_object_mut(), extras.as_object()) {
+            fields.extend(extras.clone());
+        }
+        serde_json::from_value(value).expect("stream chunk")
+    }
+
+    #[test]
+    fn streamed_reasoning_survives_aggregation() {
+        // DeepSeek's shape: reasoning streams first, then the answer, with
+        // `reasoning_content: null` on every answer delta.
+        let mut acc = ChatStreamAccumulator::default();
+        for choices in [
+            serde_json::json!([{"index": 0, "delta": {"role": "assistant", "content": null, "reasoning_content": "17*23 "}}]),
+            serde_json::json!([{"index": 0, "delta": {"content": null, "reasoning_content": "is 391."}}]),
+            serde_json::json!([{"index": 0, "delta": {"content": "39", "reasoning_content": null}}]),
+            serde_json::json!([{"index": 0, "delta": {"content": "1", "reasoning_content": null}, "finish_reason": "stop"}]),
+        ] {
+            acc.push(chunk(choices, serde_json::json!({})));
+        }
+        let response = acc.finish("unused");
+        let choice = &response.choices[0];
+        assert_eq!(choice.inner.message.inner.content.as_deref(), Some("391"));
+        assert_eq!(
+            choice.inner.message.other.get("reasoning_content"),
+            Some(&serde_json::json!("17*23 is 391."))
+        );
+        assert_eq!(choice.inner.finish_reason, Some(FinishReason::Stop));
+
+        // And it reaches the neutral message the way an unstreamed answer's does.
+        let message = crate::message::Message::from_chat_choice(choice);
+        assert!(
+            matches!(
+                message.parts.first(),
+                Some(crate::message::MessagePart::Thinking { thinking, .. }) if thinking == "17*23 is 391."
+            ),
+            "{:?}",
+            message.parts
+        );
+    }
+
+    #[test]
+    fn stream_extras_keep_their_own_merge_rule() {
+        // Gemini-style tool call carrying its thought signature, a provider
+        // field repeated on every chunk, a choice field that settles on the
+        // last chunk, a refusal in fragments, and stream padding.
+        let mut acc = ChatStreamAccumulator::default();
+        acc.push(chunk(
+            serde_json::json!([{
+                "index": 0,
+                "native_finish_reason": null,
+                "delta": {
+                    "role": "assistant",
+                    "refusal": "I won't ",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":"},
+                        "extra_content": {"google": {"thought_signature": "sig"}}
+                    }]
+                }
+            }]),
+            serde_json::json!({"provider": "Google", "obfuscation": "x1"}),
+        ));
+        acc.push(chunk(
+            serde_json::json!([{
+                "index": 0,
+                "native_finish_reason": "STOP",
+                "finish_reason": "tool_calls",
+                "delta": {
+                    "refusal": "do that.",
+                    "obfuscation": "pad",
+                    "tool_calls": [{"index": 0, "function": {"arguments": "\"a.rs\"}"}}]
+                }
+            }]),
+            serde_json::json!({"provider": "Google", "obfuscation": "x2"}),
+        ));
+        let response = acc.finish("unused");
+
+        assert_eq!(
+            response.0.other.get("provider"),
+            Some(&serde_json::json!("Google"))
+        );
+        assert!(response.0.other.get("obfuscation").is_none());
+        let choice = &response.choices[0];
+        assert_eq!(
+            choice.other.get("native_finish_reason"),
+            Some(&serde_json::json!("STOP"))
+        );
+        let message = &choice.inner.message;
+        assert!(message.other.get("obfuscation").is_none());
+        assert_eq!(message.inner.refusal.as_deref(), Some("I won't do that."));
+        let calls = message.inner.tool_calls.as_ref().expect("tool call");
+        match &calls[0].inner {
+            ChatCompletionMessageToolCallsRaw::Function(call) => {
+                assert_eq!(call.inner.id, "call_1");
+                assert_eq!(call.inner.function.inner.arguments, "{\"path\":\"a.rs\"}");
+                assert_eq!(
+                    call.other.get("extra_content"),
+                    Some(&serde_json::json!({"google": {"thought_signature": "sig"}}))
+                );
+            }
+            other => panic!("expected a function call, got {other:?}"),
+        }
     }
 
     #[test]

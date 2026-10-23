@@ -376,7 +376,7 @@ pub fn extract_raw_text(req: &CreateChatCompletionRequestRaw) -> String {
                 // the estimate must count it too. `reasoning` covers
                 // passthrough requests written for providers using that
                 // spelling.
-                for key in ["reasoning_content", "reasoning"] {
+                for key in crate::message::REASONING_EXTRA_KEYS {
                     if let Some(serde_json::Value::String(reasoning)) = ass.other.get(key) {
                         parts.push(reasoning.clone());
                     }

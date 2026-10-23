@@ -34,6 +34,11 @@ use crate::req::{
 };
 use crate::resp::ChatChoice;
 
+/// The chat-message extras that carry readable reasoning text, in order of
+/// preference: most providers (DeepSeek, Qwen) spell it `reasoning_content`,
+/// OpenRouter and vLLM `reasoning`. llmy writes the first when replaying.
+pub const REASONING_EXTRA_KEYS: [&str; 2] = ["reasoning_content", "reasoning"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
@@ -338,18 +343,18 @@ impl Message {
 
     /// The assistant turn of a chat-protocol response, in neutral form.
     /// Provider extras on tool calls (Gemini's `thought_signature`) are
-    /// carried; a non-blank `reasoning_content` extra becomes a
-    /// [`MessagePart::Thinking`] without signature. A custom tool call is
-    /// folded to a function-style [`MessagePart::ToolCall`].
+    /// carried; a non-blank reasoning extra (see [`REASONING_EXTRA_KEYS`])
+    /// becomes a [`MessagePart::Thinking`] without signature. A custom tool
+    /// call is folded to a function-style [`MessagePart::ToolCall`].
     pub fn from_chat_choice(choice: &ChatChoice) -> Message {
         let mut parts = Vec::new();
-        if let Some(reasoning) = choice
-            .inner
-            .message
-            .other
-            .get("reasoning_content")
-            .and_then(|value| value.as_str())
-            && !reasoning.trim().is_empty()
+        // Some providers send both spellings with the same text, so only the
+        // first non-blank one becomes thinking.
+        let extras = &choice.inner.message.other;
+        if let Some(reasoning) = REASONING_EXTRA_KEYS
+            .iter()
+            .filter_map(|key| extras.get(*key).and_then(Value::as_str))
+            .find(|text| !text.trim().is_empty())
         {
             parts.push(MessagePart::Thinking {
                 thinking: reasoning.to_string(),
@@ -624,6 +629,58 @@ mod tests {
         let value = serde_json::to_value(&message.to_chat_messages()[0]).unwrap();
         assert_eq!(value["tool_calls"][0]["thought_signature"], "c2ln");
         assert_eq!(value["reasoning_content"], "I need the tool.");
+    }
+
+    /// The thinking texts a chat choice with this assistant message reads back as.
+    fn thinking_of(message: serde_json::Value) -> Vec<String> {
+        let choice: ChatChoice = serde_json::from_value(serde_json::json!({
+            "index": 0,
+            "message": message,
+            "finish_reason": "stop"
+        }))
+        .expect("chat choice");
+        Message::from_chat_choice(&choice)
+            .parts
+            .into_iter()
+            .filter_map(|part| match part {
+                MessagePart::Thinking { thinking, .. } => Some(thinking),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reasoning_reads_back_under_either_spelling() {
+        // OpenRouter / vLLM spelling.
+        assert_eq!(
+            thinking_of(
+                serde_json::json!({"role": "assistant", "content": "391", "reasoning": "17*23"})
+            ),
+            ["17*23"]
+        );
+        // Both spellings carrying the same text: one thinking part, not two.
+        assert_eq!(
+            thinking_of(serde_json::json!({
+                "role": "assistant", "content": "391",
+                "reasoning_content": "17*23", "reasoning": "17*23"
+            })),
+            ["17*23"]
+        );
+        // A blank preferred spelling falls through to the other.
+        assert_eq!(
+            thinking_of(serde_json::json!({
+                "role": "assistant", "content": "391",
+                "reasoning_content": "", "reasoning": "17*23"
+            })),
+            ["17*23"]
+        );
+        // `reasoning` that is not text (a request-style effort object) is no thinking.
+        assert!(
+            thinking_of(serde_json::json!({
+                "role": "assistant", "content": "391", "reasoning": {"effort": "low"}
+            }))
+            .is_empty()
+        );
     }
 
     #[test]
