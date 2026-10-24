@@ -23,7 +23,8 @@ const MAX_DECLARATION_CHARS: usize = 240;
 /// module read returns.
 #[derive(Debug, Clone, Copy)]
 pub struct CodegraphToolOptions {
-    /// Offer `read_module_source`.
+    /// Offer `read_module_source` (off by default: contracts are read by
+    /// metadata, callable and declaration).
     pub module_source: bool,
     /// Bytes one `read_module_source` reply returns per module, cut at a line
     /// boundary; the reply says where to continue.
@@ -33,7 +34,7 @@ pub struct CodegraphToolOptions {
 impl Default for CodegraphToolOptions {
     fn default() -> Self {
         Self {
-            module_source: true,
+            module_source: false,
             max_read_bytes: 8192,
         }
     }
@@ -83,7 +84,8 @@ impl CodegraphContext {
         lines.join("\n")
     }
 
-    /// Every codegraph tool, `read_module_source` included.
+    /// The codegraph tools with the default options, `read_module_source` left
+    /// out.
     pub fn tool_box(&self) -> ToolBox {
         self.tool_box_with(CodegraphToolOptions::default())
     }
@@ -551,23 +553,58 @@ impl LookupStateTool {
     }
 }
 
+/// Names a read covers: one name, or a list of them read in one call.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum NameOrNames {
+    Many(Vec<String>),
+    One(String),
+}
+
+impl NameOrNames {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::Many(names) => names,
+            Self::One(name) => vec![name],
+        }
+    }
+}
+
+impl JsonSchema for NameOrNames {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("NameOrNames")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "anyOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}}
+            ]
+        })
+    }
+}
+
+/// Callables one `read_callable_source` call reads at most.
+const MAX_NAMES_PER_READ: usize = 10;
+
 /// Arguments accepted by [`ReadCallableSourceTool`].
 #[derive(Deserialize, JsonSchema)]
 pub struct ReadCallableSourceArgs {
-    /// Function / callable name.
-    pub name: String,
-    /// Optional module/contract name to disambiguate.
+    /// Function / callable name, or a list of up to 10 names read in one call.
+    pub name: NameOrNames,
+    /// Optional module/contract name to disambiguate; applies to every name.
     #[serde(default)]
     pub module: Option<String>,
 }
 
-/// Reads a callable's source by name.
+/// Reads the source of one or several callables by name.
 #[derive(Debug, Clone)]
 #[llmy_agent::tool(
     arguments = ReadCallableSourceArgs,
     invoke = read,
     name = "read_callable_source",
-    description = "Read the full source of a function/callable by name (optionally scoped to a module/contract).",
+    description = "Read the full source of a function/callable by name, or of up to 10 callables at once given a list of names (optionally scoped to a module/contract).",
 )]
 pub struct ReadCallableSourceTool {
     context: CodegraphContext,
@@ -579,33 +616,49 @@ impl ReadCallableSourceTool {
     }
 
     async fn read(&self, args: ReadCallableSourceArgs) -> Result<String, LLMYError> {
-        let matches = self
-            .context
-            .graph
-            .find_callables(args.module.as_deref(), &args.name);
-        if matches.is_empty() {
-            return Ok(format!(
-                "No callable named {:?} in the code graph.",
-                args.name
-            ));
-        }
+        let names = args.name.into_vec();
         let mut sections = vec![];
-        for callable in matches.iter().take(MAX_SOURCE_MATCHES) {
-            let source = self
+        for name in names.iter().take(MAX_NAMES_PER_READ) {
+            let matches = self
                 .context
                 .graph
-                .read_span(&self.context.root, &callable.file, callable.span)
-                .await?;
-            sections.push(format!(
-                "{}\n```\n{}\n```",
-                self.context.render_callable_line(callable),
-                source
-            ));
+                .find_callables(args.module.as_deref(), name);
+            if matches.is_empty() {
+                sections.push(format!(
+                    "No callable named {:?}{} in the code graph.",
+                    name,
+                    args.module
+                        .as_deref()
+                        .map(|m| format!(" in module {m:?}"))
+                        .unwrap_or_default()
+                ));
+                continue;
+            }
+            for callable in matches.iter().take(MAX_SOURCE_MATCHES) {
+                let source = self
+                    .context
+                    .graph
+                    .read_span(&self.context.root, &callable.file, callable.span)
+                    .await?;
+                sections.push(format!(
+                    "{}\n```\n{}\n```",
+                    self.context.render_callable_line(callable),
+                    source
+                ));
+            }
+            if matches.len() > MAX_SOURCE_MATCHES {
+                sections.push(format!(
+                    "[{} more matches of {:?} omitted; scope with `module`]",
+                    matches.len() - MAX_SOURCE_MATCHES,
+                    name
+                ));
+            }
         }
-        if matches.len() > MAX_SOURCE_MATCHES {
+        if names.len() > MAX_NAMES_PER_READ {
             sections.push(format!(
-                "[{} more matches omitted; scope with `module`]",
-                matches.len() - MAX_SOURCE_MATCHES
+                "[{} more names not read: {}; read them in another call]",
+                names.len() - MAX_NAMES_PER_READ,
+                names[MAX_NAMES_PER_READ..].join(", ")
             ));
         }
         Ok(sections.join("\n\n"))

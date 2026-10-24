@@ -237,9 +237,9 @@ them over grep for code navigation: `read_contract_metadata` (a contract's paren
 directives, declared types/events/errors, state and callables), `lookup_callable` (call edges \
 in/out plus state accesses of a function), `lookup_state` (who reads/writes a state item), \
 `read_callable_source` and `read_type_definition` (source of a function, or of a struct, enum, \
-event, error or user-defined type), `read_module_source` (a contract's source, in capped line \
-ranges), `codegraph_overview` (the module map). Call edges are resolved syntactically: edges \
-marked ambiguous or external need source-level confirmation before you rely on them.\n\n{overview}"
+event, error or user-defined type), `codegraph_overview` (the module map). Call edges are \
+resolved syntactically: edges marked ambiguous or external need source-level confirmation \
+before you rely on them.\n\n{overview}"
     )
 }
 

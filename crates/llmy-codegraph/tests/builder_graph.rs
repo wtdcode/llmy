@@ -222,7 +222,10 @@ async fn tools_render_overview_and_xrefs() {
     assert!(overview.contains("contract Vault"), "{overview}");
     assert!(overview.contains("interface IVault"), "{overview}");
 
-    let tools = context.tool_box();
+    let tools = context.tool_box_with(CodegraphToolOptions {
+        module_source: true,
+        ..CodegraphToolOptions::default()
+    });
     let lookup = tools
         .invoke(
             "lookup_callable".to_string(),
@@ -244,6 +247,22 @@ async fn tools_render_overview_and_xrefs() {
         .expect("tool exists")
         .expect("tool ran");
     assert!(source.contains("function withdraw"), "{source}");
+    let several = tools
+        .invoke(
+            "read_callable_source".to_string(),
+            r#"{"name": ["deposit", "withdraw", "missing"], "module": "Vault"}"#.to_string(),
+        )
+        .await
+        .expect("tool exists")
+        .expect("tool ran");
+    assert!(
+        several.contains("function deposit") && several.contains("function withdraw"),
+        "{several}"
+    );
+    assert!(
+        several.contains("No callable named \"missing\" in module \"Vault\""),
+        "{several}"
+    );
 
     let module_source = tools
         .invoke(
@@ -346,11 +365,9 @@ async fn tools_render_overview_and_xrefs() {
         .expect("tool exists")
         .expect("tool ran");
     assert!(capped.contains("continue with start_line="), "{capped}");
+    // The default tool box leaves read_module_source out.
     let without = context
-        .tool_box_with(CodegraphToolOptions {
-            module_source: false,
-            ..CodegraphToolOptions::default()
-        })
+        .tool_box()
         .invoke(
             "read_module_source".to_string(),
             r#"{"module": "Vault"}"#.to_string(),
@@ -358,6 +375,6 @@ async fn tools_render_overview_and_xrefs() {
         .await;
     assert!(
         without.is_none(),
-        "read_module_source must be absent when disabled"
+        "read_module_source must be absent by default"
     );
 }

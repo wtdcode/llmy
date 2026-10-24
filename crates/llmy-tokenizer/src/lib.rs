@@ -188,6 +188,13 @@ pub struct LongContextPricing {
     pub input_cache_write: Option<Decimal>,
 }
 
+/// Which half of a peak/off-peak schedule to bill at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PricingPeriod {
+    Peak,
+    OffPeak,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ModelPricing {
     /// Per-token USD price for uncached input.
@@ -222,14 +229,7 @@ impl ModelPricing {
         if let Some(off) = self.off_peak
             && !off.is_peak(at)
         {
-            return ModelPricing {
-                input: off.input,
-                output: off.output,
-                input_cache_read: off.input_cache_read,
-                input_cache_write: off.input_cache_write,
-                long_context: None,
-                off_peak: None,
-            };
+            return self.pinned_to(PricingPeriod::OffPeak);
         }
         match self.long_context {
             Some(long) if input_tokens > long.threshold => ModelPricing {
@@ -241,6 +241,31 @@ impl ModelPricing {
                 off_peak: None,
             },
             _ => *self,
+        }
+    }
+
+    /// These rates with the time of day settled up front instead of read off
+    /// the clock: `Peak` bills the base rates around the clock (the
+    /// long-context tier still applies), `OffPeak` the discounted ones.
+    /// Pricing without an off-peak schedule has nothing to pin and comes
+    /// back unchanged.
+    pub fn pinned_to(&self, period: PricingPeriod) -> ModelPricing {
+        let Some(off) = self.off_peak else {
+            return *self;
+        };
+        match period {
+            PricingPeriod::Peak => ModelPricing {
+                off_peak: None,
+                ..*self
+            },
+            PricingPeriod::OffPeak => ModelPricing {
+                input: off.input,
+                output: off.output,
+                input_cache_read: off.input_cache_read,
+                input_cache_write: off.input_cache_write,
+                long_context: None,
+                off_peak: None,
+            },
         }
     }
 }
@@ -703,6 +728,40 @@ mod tests {
         let m2 = get_model("minimax/minimax-m2").expect("known model");
         assert_eq!(m2.encoding(), Some(Encoding::MiniMax));
         assert_eq!(m2.max_input_tokens, 204_800);
+    }
+
+    #[test]
+    fn a_pinned_period_ignores_the_clock() {
+        use chrono::TimeZone;
+        let pricing = get_model("deepseek/deepseek-flash")
+            .expect("known model")
+            .pricing
+            .expect("pricing");
+        let off = pricing.off_peak.expect("off-peak tier");
+        // Wednesday 02:00 UTC is peak, Wednesday 12:00 UTC off-peak.
+        let peak_hour = chrono::Utc.with_ymd_and_hms(2026, 9, 23, 2, 0, 0).unwrap();
+        let off_hour = chrono::Utc.with_ymd_and_hms(2026, 9, 23, 12, 0, 0).unwrap();
+
+        let peak = pricing.pinned_to(PricingPeriod::Peak);
+        assert_eq!(peak.for_request(1_000, off_hour).input, pricing.input);
+        assert_eq!(peak.for_request(1_000, off_hour).output, pricing.output);
+
+        let off_peak = pricing.pinned_to(PricingPeriod::OffPeak);
+        assert_eq!(off_peak.for_request(1_000, peak_hour).input, off.input);
+        assert_eq!(off_peak.for_request(1_000, peak_hour).output, off.output);
+        assert_eq!(
+            off_peak.for_request(1_000, peak_hour).input_cache_read,
+            off.input_cache_read
+        );
+
+        // Without a schedule there is nothing to pin; the long-context tier stays.
+        let flat = get_model("openai/gpt-6-sol")
+            .expect("known model")
+            .pricing
+            .expect("pricing");
+        let pinned = flat.pinned_to(PricingPeriod::OffPeak);
+        assert_eq!(pinned.input, flat.input);
+        assert!(pinned.long_context.is_some());
     }
 
     #[test]

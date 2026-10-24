@@ -3,7 +3,7 @@ use color_eyre::eyre::eyre;
 use llmy_client::{
     app::{AppIdentity, AppIdentityPreset},
     client::*,
-    model::{ModelPricing, OpenAIModel},
+    model::{ModelPricing, OpenAIModel, PricingPeriod},
     settings::*,
 };
 use llmy_types::error::LLMYError;
@@ -183,6 +183,30 @@ macro_rules! make_openai_args {
             /// Cache-write input price per 1M tokens in USD.
             #[arg(long = concat!($long, "llm-cache-write-price"), env = concat!($prefix, "LLM_CACHE_WRITE_PRICE"))]
             pub llm_cache_write_price: Option<rust_decimal::Decimal>,
+
+            /// Bill every request at the peak rates, whatever the time of day.
+            /// Only models with peak/off-peak pricing (DeepSeek) are affected.
+            /// Mutually exclusive with `deepseek-force-off-hours`; explicit
+            /// price flags still win over the rates it picks.
+            #[arg(
+                long = concat!($long, "deepseek-force-peak-hours"),
+                env = concat!($prefix, "DEEPSEEK_FORCE_PEAK_HOURS"),
+                default_value_t = false,
+                value_parser = clap::builder::BoolishValueParser::new()
+            )]
+            pub deepseek_force_peak_hours: bool,
+
+            /// Bill every request at the off-peak rates, whatever the time of
+            /// day. Only models with peak/off-peak pricing (DeepSeek) are
+            /// affected. Mutually exclusive with `deepseek-force-peak-hours`;
+            /// explicit price flags still win over the rates it picks.
+            #[arg(
+                long = concat!($long, "deepseek-force-off-hours"),
+                env = concat!($prefix, "DEEPSEEK_FORCE_OFF_HOURS"),
+                default_value_t = false,
+                value_parser = clap::builder::BoolishValueParser::new()
+            )]
+            pub deepseek_force_off_hours: bool,
 
             /// The model's context window in tokens (its max input); wins
             /// over the registry value. Custom models default to 256k.
@@ -455,6 +479,8 @@ macro_rules! make_openai_args {
                     llm_output_price: None,
                     llm_cache_read_price: None,
                     llm_cache_write_price: None,
+                    deepseek_force_peak_hours: false,
+                    deepseek_force_off_hours: false,
                     llm_max_context: None,
                     llm_max_output: None,
                     use_full_model_id: false,
@@ -605,8 +631,24 @@ macro_rules! make_openai_args {
             /// Fold the per-field model flags (prices, context window) into
             /// the resolved model's config. They win over both the registry
             /// and the comma-separated model format, field by field; prices
-            /// use the same per-1M-token USD unit as that format.
+            /// use the same per-1M-token USD unit as that format. A forced
+            /// peak/off-peak period is settled first, so an explicit price
+            /// flag still wins over the rate it picks.
             fn apply_model_overrides(&self, model: &mut OpenAIModel) -> Result<(), LLMYError> {
+                let period = match (self.deepseek_force_peak_hours, self.deepseek_force_off_hours) {
+                    (true, true) => {
+                        return Err(LLMYError::Other(eyre!(concat!(
+                            "--", $long, "deepseek-force-peak-hours and --", $long,
+                            "deepseek-force-off-hours cannot both be set"
+                        ))));
+                    }
+                    (true, false) => Some(PricingPeriod::Peak),
+                    (false, true) => Some(PricingPeriod::OffPeak),
+                    (false, false) => None,
+                };
+                if let (Some(period), Some(pricing)) = (period, model.config.pricing.as_mut()) {
+                    *pricing = pricing.pinned_to(period);
+                }
                 if let Some(max_context) = self.llm_max_context {
                     model.config.max_input_tokens = max_context;
                 }
@@ -1081,6 +1123,69 @@ mod tests {
         let profile: OpenAISetup =
             toml::from_str("model = \"x,1,2\"\nerror-on-mismatched-model = true").expect("profile");
         assert!(profile.settings().error_on_mismatched_model);
+    }
+
+    #[test]
+    fn deepseek_period_flags_pin_peak_or_off_peak_rates() {
+        let _env = env_lock();
+        let million = rust_decimal::dec!(1_000_000);
+        let registry: OpenAIModel = "deepseek-v4-flash".parse().unwrap();
+        let base = registry.pricing();
+        let off = base.off_peak.expect("DeepSeek has an off-peak schedule");
+        let resolve = |args: &[&str]| {
+            let mut full = vec!["--opt-opt-model", "deepseek-v4-flash"];
+            full.extend_from_slice(args);
+            parse(&full).resolved_model(false)
+        };
+
+        let pricing = resolve(&["--opt-opt-deepseek-force-peak-hours"])
+            .unwrap()
+            .unwrap()
+            .pricing();
+        assert!(pricing.off_peak.is_none());
+        assert_eq!(pricing.input, base.input);
+        assert_eq!(pricing.output, base.output);
+
+        let pricing = resolve(&["--opt-opt-deepseek-force-off-hours"])
+            .unwrap()
+            .unwrap()
+            .pricing();
+        assert!(pricing.off_peak.is_none());
+        assert_eq!(pricing.input, off.input);
+        assert_eq!(pricing.output, off.output);
+
+        // An explicit price still wins over the rate the period picks.
+        let pricing = resolve(&[
+            "--opt-opt-deepseek-force-off-hours",
+            "--opt-opt-llm-input-price",
+            "9",
+        ])
+        .unwrap()
+        .unwrap()
+        .pricing();
+        assert_eq!(pricing.input * million, rust_decimal::dec!(9));
+        assert_eq!(pricing.output, off.output);
+
+        let err = resolve(&[
+            "--opt-opt-deepseek-force-peak-hours",
+            "--opt-opt-deepseek-force-off-hours",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot both be set"), "{err}");
+
+        // A config profile takes them by the same names.
+        let profile: OpenAISetup =
+            toml::from_str("model = \"deepseek-v4-flash\"\ndeepseek-force-off-hours = true")
+                .expect("profile");
+        assert_eq!(
+            profile
+                .resolved_model(true)
+                .unwrap()
+                .unwrap()
+                .pricing()
+                .input,
+            off.input
+        );
     }
 
     #[test]
