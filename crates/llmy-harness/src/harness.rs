@@ -351,6 +351,8 @@ impl Agent {
                 FinishReason::ToolCalls | FinishReason::FunctionCall => {
                     let calls = chat_choice_to_toolcalls(&choice);
                     let mut out = vec![];
+                    // (call id, arguments) of calls whose wire arguments only parsed after repair.
+                    let mut repaired: Vec<(String, String)> = Vec::new();
                     if calls.is_empty() {
                         if config.allow_empty_tool_calls {
                             tracing::warn!("no tool calls but give tool call reason");
@@ -383,6 +385,16 @@ impl Agent {
                                 continue;
                             }
                         };
+                        // A call the parser had to repair (bare tokens) is replayed in its
+                        // repaired form: a model that finds its own malformed arguments in the
+                        // history starts imitating them, and those turns get discarded.
+                        for (call, parsed) in calls.iter().zip(&parsed_args) {
+                            if let Some(parsed) = parsed
+                                && serde_json::from_str::<serde_json::Value>(&call.tool_args).is_err()
+                            {
+                                repaired.push((call.tool_id.clone(), parsed.to_string()));
+                            }
+                        }
 
                         // Unknown tool names come back as `None` markers.
                         // By default (`unknown_tool_hard_reject`) the turn
@@ -483,7 +495,13 @@ impl Agent {
                     // content.
                     let assistant_message = match content_override {
                         Some(content) => Message::assistant(content),
-                        None => assistant_native,
+                        None => {
+                            let mut message = assistant_native;
+                            for (id, arguments) in repaired {
+                                message.set_tool_call_arguments(&id, arguments);
+                            }
+                            message
+                        }
                     };
                     break (
                         StepResult::Toolcalled(assistant_content.clone()),

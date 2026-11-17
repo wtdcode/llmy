@@ -175,6 +175,23 @@ impl Message {
         out
     }
 
+    /// Replaces the arguments of this message's tool call `id`; false when it has no such call.
+    pub fn set_tool_call_arguments(&mut self, id: &str, arguments: String) -> bool {
+        for part in &mut self.parts {
+            if let MessagePart::ToolCall {
+                id: call_id,
+                arguments: current,
+                ..
+            } = part
+                && call_id == id
+            {
+                *current = arguments;
+                return true;
+            }
+        }
+        false
+    }
+
     // -----------------------------------------------------------------------
     // Lowering to chat-completion form
     // -----------------------------------------------------------------------
@@ -515,6 +532,31 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_call_argument_is_replaced_by_id_and_other_parts_stay() {
+        let mut message = Message::new(
+            MessageRole::Assistant,
+            vec![
+                MessagePart::Text {
+                    text: "reading".to_string(),
+                },
+                MessagePart::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    arguments: "{\"name\": burn}".to_string(),
+                    extra: OtherFields::default(),
+                },
+            ],
+        );
+        assert!(message.set_tool_call_arguments("call_1", "{\"name\":\"burn\"}".to_string()));
+        assert!(!message.set_tool_call_arguments("call_2", "{}".to_string()));
+        assert_eq!(message.text(), "reading");
+        match &message.parts[1] {
+            MessagePart::ToolCall { arguments, .. } => assert_eq!(arguments, "{\"name\":\"burn\"}"),
+            other => panic!("unexpected part {other:?}"),
+        }
+    }
 
     #[test]
     fn an_assistant_turn_lowers_to_one_chat_message_with_extras_carried() {

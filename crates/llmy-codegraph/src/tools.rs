@@ -575,12 +575,16 @@ impl JsonSchema for NameOrNames {
         std::borrow::Cow::Borrowed("NameOrNames")
     }
 
+    // Inline with a top-level `type`: behind a `$ref`/`anyOf` without one, deepseek writes the
+    // name unquoted.
+    fn inline_schema() -> bool {
+        true
+    }
+
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
-            "anyOf": [
-                {"type": "string"},
-                {"type": "array", "items": {"type": "string"}}
-            ]
+            "type": ["string", "array"],
+            "items": {"type": "string"}
         })
     }
 }
@@ -905,6 +909,21 @@ mod tests {
 
     use super::*;
     use crate::model::{InheritEdge, Language, ModuleKind};
+
+    #[test]
+    fn the_name_schema_is_inline_and_typed_and_both_shapes_parse() {
+        let schema = serde_json::to_value(schemars::schema_for!(ReadCallableSourceArgs)).unwrap();
+        assert!(schema.get("$defs").is_none(), "{schema}");
+        assert_eq!(
+            schema["properties"]["name"]["type"],
+            serde_json::json!(["string", "array"])
+        );
+        let one: ReadCallableSourceArgs = serde_json::from_str(r#"{"name": "burn"}"#).unwrap();
+        assert_eq!(one.name.into_vec(), vec!["burn"]);
+        let many: ReadCallableSourceArgs =
+            serde_json::from_str(r#"{"name": ["burn", "mint"], "module": "Token"}"#).unwrap();
+        assert_eq!(many.name.into_vec().len(), 2);
+    }
 
     /// Leaf is Mid; Mid is Base, Context (outside the graph); Base is Context.
     fn layered() -> CodegraphContext {
