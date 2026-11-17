@@ -25,7 +25,10 @@ tokio-stream.workspace = true
 futures.workspace = true
 regex.workspace = true
 sqlx.workspace = true
-reqwest.workspace = true
+# With these codecs compiled in, every reqwest client — async-openai's own
+# and the app-identity one — sends `Accept-Encoding` and decodes responses,
+# including streamed ones. Cargo unifies them into async-openai's reqwest.
+reqwest = { workspace = true, features = ["gzip", "brotli", "zstd", "deflate"] }
 rust_decimal = { workspace = true, features = ["serde", "macros"] }
 
 llmy-tokenizer.workspace = true
@@ -54,4 +57,5 @@ native-tls-vendored = [
 
 [dev-dependencies]
 tempfile.workspace = true
+flate2.workspace = true
 tokio = {workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"]}

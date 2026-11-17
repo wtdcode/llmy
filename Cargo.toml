@@ -49,6 +49,7 @@ rmcp = { version = "1", default-features = false }
 # unification; this direct dependency only names the types.
 reqwest = { version = "0.13", default-features = false }
 rust_decimal = { version = "1" }
+flate2 = "1"
 
 llmy-clap = {version = "1.6.1", path = "./crates/llmy-clap", default-features = false}
 llmy-client = {version = "1.6.1", path = "./crates/llmy-client", default-features = false}
